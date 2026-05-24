@@ -1,6 +1,7 @@
 package goguard
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -37,7 +38,7 @@ func TestResilientTransport(t *testing.T) {
 
 	// 3. Verify it's open
 	_, err := client.Get(ts.URL)
-	if err != ErrCircuitOpen {
+	if !errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("Expected ErrCircuitOpen, got %v", err)
 	}
 
