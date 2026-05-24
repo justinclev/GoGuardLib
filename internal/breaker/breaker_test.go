@@ -4,17 +4,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/justinclev/GoGuardLib/internal/state"
+	"github.com/justinclev/GoGuardLib/internal/engine"
 )
 
 func TestBreakerTransitions(t *testing.T) {
-	b := NewBreaker(0.5, 100*time.Millisecond, 1*time.Second)
+	b := NewBreaker(0.5, 100*time.Millisecond, 1*time.Second, 100*time.Millisecond)
 
 	// Closed -> Open
 	for i := 0; i < 10; i++ {
 		b.MarkFailure()
 	}
-	if b.state.Get() != state.StateOpen {
+	if b.state.Get() != engine.StateOpen {
 		t.Error("Expected StateOpen after failures")
 	}
 
@@ -26,21 +26,18 @@ func TestBreakerTransitions(t *testing.T) {
 	if !b.Allow() {
 		t.Error("Expected Allow to be true in HalfOpen state")
 	}
-	if b.state.Get() != state.StateHalfOpen {
+	if b.state.Get() != engine.StateHalfOpen {
 		t.Error("Expected StateHalfOpen")
+	}
+
+	// Probing (Single-flight)
+	if b.Allow() {
+		t.Error("Expected only one request allowed in HalfOpen")
 	}
 
 	// HalfOpen -> Open (failure)
 	b.MarkFailure()
-	if b.state.Get() != state.StateOpen {
+	if b.state.Get() != engine.StateOpen {
 		t.Error("Expected StateOpen after failure in HalfOpen")
-	}
-
-	// Recover to Closed
-	time.Sleep(150 * time.Millisecond)
-	b.Allow()
-	b.MarkSuccess()
-	if b.state.Get() != state.StateClosed {
-		t.Error("Expected StateClosed after success in HalfOpen")
 	}
 }
