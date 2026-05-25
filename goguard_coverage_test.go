@@ -163,6 +163,7 @@ func TestResilientTransport_Heartbeat(t *testing.T) {
 		// Success from heartbeat should transition it out of Open eventually (to HalfOpen or Closed depending on implementation details)
 		// MarkSuccess in heartbeat transitions HalfOpen to Closed.
 		// Heartbeat runs when Open or HalfOpen.
+		_ = br.State()
 	}
 }
 
@@ -265,6 +266,7 @@ func TestResilientTransport_RoundTrip_OutlierDetection(t *testing.T) {
 		// Wait, the duration is measured inside the function.
 		// My mock sleep might not be enough if it's too fast or something.
 		// Let's re-run and check.
+		_ = fail
 	}
 }
 

@@ -34,12 +34,12 @@ func TestBreaker_SetOverride(t *testing.T) {
 	b := NewBreaker(0.5, 1*time.Second, 10*time.Second, 1*time.Second, 0, 0, false, 0)
 	
 	b.SetOverride(1) // Always Open
-	if b.Allow(nil, 0, nil, false) {
+	if b.Allow(context.TODO(), 0, nil, false) {
 		t.Errorf("expected Allow to be false with override 1")
 	}
 	
 	b.SetOverride(2) // Always Closed
-	if !b.Allow(nil, 0, nil, false) {
+	if !b.Allow(context.TODO(), 0, nil, false) {
 		t.Errorf("expected Allow to be true with override 2")
 	}
 }

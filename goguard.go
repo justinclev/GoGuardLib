@@ -300,7 +300,7 @@ func isRetryable(req *http.Request, err error, resp *http.Response) bool {
 	}
 	if err != nil {
 		var netErr net.Error
-		if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		if errors.As(err, &netErr) && netErr.Timeout() {
 			return req.Body == nil || req.GetBody != nil
 		}
 		return false

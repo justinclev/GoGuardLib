@@ -30,14 +30,16 @@ func TestResilientTransport(t *testing.T) {
 	client := &http.Client{Transport: transport}
 
 	// 2. Trip the breaker
-	// We need enough failures to exceed the threshold.
-	// NewBreaker uses samplingWindow/10 for buckets.
-	for i := 0; i < 5; i++ {
-		client.Get(ts.URL)
+	resp, err := client.Get(ts.URL)
+	if err != nil {
+		t.Fatalf("Expected 500 response, got error: %v", err)
+	}
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("Expected 500, got %d", resp.StatusCode)
 	}
 
 	// 3. Verify it's open
-	_, err := client.Get(ts.URL)
+	_, err = client.Get(ts.URL)
 	if !errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("Expected ErrCircuitOpen, got %v", err)
 	}
@@ -46,7 +48,7 @@ func TestResilientTransport(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 	fail = false // Fix server
 
-	resp, err := client.Get(ts.URL)
+	resp, err = client.Get(ts.URL)
 	if err != nil {
 		t.Fatalf("Expected recovery, got error: %v", err)
 	}
