@@ -1,4 +1,3 @@
-
 # GoGuardLib
 
 GoGuardLib is a Go library for resilient outbound HTTP requests, providing connection pooling and circuit breaker functionality.
