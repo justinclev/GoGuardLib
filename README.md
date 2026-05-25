@@ -1,14 +1,18 @@
 # GoGuardLib
 
-GoGuardLib is a high-performance, low-latency, resilient outbound HTTP connection pooler and circuit breaker library for Go. It protects your systems from cascading failures by monitoring downstream health and short-circuiting requests when services degrade.
+GoGuardLib is an enterprise-grade, high-performance, resilient outbound HTTP connection pooler and circuit breaker library for Go.
 
-## Features
+## Advanced Features
 
-- **Circuit Breaking**: Implements Closed, Open, and Half-Open states.
-- **Granular Protection**: Automatic breaker isolation per host.
-- **Rolling Window Metrics**: Sub-second bucketed metrics for high concurrency with low lock contention.
-- **Pluggable \`http.RoundTripper\`: Seamlessly integrates with existing \`http.Client\` setups.
-- **Zero External Dependencies**: Built entirely on Go standard library primitives.
+- **Lock Sharding**: 64-way sharded state to eliminate global lock contention.
+- **O(1) Metrics**: Constant-time failure rate calculation using atomic running sums.
+- **Adaptive Tripping**: MinSamples prevents flapping on low-volume traffic.
+- **Bulkheading**: MaxInflight limits concurrent requests per host.
+- **Enforced Timeouts**: Library-level per-request timeout enforcement.
+- **Safe Retries**: Automatic retries for idempotent methods (GET/HEAD) on transient network errors.
+- **Memory Safety**: LRU-based breaker eviction prevents memory exhaustion under high host cardinality.
+- **Panic Protection**: Automatically captures panics in downstream transports to trip the circuit safely.
+- **Observability**: State-change hooks and programmatic error unwrapping with CircuitError.
 
 ## Installation
 
@@ -16,67 +20,32 @@ GoGuardLib is a high-performance, low-latency, resilient outbound HTTP connectio
 go get github.com/justinclev/GoGuardLib
 \`\`\`
 
-## Usage
-
-Integrate \`GoGuardLib\` into your application by wrapping your HTTP client's transport.
+## Advanced Usage
 
 \`\`\`go
-package main
-
-import (
-	"fmt"
-	"net/http"
-	"time"
-
-	"github.com/justinclev/GoGuardLib"
-)
-
-func main() {
-	// 1. Configure the transport
-	cfg := goguard.Config{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-		FailureThreshold:    0.50,          // Trip at 50% failure rate
-		SleepWindow:         5 * time.Second, // Wait 5s before retrying
-		SamplingWindow:      10 * time.Second,
-	}
-
-	// 2. Create the ResilientTransport
-	transport := goguard.NewResilientTransport(cfg)
-
-	// 3. Use it with an http.Client
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   15 * time.Second,
-	}
-
-	// 4. Make requests
-	resp, err := client.Get("https://api.example.com/data")
-	if err != nil {
-		fmt.Printf("Request failed or short-circuited: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	fmt.Printf("Status: %s\n", resp.Status)
+cfg := goguard.Config{
+    FailureThreshold: 0.50,          // Trip at 50% failure rate
+    MinSamples:       10,            // Don't trip until at least 10 requests
+    MaxLatency:       2 * time.Second, // Responses slower than 2s count as failures
+    RequestTimeout:   5 * time.Second, // Enforce 5s timeout
+    MaxRetries:       2,               // Retry idempotent requests on network errors
+    MaxBreakers:      5000,            // LRU limit per shard (total 320,000 hosts)
+    OnStateChange: func(host string, from, to engine.BreakerState) {
+        log.Printf("Host %s transitioned from %v to %v", host, from, to)
+    },
 }
+
+transport := goguard.NewResilientTransport(cfg)
+defer transport.Close()
+
+client := &http.Client{Transport: transport}
 \`\`\`
 
-## Development
+## Performance
 
-### Running Tests
-
-\`\`\`bash
-go test -v ./...
-\`\`\`
-
-### Checking Coverage
-
-\`\`\`bash
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out
-\`\`\`
+- **Zero Allocation Hashing**: Uses sync.Pool for FNV hashers.
+- **Ring Buffer Metrics**: O(1) rotation and insertion.
+- **Lockless Hot-Path**: Atomic state checks before acquiring shard locks.
 
 ## License
 

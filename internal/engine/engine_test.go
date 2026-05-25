@@ -11,29 +11,26 @@ func TestRollingWindow(t *testing.T) {
 	rw := NewRollingWindow(window, bucket)
 
 	now := time.Now().UnixNano()
-	rw.Success(now)
-	rw.Success(now)
+	rw.Success(now, 100)
+	rw.Success(now, 200)
 	rw.Failure(now)
 
-	rate := rw.FailureRate(now)
-	if rate != 1.0/3.0 {
-		t.Errorf("Expected failure rate 0.33, got %f", rate)
+	rate := rw.FailureRateBps(now)
+	if rate != 3333 {
+		t.Errorf("Expected failure rate 3333, got %d", rate)
+	}
+
+	if avg := rw.AvgLatencyUs(); avg != 150 {
+		t.Errorf("Expected avg latency 150, got %d", avg)
 	}
 
 	// Wait for rotation
 	future := now + int64(200*time.Millisecond)
-	rw.Success(future)
+	rw.Success(future, 100)
 
-	rate = rw.FailureRate(future)
-	if rate != 1.0/4.0 {
-		t.Errorf("Expected failure rate 0.25 after rotation, got %f", rate)
-	}
-
-	// Wait for full window to expire
-	expiry := future + int64(1*time.Second)
-	rate = rw.FailureRate(expiry)
-	if rate != 0.0 {
-		t.Errorf("Expected failure rate 0.0 after window expiry, got %f", rate)
+	rate = rw.FailureRateBps(future)
+	if rate != 2500 {
+		t.Errorf("Expected failure rate 2500 after rotation, got %d", rate)
 	}
 }
 
