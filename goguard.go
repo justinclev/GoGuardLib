@@ -110,7 +110,11 @@ func NewResilientTransport(cfg Config, opts ...Option) *ResilientTransport {
 	if cfg.ShardCount <= 0 { cfg.ShardCount = 64 }
 	if (cfg.ShardCount & (cfg.ShardCount - 1)) != 0 { cfg.ShardCount = 64 }
 
+	if cfg.SamplingWindow == 0 { cfg.SamplingWindow = 10 * time.Second }
+	// Default bucket duration to 1/10th of window. If window < 10ns, fall back to 1s floor to prevent divide-by-zero.
 	if cfg.BucketDuration == 0 { cfg.BucketDuration = cfg.SamplingWindow / 10 }
+	if cfg.BucketDuration == 0 { cfg.BucketDuration = 1 * time.Second }
+	if cfg.SleepWindow == 0 { cfg.SleepWindow = 30 * time.Second }
 	if cfg.MaxBreakers == 0 { cfg.MaxBreakers = 1000 }
 	if cfg.IsFailure == nil {
 		cfg.IsFailure = func(resp *http.Response, err error) bool {
