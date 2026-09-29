@@ -8,12 +8,19 @@ import (
 	"time"
 )
 
-// MemoryOptions configures a MemoryStore. The zero value is unlimited.
+// DefaultMemoryMaxBytes bounds a MemoryStore when MemoryOptions.MaxBytes is zero, so
+// a long outage fills the store (and applies backpressure) instead of exhausting
+// the process's memory.
+const DefaultMemoryMaxBytes = 512 << 20
+
+// MemoryOptions configures a MemoryStore. The zero value holds up to
+// DefaultMemoryMaxBytes.
 type MemoryOptions struct {
 	// MaxRecords caps the number of records held; Append beyond it returns ErrFull.
 	MaxRecords int
 	// MaxBytes caps the estimated bytes held; Append and Checkpoint beyond it
-	// return ErrFull.
+	// return ErrFull. Zero means DefaultMemoryMaxBytes; a negative value removes the
+	// cap.
 	MaxBytes int64
 	// MaxRecordBytes rejects any single record larger than this.
 	MaxRecordBytes int
@@ -39,6 +46,9 @@ type MemoryStore struct {
 func NewMemoryStore(opts MemoryOptions) *MemoryStore {
 	if opts.Clock == nil {
 		opts.Clock = time.Now
+	}
+	if opts.MaxBytes == 0 {
+		opts.MaxBytes = DefaultMemoryMaxBytes
 	}
 	return &MemoryStore{
 		clock: opts.Clock,

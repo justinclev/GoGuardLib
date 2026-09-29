@@ -10,24 +10,24 @@ import (
 // Matcher decides whether a request belongs to an endpoint.
 type Matcher func(*http.Request) bool
 
-// Host matches requests whose URL host (including any port) equals one of
-// hosts, ignoring case.
+// Host matches requests whose URL host (including any port other than the default
+// 80 or 443) equals one of hosts, ignoring case and any trailing dot.
 func Host(hosts ...string) Matcher {
 	set := make(map[string]struct{}, len(hosts))
 	for _, h := range hosts {
-		set[strings.ToLower(h)] = struct{}{}
+		set[canonHost(h)] = struct{}{}
 	}
 	return func(r *http.Request) bool {
-		_, ok := set[strings.ToLower(r.URL.Host)]
+		_, ok := set[canonHost(r.URL.Host)]
 		return ok
 	}
 }
 
 // HostPath matches requests to host whose path starts with pathPrefix.
 func HostPath(host, pathPrefix string) Matcher {
-	host = strings.ToLower(host)
+	host = canonHost(host)
 	return func(r *http.Request) bool {
-		return strings.ToLower(r.URL.Host) == host && strings.HasPrefix(r.URL.Path, pathPrefix)
+		return canonHost(r.URL.Host) == host && strings.HasPrefix(r.URL.Path, pathPrefix)
 	}
 }
 

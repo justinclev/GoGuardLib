@@ -100,3 +100,27 @@ func TestAbandonedProbeFreesProbeSlot(t *testing.T) {
 		t.Fatalf("FailureRateBps = %d, want 10000", b.FailureRateBps())
 	}
 }
+
+// A probe whose caller never reports back must not leave the circuit half-open for
+// ever: after a sleep window another call takes over as the probe.
+func TestLeakedProbeIsReplacedAfterASleepWindow(t *testing.T) {
+	b := NewBreaker(0.5, 50*time.Millisecond, time.Second, 100*time.Millisecond, 0, 1, false, 0)
+	ctx := context.Background()
+	var seed uint64 = 1
+	b.MarkFailure() // MinSamples 1: opens the circuit
+	if b.State().String() != "open" {
+		t.Fatalf("state %v, want open", b.State())
+	}
+	time.Sleep(80 * time.Millisecond)
+	if b.AllowEx(ctx, 0, &seed, false) != Admitted {
+		t.Fatal("the first probe was not admitted after the sleep window")
+	}
+	// This probe is never finished. Others are turned away while it may still report.
+	if b.AllowEx(ctx, 0, &seed, false) == Admitted {
+		t.Fatal("a second call was admitted while a probe was in flight")
+	}
+	time.Sleep(80 * time.Millisecond)
+	if b.AllowEx(ctx, 0, &seed, false) != Admitted {
+		t.Fatal("the circuit stayed wedged half-open behind a probe that never reported back")
+	}
+}

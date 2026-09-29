@@ -742,3 +742,67 @@ func secureStore(t testing.TB) dlq.Store {
 	must(t, err)
 	return s
 }
+
+// A step that hangs past the run's deadline must not make the message vanish into
+// an endless retry loop that blocks everything behind it: the message is stored
+// with its progress, like any other step failure.
+func TestAMessageThatHangsPastItsDeadlineIsStoredWithItsProgress(t *testing.T) {
+	h := newHarness()
+	steps := h.steps(false)
+	steps[2].Run = func(ctx context.Context, x *pipeline.Exec) error { <-ctx.Done(); return ctx.Err() } // "c" hangs
+	p := mustPipeline(t, steps)
+	store := dlq.NewMemoryStore(dlq.MemoryOptions{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	res, err := p.Execute(ctx, store, input("m1"))
+	if err != nil || res != pipeline.Deferred {
+		t.Fatalf("Execute = %v, %v; want Deferred", res, err)
+	}
+	rec, err := store.Get(context.Background(), "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, _ := pipeline.Completed(rec.Checkpoint)
+	if rec.BlockedOn != "dep-c" || fmt.Sprint(done) != "[a b]" {
+		t.Fatalf("stored blocked on %q with %v done, want dep-c with [a b]", rec.BlockedOn, done)
+	}
+}
+
+// Cancelling is the caller stopping, not the message misbehaving: nothing is stored.
+func TestACancelledRunIsNotHeldAgainstTheMessage(t *testing.T) {
+	h := newHarness()
+	steps := h.steps(false)
+	steps[1].Run = func(ctx context.Context, x *pipeline.Exec) error { <-ctx.Done(); return ctx.Err() }
+	p := mustPipeline(t, steps)
+	store := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(30*time.Millisecond, cancel)
+	if res, _ := p.Execute(ctx, store, input("m2")); res != pipeline.Failed {
+		t.Fatalf("Execute = %v, want Failed", res)
+	}
+	if n := total(t, store).Total(); n != 0 {
+		t.Fatalf("%d records stored for a cancelled run", n)
+	}
+}
+
+func TestAMessageThatAlwaysHangsIsEventuallyParked(t *testing.T) {
+	h := newHarness()
+	steps := h.steps(false)
+	steps[0].Run = func(ctx context.Context, x *pipeline.Exec) error { <-ctx.Done(); return ctx.Err() }
+	p := mustPipeline(t, steps)
+	store := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	must(t, store.Append(context.Background(), dlq.Record{ID: "hang", Value: []byte("x"), BlockedOn: "dep-a"}))
+	r, err := dlq.NewRedriver(dlq.RedriveConfig{
+		Store: store, Handler: p.Handler(), LeaseTTL: 100 * time.Millisecond, MaxAttempts: 3,
+		PollInterval: 5 * time.Millisecond, Backoff: retry.Constant(5 * time.Millisecond),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = r.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+	eventually(t, "the hanging record to be parked", func() bool { return total(t, store).Parked == 1 })
+}

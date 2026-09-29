@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,6 +66,9 @@ type Config struct {
 	// Transport is the underlying transport. Default: a pooled http.Transport.
 	Transport http.RoundTripper
 
+	// Settings for the default transport (ignored when Transport is set). Defaults
+	// are 100 idle connections, 16 per host and a 90 second idle timeout, and HTTP/2
+	// is enabled.
 	MaxIdleConns        int
 	MaxIdleConnsPerHost int
 	IdleConnTimeout     time.Duration
@@ -123,6 +127,12 @@ type endpoint struct {
 	perHost bool
 	policy  Policy
 	bcfg    breaker.Config
+
+	// A shared circuit (one for the whole endpoint) is created once and kept here,
+	// so the request path reads a pointer instead of hashing and locking a shard.
+	// There is at most one per endpoint, so it needs no eviction.
+	shared   atomic.Pointer[entry]
+	sharedMu sync.Mutex
 }
 
 type key struct {
@@ -221,6 +231,12 @@ func New(cfg Config, opts ...Option) (*ResilientTransport, error) {
 			cancel()
 			return nil, err
 		}
+		if len(cfg.GuardAll.HealthHeader) > 0 {
+			// GuardAll circuits are per host, whatever host the application happens to
+			// call: the header (a credential) would be sent to all of them.
+			cancel()
+			return nil, errors.New("goguard: GuardAll cannot set HealthHeader: it would send the credential to every host the application calls")
+		}
 		rt.guardAll = newEndpoint(len(rt.endpoints), Endpoint{
 			Name: guardAllName, Match: func(*http.Request) bool { return true },
 			Policy: *cfg.GuardAll, PerHost: true,
@@ -231,12 +247,15 @@ func New(cfg Config, opts ...Option) (*ResilientTransport, error) {
 	rt.underlying = cfg.Transport
 	if rt.underlying == nil {
 		rt.underlying = &http.Transport{
-			Proxy:               http.ProxyFromEnvironment,
-			DialContext:         (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			MaxIdleConns:        cfg.MaxIdleConns,
-			MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
-			IdleConnTimeout:     cfg.IdleConnTimeout,
-			TLSHandshakeTimeout: 10 * time.Second,
+			Proxy:       http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			// A custom DialContext switches HTTP/2 off unless it is forced on.
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          orDefault(cfg.MaxIdleConns, 100),
+			MaxIdleConnsPerHost:   orDefault(cfg.MaxIdleConnsPerHost, 16),
+			IdleConnTimeout:       orDefaultDuration(cfg.IdleConnTimeout, 90*time.Second),
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: time.Second,
 		}
 	}
 
@@ -273,6 +292,20 @@ func NewResilientTransport(cfg Config, opts ...Option) *ResilientTransport {
 	return rt
 }
 
+func orDefault(v, d int) int {
+	if v <= 0 {
+		return d
+	}
+	return v
+}
+
+func orDefaultDuration(v, d time.Duration) time.Duration {
+	if v <= 0 {
+		return d
+	}
+	return v
+}
+
 func newEndpoint(idx int, e Endpoint) *endpoint {
 	ep := &endpoint{Endpoint: e, idx: idx, perHost: e.PerHost, policy: e.Policy}
 	ep.policy.applyDefaults()
@@ -293,22 +326,40 @@ func (t *ResilientTransport) Close() error {
 	t.closeMu.Unlock()
 
 	t.cancel()
-	for _, s := range t.shards {
-		s.mu.RLock()
-		entries := make([]*entry, 0, len(s.entries))
-		for _, el := range s.entries {
-			entries = append(entries, el.Value.(*entry))
-		}
-		s.mu.RUnlock()
-		for _, e := range entries {
-			e.breaker.Close() // stops its health prober
-		}
+	for _, e := range t.entries() {
+		e.breaker.Close() // stops its health prober
 	}
 	t.wg.Wait()
 	if t.dispatcher != nil {
 		t.dispatcher.Close()
 	}
 	return nil
+}
+
+// CloseIdleConnections closes idle connections of the underlying transport, so
+// http.Client.CloseIdleConnections works through the guard.
+func (t *ResilientTransport) CloseIdleConnections() {
+	if c, ok := t.underlying.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
+}
+
+// entries lists every live circuit: the shared ones and those in the shards.
+func (t *ResilientTransport) entries() []*entry {
+	var out []*entry
+	for _, ep := range t.endpoints {
+		if e := ep.shared.Load(); e != nil {
+			out = append(out, e)
+		}
+	}
+	for _, s := range t.shards {
+		s.mu.RLock()
+		for _, el := range s.entries {
+			out = append(out, el.Value.(*entry))
+		}
+		s.mu.RUnlock()
+	}
+	return out
 }
 
 // retire stops the background work of a circuit that has been evicted or pruned.
@@ -352,12 +403,8 @@ func (t *ResilientTransport) Stats() Stats {
 	if t.dispatcher != nil {
 		st.DroppedEvents = t.dispatcher.Dropped()
 	}
-	for _, s := range t.shards {
-		s.mu.RLock()
-		for _, el := range s.entries {
-			st.Breakers = append(st.Breakers, el.Value.(*entry).breaker.Stats())
-		}
-		s.mu.RUnlock()
+	for _, e := range t.entries() {
+		st.Breakers = append(st.Breakers, e.breaker.Stats())
 	}
 	return st
 }
@@ -408,17 +455,49 @@ func (t *ResilientTransport) shardFor(name string) *shard {
 	return t.shards[h.Sum64()&t.shardMask]
 }
 
+// canonHost puts a host in the form used to key circuits and match endpoints:
+// lower case, without a trailing dot and without the default port, so
+// "Example.com", "example.com." and "example.com:443" are one service.
+func canonHost(h string) string {
+	h = strings.ToLower(h)
+	if strings.HasSuffix(h, ":443") {
+		h = strings.TrimSuffix(h, ":443")
+	} else if strings.HasSuffix(h, ":80") {
+		h = strings.TrimSuffix(h, ":80")
+	}
+	return strings.TrimSuffix(h, ".")
+}
+
+func (t *ResilientTransport) newEntry(ep *endpoint, k key, scheme, host, canon string, now int64) *entry {
+	cfg := ep.bcfg
+	name := circuitName(ep, canon)
+	cfg.Name = name
+	cfg.Events = t.sink
+	cfg.Health = t.healthFor(ep, scheme, host)
+	return &entry{key: k, name: name, ep: ep, breaker: breaker.New(cfg), lastAccess: now}
+}
+
 // getEntry returns the circuit for a request to host under ep, creating it on
 // first use.
 func (t *ResilientTransport) getEntry(ep *endpoint, scheme, host string) *entry {
-	k := key{idx: ep.idx}
-	shardKey := ep.Name
-	if ep.perHost {
-		k.host = host
-		shardKey = host
-	}
-	s := t.shardFor(shardKey)
 	now := time.Now().UnixNano()
+	if !ep.perHost {
+		if e := ep.shared.Load(); e != nil {
+			return e
+		}
+		ep.sharedMu.Lock()
+		defer ep.sharedMu.Unlock()
+		if e := ep.shared.Load(); e != nil {
+			return e
+		}
+		e := t.newEntry(ep, key{idx: ep.idx}, scheme, host, host, now)
+		ep.shared.Store(e)
+		return e
+	}
+
+	canon := canonHost(host)
+	k := key{idx: ep.idx, host: canon}
+	s := t.shardFor(canon)
 
 	s.mu.RLock()
 	el, ok := s.entries[k]
@@ -444,21 +523,25 @@ func (t *ResilientTransport) getEntry(ep *endpoint, scheme, host string) *entry 
 	}
 
 	if s.lru.Len() >= t.config.MaxBreakers {
-		if back := s.lru.Back(); back != nil {
-			evicted := back.Value.(*entry)
-			s.lru.Remove(back)
+		// Evict the least recently used circuit, but prefer one that is closed: an
+		// open circuit holds the knowledge that a dependency is down, and a flood of
+		// new hosts must not be able to wash it away.
+		victim := s.lru.Back()
+		for el, i := victim, 0; el != nil && i < 16; el, i = el.Prev(), i+1 {
+			if el.Value.(*entry).breaker.State() == breaker.StateClosed {
+				victim = el
+				break
+			}
+		}
+		if victim != nil {
+			evicted := victim.Value.(*entry)
+			s.lru.Remove(victim)
 			delete(s.entries, evicted.key)
 			t.retire(evicted)
 		}
 	}
 
-	cfg := ep.bcfg
-	name := circuitName(ep, host)
-	cfg.Name = name
-	cfg.Events = t.sink
-	cfg.Health = t.healthFor(ep, scheme, host)
-	e := &entry{key: k, name: name, ep: ep, breaker: breaker.New(cfg), lastAccess: now}
-
+	e := t.newEntry(ep, k, scheme, host, canon, now)
 	s.entries[k] = s.lru.PushFront(e)
 	return e
 }
@@ -547,12 +630,14 @@ func (t *ResilientTransport) resolve(req *http.Request) (*endpoint, error) {
 func (t *ResilientTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	select {
 	case <-t.ctx.Done():
+		closeRequestBody(req)
 		return nil, t.ctx.Err()
 	default:
 	}
 
 	ep, err := t.resolve(req)
 	if err != nil {
+		closeRequestBody(req)
 		return nil, err
 	}
 	if ep == nil {
@@ -580,6 +665,7 @@ func (t *ResilientTransport) guarded(ep *endpoint, req *http.Request) (*http.Res
 	isVIP, _ := req.Context().Value(PriorityKey).(bool)
 	permit, err := br.Acquire(req.Context(), isVIP)
 	if err != nil {
+		closeRequestBody(req) // a RoundTripper must close the body even when it sends nothing
 		cerr := &CircuitError{Host: ent.name, State: br.State(), Err: ErrCircuitOpen}
 		if errors.Is(err, breaker.ErrBulkhead) {
 			cerr.Err, cerr.Retryable = breaker.ErrBulkhead, true
@@ -699,6 +785,12 @@ func (b *cancelBody) Close() error {
 	err := b.ReadCloser.Close()
 	b.cancel()
 	return err
+}
+
+func closeRequestBody(req *http.Request) {
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
 }
 
 func closeResponse(r *http.Response) {

@@ -11,6 +11,10 @@ const Redacted = "[REDACTED]"
 
 const defaultMaxLength = 2048
 
+// inputSlack is how many times the output limit of text is examined: redaction
+// can shrink text, so a little more than the limit is looked at.
+const inputSlack = 16
+
 var defaultSensitiveHeaders = []string{
 	"Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie",
 	"X-Api-Key", "Api-Key", "X-Auth-Token", "X-Amz-Security-Token", "X-Csrf-Token",
@@ -91,6 +95,16 @@ func NewRedactor(opts ...RedactorOption) *Redactor {
 // String returns s with secrets replaced by Redacted, truncated to the maximum
 // length.
 func (r *Redactor) String(s string) string {
+	// Bound the work: text far beyond the output limit cannot survive truncation
+	// anyway, and running every pattern over megabytes of error text on each failure
+	// would make a bad payload a way to burn CPU.
+	if r.maxLength > 0 && len(s) > r.maxLength*inputSlack {
+		cut := r.maxLength * inputSlack
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut]
+	}
 	for _, rl := range r.rules {
 		s = rl.re.ReplaceAllString(s, rl.repl)
 	}

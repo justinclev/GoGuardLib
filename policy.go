@@ -60,10 +60,14 @@ type Policy struct {
 	// HealthPath (for example "/health") builds an HTTP health check against the
 	// same scheme and host as the traffic, so one policy works for many hosts
 	// (GuardAll, PerHost). Probes use the underlying transport, never the guarded
-	// one, and follow no redirects.
+	// one, and follow no redirects. A circuit shared by several hosts (an endpoint
+	// without PerHost) probes the host of its first request; give such an endpoint
+	// PerHost, or a Health.Check that knows what to ask.
 	HealthPath string
 	// HealthHeader is sent with HealthPath probes, for an auth token the health
-	// endpoint needs. Nothing else from the request is ever copied.
+	// endpoint needs. Nothing else from the request is ever copied. It goes to every
+	// host the endpoint's circuits probe, so use it only on endpoints whose Match
+	// selects hosts you trust with that credential; GuardAll refuses it.
 	HealthHeader http.Header
 
 	// DryRun tracks state and emits events but never rejects a request.

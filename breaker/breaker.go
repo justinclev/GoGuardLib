@@ -350,7 +350,9 @@ func (p *Permit) Abandon() {
 }
 
 // Acquire asks the breaker to admit a call. On success the caller must finish
-// the returned Permit. vip calls bypass the bulkhead (never the circuit).
+// the returned Permit: a Permit that is never finished keeps its bulkhead slot for
+// good, and a half-open circuit waits a sleep window before another call may take
+// over as the probe. vip calls bypass the bulkhead (never the circuit).
 // Rejections are *OpenError or *BulkheadError.
 func (b *Breaker) Acquire(ctx context.Context, vip bool) (*Permit, error) {
 	switch b.in.AllowEx(ctx, b.cfg.WaitTimeout, &b.seed, vip) {

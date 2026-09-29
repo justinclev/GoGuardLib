@@ -104,7 +104,9 @@ func (w *RollingWindow) rotate(now int64) {
 		w.buckets[w.head] = bucket{}
 	}
 
-	atomic.StoreInt64(&w.lastUpdate, now)
+	// Advance by whole buckets, keeping the remainder, so the window keeps its
+	// configured length instead of stretching by up to one bucket per rotation.
+	atomic.StoreInt64(&w.lastUpdate, w.lastUpdate+int64(diff)*int64(w.bucketDuration))
 }
 
 // Reset forgets everything recorded so far. A circuit that has just recovered

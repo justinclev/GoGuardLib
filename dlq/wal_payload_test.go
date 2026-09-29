@@ -348,3 +348,21 @@ func TestAWrongReferenceNeverReturnsAnotherRecordsData(t *testing.T) {
 		t.Fatalf("a frame of the wrong type was accepted: %v", err)
 	}
 }
+
+func TestTheIndexIsBoundedByDefaultWhenPayloadsAreOnDisk(t *testing.T) {
+	s := openInternal(t, t.TempDir(), WALOptions{})
+	if got := s.m.lim.maxRecords; got != DefaultWALMaxRecords {
+		t.Fatalf("default MaxRecords = %d, want %d", got, DefaultWALMaxRecords)
+	}
+	_ = s.Close()
+	s = openInternal(t, t.TempDir(), WALOptions{PayloadsInMemory: true})
+	if got := s.m.lim.maxRecords; got != 0 {
+		t.Fatalf("in-memory default MaxRecords = %d, want none (MaxBytes bounds it)", got)
+	}
+	_ = s.Close()
+	s = openInternal(t, t.TempDir(), WALOptions{MaxRecords: -1})
+	if got := s.m.lim.maxRecords; got > 0 {
+		t.Fatalf("a negative MaxRecords must remove the cap, got %d", got)
+	}
+	_ = s.Close()
+}

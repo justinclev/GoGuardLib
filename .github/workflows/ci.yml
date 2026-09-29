@@ -61,6 +61,25 @@ jobs:
       - name: Build
         run: go build ./...
 
+  # Known vulnerabilities in the dependencies and the standard library in use.
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.3"
+          cache: false
+      - name: Verify module checksums
+        run: go mod verify && (cd kafka && go mod verify)
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Scan the core module
+        run: $(go env GOPATH)/bin/govulncheck ./...
+      - name: Scan the Kafka module
+        run: cd kafka && $(go env GOPATH)/bin/govulncheck ./...
+
   # The Kafka adapter is its own Go module (it needs cgo and confluent-kafka-go),
   # so the jobs above, which run at the repository root, do not touch it.
   kafka:

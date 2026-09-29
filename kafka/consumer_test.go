@@ -646,7 +646,11 @@ func TestCommitsAreBatched(t *testing.T) {
 	}
 }
 
-func TestProcessTimeoutRetriesInsteadOfSkipping(t *testing.T) {
+// A message that outlives ProcessTimeout is stored with its progress and the
+// offset moves on, so one message that hangs its dependency cannot pin the
+// partition for ever. The redriver then owns it, counts its attempts and parks it
+// if it keeps hanging.
+func TestAMessageThatTimesOutIsStoredNotRetriedForEver(t *testing.T) {
 	r := newRig(t)
 	var stuck atomic.Bool
 	stuck.Store(true)
@@ -662,12 +666,16 @@ func TestProcessTimeoutRetriesInsteadOfSkipping(t *testing.T) {
 	c := r.newConsumer(func(cfg *kafka.Config) { cfg.Bindings[0].Pipeline = p; cfg.ProcessTimeout = 30 * time.Millisecond })
 	r.assign(0)
 	r.run(c)
-	eventually(t, "a retry", func() bool { return c.Stats().Retried >= 1 })
-	if r.broker.committedOffset(topic, 0) != 0 || r.storeStats().Total() != 0 {
-		t.Fatal("a message that timed out must be retried, not committed or stored")
+	eventually(t, "the timed-out message to be stored and committed", func() bool {
+		return r.broker.committedOffset(topic, 0) == 1 && r.storeStats().Total() == 1
+	})
+	if c.Stats().Deferred != 1 || c.Stats().Retried != 0 {
+		t.Fatalf("stats %+v: the timeout must defer the message, not seek back to it", c.Stats())
 	}
 	stuck.Store(false)
-	eventually(t, "success on retry", func() bool { return r.broker.committedOffset(topic, 0) == 1 })
+	_, stop := r.startRedriver(p)
+	defer stop()
+	eventually(t, "the redriver to finish it", func() bool { return r.storeStats().Total() == 0 })
 }
 
 func TestConfigurationIsValidated(t *testing.T) {

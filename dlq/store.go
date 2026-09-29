@@ -74,7 +74,9 @@ type ParkedQuery struct {
 	// After returns only records whose Seq is greater than this. Pass the Seq of
 	// the last record of the previous page (0 for the first page).
 	After uint64
-	// Limit is the page size. Default 100, at most 1000.
+	// Limit is the page size. Default 100, at most 1000. A page can be shorter (it
+	// is cut once it would carry about 32 MiB of payload), so keep paging until a
+	// page comes back empty.
 	Limit int
 }
 

@@ -25,7 +25,34 @@ type memItem struct {
 	// they stand for. In-memory stores leave all four zero.
 	bodyRef, ckptRef blobRef
 	bodyN, ckptN     int
+
+	// Position in the queue index: a Pending or Leased item sits in the group of its
+	// BlockedOn, a Parked item in the parked list (grp is nil then).
+	grp *group
+	gel *list.Element
 }
+
+// group holds the Pending and Leased items that wait on one dependency, in Seq
+// order, so a Lease can skip a whole dependency (an open circuit) in O(1) and never
+// walks records that belong to someone else.
+type group struct {
+	dep   string
+	items *list.List // *memItem
+	// wake is the earliest time a scan of this group can find something to lease,
+	// as of the last scan that found nothing; zero means "unknown, scan". Every
+	// change that can make something eligible earlier clears it, and it is never
+	// trusted for longer than maxWakeSkew, so a missed clear delays work by at most
+	// that long.
+	wake time.Time
+}
+
+// maxWakeSkew bounds how long a cached group wake time is believed.
+const maxWakeSkew = time.Second
+
+// maxParkedPageBytes bounds the payload one Parked page may carry, so listing a
+// queue of large parked records cannot exhaust memory. A page always holds at
+// least one record.
+const maxParkedPageBytes = 32 << 20
 
 func (it *memItem) unlease() {
 	it.token = ""
@@ -42,6 +69,10 @@ type machine struct {
 	byKey map[string][]*memItem // OrderKey -> items in Seq order
 	seq   uint64
 	bytes int64
+
+	groups map[string]*group // BlockedOn -> Pending and Leased items
+	parked *list.List        // Parked items in Seq order
+	counts [3]int            // items per State
 }
 
 func newMachine(lim limits) *machine {
@@ -50,7 +81,70 @@ func newMachine(lim limits) *machine {
 		items: make(map[string]*memItem),
 		order: list.New(),
 		byKey: make(map[string][]*memItem),
+
+		groups: make(map[string]*group),
+		parked: list.New(),
 	}
+}
+
+// insertOrdered puts it in l keeping Seq order. New records carry the highest Seq,
+// so searching from the back is O(1) in the common case.
+func insertOrdered(l *list.List, it *memItem) *list.Element {
+	e := l.Back()
+	for e != nil && e.Value.(*memItem).rec.Seq > it.rec.Seq {
+		e = e.Prev()
+	}
+	if e == nil {
+		return l.PushFront(it)
+	}
+	return l.InsertAfter(it, e)
+}
+
+// link adds it to the index according to its state.
+func (m *machine) link(it *memItem) {
+	m.counts[it.rec.State]++
+	if it.rec.State == Parked {
+		it.grp, it.gel = nil, insertOrdered(m.parked, it)
+		return
+	}
+	g := m.groups[it.rec.BlockedOn]
+	if g == nil {
+		g = &group{dep: it.rec.BlockedOn, items: list.New()}
+		m.groups[g.dep] = g
+	}
+	it.grp, it.gel = g, insertOrdered(g.items, it)
+	g.wake = time.Time{}
+}
+
+// unlink removes it from the index.
+func (m *machine) unlink(it *memItem) {
+	m.counts[it.rec.State]--
+	if g := it.grp; g != nil {
+		g.items.Remove(it.gel)
+		g.wake = time.Time{}
+		if g.items.Len() == 0 {
+			delete(m.groups, g.dep)
+		}
+	} else {
+		m.parked.Remove(it.gel)
+	}
+	it.grp, it.gel = nil, nil
+}
+
+// move changes an item's state and the dependency it waits on. Moving within one
+// group (Pending to Leased and back) keeps its place, so leasing the head of a
+// huge group and returning it costs O(1).
+func (m *machine) move(it *memItem, state State, dep string) {
+	if it.grp != nil && state != Parked && it.rec.BlockedOn == dep {
+		m.counts[it.rec.State]--
+		m.counts[state]++
+		it.rec.State = state
+		it.grp.wake = time.Time{}
+		return
+	}
+	m.unlink(it)
+	it.rec.State, it.rec.BlockedOn = state, dep
+	m.link(it)
 }
 
 // prepare validates r and returns the record exactly as it will be stored
@@ -100,6 +194,7 @@ func (m *machine) insert(rec Record) {
 	it := &memItem{rec: rec, size: rec.Size()}
 	it.el = m.order.PushBack(it)
 	m.items[rec.ID] = it
+	m.link(it)
 	if rec.OrderKey != "" {
 		m.byKey[rec.OrderKey] = append(m.byKey[rec.OrderKey], it)
 	}
@@ -109,8 +204,9 @@ func (m *machine) insert(rec Record) {
 	}
 }
 
-// eligible reports whether it may be leased at now.
-func (m *machine) eligible(it *memItem, now time.Time, req LeaseRequest) bool {
+// eligible reports whether it may be leased at now. Which dependency it waits on
+// is decided a level up, by group.
+func (m *machine) eligible(it *memItem, now time.Time) bool {
 	switch it.rec.State {
 	case Parked:
 		return false
@@ -123,28 +219,92 @@ func (m *machine) eligible(it *memItem, now time.Time, req LeaseRequest) bool {
 			return false
 		}
 	}
-	if req.BlockedOn != "" && it.rec.BlockedOn != req.BlockedOn {
-		return false
-	}
-	for _, skip := range req.Skip {
-		if it.rec.BlockedOn == skip {
-			return false
-		}
-	}
 	if k := it.rec.OrderKey; k != "" && m.byKey[k][0] != it {
 		return false // an earlier record with this key is still in the store
 	}
 	return true
 }
 
-// selectLease picks the records a Lease call would hand out, without changing
-// anything.
-func (m *machine) selectLease(now time.Time, req LeaseRequest) []*memItem {
+// scanGroup returns up to max eligible items of g, oldest first. A scan that finds
+// nothing records when the group could next have something.
+func (m *machine) scanGroup(g *group, now time.Time, max int) []*memItem {
 	var out []*memItem
-	for el := m.order.Front(); el != nil && len(out) < req.Max; el = el.Next() {
-		if it := el.Value.(*memItem); m.eligible(it, now, req) {
+	var next time.Time
+	for el := g.items.Front(); el != nil; el = el.Next() {
+		it := el.Value.(*memItem)
+		if m.eligible(it, now) {
 			out = append(out, it)
+			if len(out) == max {
+				return out
+			}
+			continue
 		}
+		var t time.Time
+		switch it.rec.State {
+		case Pending:
+			t = it.rec.NextAttempt
+		case Leased:
+			t = it.leaseUntil
+		}
+		if t.After(now) && (next.IsZero() || t.Before(next)) {
+			next = t
+		}
+	}
+	if len(out) == 0 {
+		if limit := now.Add(maxWakeSkew); next.IsZero() || next.After(limit) {
+			next = limit
+		}
+		g.wake = next
+	}
+	return out
+}
+
+// selectLease picks the records a Lease call would hand out, without changing
+// anything. Groups for skipped dependencies, and groups known to have nothing due,
+// cost nothing.
+func (m *machine) selectLease(now time.Time, req LeaseRequest) []*memItem {
+	var skip map[string]struct{}
+	if len(req.Skip) > 0 {
+		skip = make(map[string]struct{}, len(req.Skip))
+		for _, d := range req.Skip {
+			skip[d] = struct{}{}
+		}
+	}
+	var lists [][]*memItem
+	consider := func(g *group) {
+		if _, skipped := skip[g.dep]; skipped {
+			return
+		}
+		if !g.wake.IsZero() && now.Before(g.wake) {
+			return
+		}
+		if items := m.scanGroup(g, now, req.Max); len(items) > 0 {
+			lists = append(lists, items)
+		}
+	}
+	if req.BlockedOn != "" {
+		if g := m.groups[req.BlockedOn]; g != nil {
+			consider(g)
+		}
+	} else {
+		for _, g := range m.groups {
+			consider(g)
+		}
+	}
+	// Merge the groups' candidates by Seq so the oldest records go first.
+	var out []*memItem
+	for len(out) < req.Max {
+		best := -1
+		for i, l := range lists {
+			if len(l) > 0 && (best < 0 || l[0].rec.Seq < lists[best][0].rec.Seq) {
+				best = i
+			}
+		}
+		if best < 0 {
+			break
+		}
+		out = append(out, lists[best][0])
+		lists[best] = lists[best][1:]
 	}
 	return out
 }
@@ -155,7 +315,7 @@ func (m *machine) grant(items []*memItem, now time.Time, ttl time.Duration) []Le
 	for _, it := range items {
 		it.token = newToken()
 		it.leaseUntil = now.Add(ttl)
-		it.rec.State = Leased
+		m.move(it, Leased, it.rec.BlockedOn)
 		it.rec.Attempts++
 		out = append(out, Lease{Record: it.rec.Clone(), Token: it.token, Until: it.leaseUntil})
 	}
@@ -181,16 +341,26 @@ func (m *machine) resize(it *memItem) {
 }
 
 func (m *machine) remove(it *memItem) {
+	m.unlink(it)
 	m.order.Remove(it.el)
 	delete(m.items, it.rec.ID)
 	m.bytes -= int64(it.size)
 	if k := it.rec.OrderKey; k != "" {
 		list := m.byKey[k]
 		for i, x := range list {
-			if x == it {
-				list = append(list[:i], list[i+1:]...)
-				break
+			if x != it {
+				continue
 			}
+			if i == 0 { // the head leaving is the usual case: O(1), and it may unblock its successor
+				list[0] = nil
+				list = list[1:]
+				if len(list) > 0 && list[0].grp != nil {
+					list[0].grp.wake = time.Time{}
+				}
+			} else {
+				list = append(list[:i], list[i+1:]...)
+			}
+			break
 		}
 		if len(list) == 0 {
 			delete(m.byKey, k)
@@ -252,6 +422,7 @@ func (m *machine) insertOffloaded(rec Record, body blobRef) {
 	it.rec = rec
 	it.el = m.order.PushBack(it)
 	m.items[rec.ID] = it
+	m.link(it)
 	if rec.OrderKey != "" {
 		m.byKey[rec.OrderKey] = append(m.byKey[rec.OrderKey], it)
 	}
@@ -262,22 +433,23 @@ func (m *machine) insertOffloaded(rec Record, body blobRef) {
 }
 
 func (m *machine) applyNack(it *memItem, at, next time.Time, errText, blockedOn string, refund bool) {
-	it.rec.State = Pending
+	dep := it.rec.BlockedOn
+	if blockedOn != "" {
+		dep = blockedOn
+	}
+	m.move(it, Pending, dep)
 	if refund && it.rec.Attempts > 0 {
 		it.rec.Attempts--
 	}
 	it.rec.LastFailed = at
 	it.rec.NextAttempt = next
 	it.rec.LastError = errText
-	if blockedOn != "" {
-		it.rec.BlockedOn = blockedOn
-	}
 	it.unlease()
 	m.resize(it)
 }
 
 func (m *machine) applyRelease(it *memItem) {
-	it.rec.State = Pending
+	m.move(it, Pending, it.rec.BlockedOn)
 	if it.rec.Attempts > 0 {
 		it.rec.Attempts--
 	}
@@ -285,7 +457,7 @@ func (m *machine) applyRelease(it *memItem) {
 }
 
 func (m *machine) applyPark(it *memItem, at time.Time, reason string) {
-	it.rec.State = Parked
+	m.move(it, Parked, it.rec.BlockedOn)
 	it.rec.LastFailed = at
 	it.rec.LastError = reason
 	it.unlease()
@@ -293,7 +465,7 @@ func (m *machine) applyPark(it *memItem, at time.Time, reason string) {
 }
 
 func (m *machine) applyRequeue(it *memItem, replace bool, checkpoint []byte) {
-	it.rec.State = Pending
+	m.move(it, Pending, it.rec.BlockedOn)
 	it.rec.Attempts = 0
 	it.rec.NextAttempt = time.Time{}
 	if replace {
@@ -301,7 +473,9 @@ func (m *machine) applyRequeue(it *memItem, replace bool, checkpoint []byte) {
 	}
 }
 
-// parkedItems returns up to limit parked items with Seq greater than after.
+// parkedItems returns up to limit parked items with Seq greater than after, and
+// stops early once the page would carry maxParkedPageBytes of payload. Callers page
+// until they get an empty result, not until a short one.
 func (m *machine) parkedItems(after uint64, limit int) []*memItem {
 	if limit <= 0 {
 		limit = 100
@@ -310,11 +484,17 @@ func (m *machine) parkedItems(after uint64, limit int) []*memItem {
 		limit = 1000
 	}
 	var out []*memItem
-	for el := m.order.Front(); el != nil && len(out) < limit; el = el.Next() {
+	var bytes int
+	for el := m.parked.Front(); el != nil && len(out) < limit; el = el.Next() {
 		it := el.Value.(*memItem)
-		if it.rec.State == Parked && it.rec.Seq > after {
-			out = append(out, it)
+		if it.rec.Seq <= after {
+			continue
 		}
+		if len(out) > 0 && bytes+it.size > maxParkedPageBytes {
+			break
+		}
+		out = append(out, it)
+		bytes += it.size
 	}
 	return out
 }
@@ -332,22 +512,22 @@ func (m *machine) parkedList(after uint64, limit int) []Record {
 func (m *machine) hasOrderKey(k string) bool { return k != "" && len(m.byKey[k]) > 0 }
 
 func (m *machine) stats(now time.Time) StoreStats {
-	st := StoreStats{Bytes: m.bytes}
-	oldest := true
-	for el := m.order.Front(); el != nil; el = el.Next() {
-		it := el.Value.(*memItem)
-		switch it.rec.State {
-		case Pending:
-			st.Pending++
-			if oldest {
-				st.OldestPending = now.Sub(it.rec.FirstFailed)
-				oldest = false
+	st := StoreStats{Bytes: m.bytes, Pending: m.counts[Pending], Leased: m.counts[Leased], Parked: m.counts[Parked]}
+	// The oldest waiting record is the first Pending item of some group. Only
+	// leased items can precede it in a group, and those are few.
+	var oldest *memItem
+	for _, g := range m.groups {
+		for el := g.items.Front(); el != nil; el = el.Next() {
+			if it := el.Value.(*memItem); it.rec.State == Pending {
+				if oldest == nil || it.rec.Seq < oldest.rec.Seq {
+					oldest = it
+				}
+				break
 			}
-		case Leased:
-			st.Leased++
-		case Parked:
-			st.Parked++
 		}
+	}
+	if oldest != nil {
+		st.OldestPending = now.Sub(oldest.rec.FirstFailed)
 	}
 	return st
 }
@@ -358,7 +538,7 @@ func (m *machine) stats(now time.Time) StoreStats {
 func (m *machine) replayLease(id string) {
 	if it, ok := m.items[id]; ok {
 		it.rec.Attempts++
-		it.rec.State = Leased
+		m.move(it, Leased, it.rec.BlockedOn)
 	}
 }
 
@@ -399,7 +579,7 @@ func (m *machine) endReplay() {
 	for el := m.order.Front(); el != nil; el = el.Next() {
 		it := el.Value.(*memItem)
 		if it.rec.State == Leased {
-			it.rec.State = Pending
+			m.move(it, Pending, it.rec.BlockedOn)
 			it.unlease()
 		}
 	}

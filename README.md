@@ -55,6 +55,14 @@ client := &http.Client{Transport: rt}
 | `goguard.Skip(ctx)` | Let one request bypass protection. |
 | `goguard.PriorityKey` | Set to `true` in the context to bypass the bulkhead (never the circuit). |
 
+**Good to know**
+
+- Hosts are compared in canonical form (lower case, no trailing dot, no default port), so `Host("example.com")` matches `https://EXAMPLE.com:443/`, and both spellings share one circuit.
+- The default transport enables HTTP/2 and keeps 100 idle connections (16 per host, 90 s); set `Config.MaxIdleConns`, `MaxIdleConnsPerHost` and `IdleConnTimeout`, or supply your own `Transport`. `http.Client.CloseIdleConnections` reaches it through the guard.
+- Request bodies are closed on every path, including requests rejected by an open circuit.
+- When an endpoint's circuits reach `MaxBreakers`, closed circuits are evicted before open ones, so a burst of new hosts cannot wash away the knowledge that a dependency is down.
+- `HealthHeader` (a credential for `/health`) is refused with `GuardAll`, which would send it to every host you call.
+
 **Observing**
 
 - `Config.OnStateChange` is delivered in order on its own goroutine, so a slow callback cannot stall requests.
@@ -134,7 +142,7 @@ A `dlq.Record` captures work that could not be finished (a Kafka message, a requ
 
 | | Survives a process crash | Survives power loss | Use it for |
 |---|---|---|---|
-| `dlq.NewMemoryStore` | no | no | tests, or work you can afford to lose on restart |
+| `dlq.NewMemoryStore` | no | no | tests, or work you can afford to lose on restart (holds up to 512 MiB unless `MaxBytes` says otherwise; a negative `MaxBytes` removes the cap) |
 | `dlq.OpenWAL` | yes | yes (with the default `SyncAlways`) | anything you must not lose |
 
 Any store can be checked against the contract with `storetest.Run` from `dlq/storetest`.
@@ -165,7 +173,7 @@ A segmented, checksummed write-ahead log: every change is one CRC-32C-framed ent
 
 **Limits to plan for**
 
-- **`MaxBytes` (default 512 MiB) bounds the live data on disk** and `MaxRecords` bounds the index in memory; beyond either, `Append` returns `ErrFull`. Size them for the worst outage you want to ride out. Set `PayloadsInMemory` to keep everything in RAM (faster leases, and then `MaxBytes` is also your memory budget); compaction then blocks other operations while it writes.
+- **`MaxBytes` (default 512 MiB) bounds the live data on disk** and `MaxRecords` (default 1,000,000) bounds the index in memory; beyond either, `Append` returns `ErrFull`. Size them for the worst outage you want to ride out. Set `PayloadsInMemory` to keep everything in RAM (faster leases, and then `MaxBytes` is also your memory budget); compaction then blocks other operations while it writes.
 - **Unix only.** Directory locking is not implemented elsewhere, so `OpenWAL` refuses to run without it.
 - Quarantine files are kept until you remove them. They hold whatever was in the damaged tail, in the clear unless the store is wrapped with `dlq.Secure`.
 - Wrap it with `dlq.Secure` to encrypt payloads at rest; the log itself only checksums.
@@ -210,6 +218,7 @@ go r.Run(ctx) // returns when ctx ends, after finishing or releasing what it hol
 - **Recovery drains the backlog gently.** A rate limit spreads the replay, and after a recovery the rate ramps up from 10% over `RampUp`. Add `r.Sink()` to your breakers' events to react to recovery at once instead of at the next poll.
 - **The handler's return value decides what happens:** `nil` removes the record; a `*dlq.BlockedError` or a `breaker.ErrOpen` holds it for that dependency (an open circuit costs no attempt); `retry.Permanent(err)` parks it for a human; any other error retries with backoff.
 - **Poison pills park; outages don't.** A record that fails `MaxAttempts` times is parked, and so is one whose lease was taken `MaxAttempts` times without finishing (a handler that keeps crashing on it never sees it again). Being rejected by an open circuit is not the record's fault and is never counted. A `BlockedError` for a call that was made and failed *is* counted, so a message that itself breaks a dependency cannot loop forever; set `Refund` only when the call was never made.
+- **Bounded impact on the dependency.** A `BlockedError` for a call that was made and failed backs off like any failure (`Backoff`), so a struggling dependency is not hit every second and the attempt budget is not spent in seconds. A store that hiccups (a timeout, a dropped connection) does not stop the redriver: it backs off, retries, and counts the error in `Stats().StoreErrors`; only a store that has failed for good (`ErrStoreFailed`, `ErrClosed`, `ErrCorrupt`) ends `Run` with an error.
 - **Safe under failure.** One record is never handled twice at once, even by a handler that outlives its lease; the handler's context ends before the lease does; a handler that panics is treated as a failure without keeping the panic text; stored error text is redacted; on shutdown, unfinished records are released without penalty.
 - Events (`obs.Redrive`) and `Stats()` report every outcome. Per-key ordering (`OrderKey`) is preserved with any number of workers.
 
@@ -286,10 +295,13 @@ Only the topics you bind are consumed and guarded. For every message the consume
 - **An offset is committed only when its message is safe:** fully processed, or durably stored in the `Store` together with its progress. Commits are batched (`CommitInterval`, `CommitBatch`) and always made on rebalance and shutdown. A crash between commits redelivers messages that were already safe, which is harmless: storing is idempotent by ID and pipeline steps carry idempotency keys.
 - **While a dependency is down, the topic pauses and the messages stay in Kafka.** If any circuit breaker used by a topic's pipeline is open, its partitions are paused. Kafka retains the backlog far more cheaply than a local queue, nothing is copied out, and the consumer keeps polling, so the group does not think it died (verified against a real broker for longer than both `session.timeout.ms` and `max.poll.interval.ms`). When the circuit half-opens, consumption resumes and a real message is the canary.
 - **A message that cannot finish is stored, not blocking.** A failing step defers the message with its checkpoint to the `Store`; the topic keeps flowing and a `dlq.Redriver` running `pipeline.Handler()` completes it when its dependency recovers, resuming at the failed step.
-- **A message is never skipped.** If a message can neither be processed nor stored (the store is full, a timeout), the partition is pointed back at it and paused for a backoff (`Stats().Backpressure` counts store-full cases); nothing behind it is processed first. The consumer also refuses any message that is not exactly the next offset, so a gap or a stale delivery can never be committed past. If the store fails closed, or the consumer cannot seek back, `Run` stops with an error instead of continuing past a message it cannot protect.
+- **A message is never skipped.** If a message can neither be processed nor stored (the store is full or unavailable), the partition is pointed back at it and paused for a backoff (`Stats().Backpressure` counts store-full cases); nothing behind it is processed first. The consumer also refuses any message that is not exactly the next offset, so a gap or a stale delivery can never be committed past. If the store fails closed, or the consumer cannot seek back, `Run` stops with an error instead of continuing past a message it cannot protect.
+- **A message that hangs cannot pin a partition.** If processing outlives `ProcessTimeout`, the message is stored with its progress like any other failed step and the offset moves on; the redriver then counts its attempts and parks it if it keeps hanging. (Cancelling the context is different: that is you stopping, and stores nothing.)
 - **Per-key ordering.** While a message with a key is waiting in the store, later messages with the same key are stored behind it (`dlq.Store.HasOrderKey`) instead of being processed ahead of it, and the redriver replays them in order. Other keys are unaffected. `IgnoreKeyOrder` turns this off.
 - **Rebalances are safe.** Progress on partitions being revoked is committed before they are released; pauses are re-applied to partitions that come back. Both the eager and cooperative protocols work. On shutdown the final commit keeps polling and retrying (`ShutdownTimeout`), because a commit is refused while a rebalance is in progress.
 - **Parked messages can be mirrored to a dead-letter topic** (`kafka.NewDLQPublisher`, default `<topic>.dlq`) with the original key, value and headers plus `x-goguard-*` metadata (original topic, partition, offset, reason, attempts, record ID). Pass `publisher.Publish` as `dlq.RedriveConfig.OnPark` for messages the redriver parks. The mirror is best effort: the message is already parked in the store. The producer is idempotent with `acks=all`. The mirrored payload leaves the store, so this is opt-in.
+
+`confluent.NewClient` takes `confluent.WithErrorHandler(func(error))` for the errors librdkafka retries by itself (brokers unreachable, authentication failing): without it an unreachable cluster looks like an idle topic. A message that arrives carrying an error stops the consumer rather than being skipped.
 
 **Requirements and limits.** Processing is sequential per consumer (scale by running more consumers in the group), and one message's processing must stay under `max.poll.interval.ms` (`ProcessTimeout` bounds it). Set `auto.offset.reset` yourself; auto-commit and offset-storing are forced off. Run the integration tests against a broker with `KAFKA_BROKERS=host:9092 make kafka-integration`.
 
@@ -308,7 +320,16 @@ This release changes behaviour deliberately:
 - `Policy.HeartbeatInterval` and `HeartbeatFunc` are replaced by `Policy.Health` / `HealthPath` (see "Recovery"), and `breaker.RecordProbe` is gone: probes are driven by package `health`.
 - A circuit that closes starts with a clean sampling window, so failures from before an outage cannot reopen it on the first new error.
 - `Breaker.Close` now exists; call it if the breaker has a health check.
+- `dlq.OpenWAL` caps the in-memory index at 1,000,000 records by default when payloads are on disk (`MaxRecords`; negative removes the cap).
+- `dlq.NewMemoryStore` is capped at 512 MiB by default (`ErrFull` beyond it, which the consumer turns into backpressure); set `MaxBytes` negative for the old unlimited behaviour.
+- `Store.Parked` may return a page shorter than `Limit` when the payload would exceed about 32 MiB; page until an empty result.
+- `goguard.Host` and `HostPath` ignore the default ports (`:80`, `:443`) and a trailing dot; circuit names for per-host circuits use the same canonical form.
+- A `pipeline` run that outlives its context deadline is stored against its step (it used to fail without being stored); a cancelled context still stores nothing.
 - `dlq.Store` gained `HasOrderKey`, `Get`, `Parked` and `RequeueWith` (implement them in custom stores), plus `NackOptions.Refund` and `LeaseRequest.Skip`.
+
+## Review
+
+`docs/AUDIT.md` records a full review of the project (bottlenecks, data loss, security, usability, reliability, scalability): what was found, what was fixed and how it was verified, and what is deliberately left open.
 
 ## Roadmap
 

@@ -33,6 +33,7 @@ type Breaker struct {
 	inflight    int32
 	maxInflight int32
 	probing     int32
+	probeAt     int64 // unix nanos when the current probe was admitted
 	override    int32
 	dryRun      int32
 	healthGated int32 // 1: only a health check may end the open state (until maxOpen)
@@ -129,13 +130,23 @@ func (b *Breaker) circuitAllows(shardSeed *uint64) bool {
 		if now-last > int64(b.sleepWindow)+jitter {
 			if b.transition(engine.StateOpen, engine.StateHalfOpen) {
 				if atomic.CompareAndSwapInt32(&b.probing, 0, 1) {
+					atomic.StoreInt64(&b.probeAt, now)
 					return true
 				}
 			}
 		}
 		return dryRun
 	case engine.StateHalfOpen:
+		now := time.Now().UnixNano()
 		if atomic.CompareAndSwapInt32(&b.probing, 0, 1) {
+			atomic.StoreInt64(&b.probeAt, now)
+			return true
+		}
+		// A probe that never reports back (a Permit that was never finished) must not
+		// wedge the circuit half-open for ever: after a sleep window, let another
+		// call take over as the probe.
+		if last := atomic.LoadInt64(&b.probeAt); last != 0 && now-last > int64(b.sleepWindow) &&
+			atomic.CompareAndSwapInt64(&b.probeAt, last, now) {
 			return true
 		}
 		return dryRun

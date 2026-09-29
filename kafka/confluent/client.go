@@ -21,7 +21,18 @@ type Client struct {
 	c       *ck.Consumer
 	handler atomic.Pointer[kafka.RebalanceHandler]
 	failure atomic.Pointer[error] // an error from the handler, reported by the next Poll
+	onError func(error)
 }
+
+// Option customises NewClient.
+type Option func(*Client)
+
+// WithErrorHandler receives the errors librdkafka retries by itself (a broker
+// down, a connection lost, an authentication problem). The consumer keeps running
+// through them, so without a handler an unreachable cluster looks like an idle
+// topic. The handler is called on the polling goroutine and must not block; the
+// error text can name broker addresses but never message data.
+func WithErrorHandler(f func(error)) Option { return func(c *Client) { c.onError = f } }
 
 var _ kafka.Client = (*Client)(nil)
 
@@ -33,7 +44,7 @@ var _ kafka.Client = (*Client)(nil)
 // decide when an offset is safe: enable.auto.commit=false and
 // enable.auto.offset.store=false. Set auto.offset.reset (earliest is usual)
 // yourself. Both the eager and the cooperative rebalance protocols work.
-func NewClient(cfg ck.ConfigMap, topics []string) (*Client, error) {
+func NewClient(cfg ck.ConfigMap, topics []string, opts ...Option) (*Client, error) {
 	if _, err := cfg.Get("group.id", nil); err != nil {
 		return nil, err
 	}
@@ -59,6 +70,9 @@ func NewClient(cfg ck.ConfigMap, topics []string) (*Client, error) {
 		return nil, fmt.Errorf("confluent: creating consumer: %w", err)
 	}
 	cl := &Client{c: c}
+	for _, o := range opts {
+		o(cl)
+	}
 	if err := c.SubscribeTopics(topics, cl.rebalance); err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("confluent: subscribing: %w", err)
@@ -136,6 +150,10 @@ func (c *Client) Poll(ctx context.Context, timeout time.Duration) (kafka.Event, 
 	}
 	switch e := ev.(type) {
 	case *ck.Message:
+		if e.TopicPartition.Error != nil {
+			// A message that could not be delivered must not be skipped: stop and say why.
+			return nil, fmt.Errorf("confluent: message error on %s[%d]: %w", toTP(e.TopicPartition).Topic, e.TopicPartition.Partition, e.TopicPartition.Error)
+		}
 		m := kafka.Message{
 			TopicPartition: toTP(e.TopicPartition), Offset: int64(e.TopicPartition.Offset),
 			Key: e.Key, Value: e.Value, Timestamp: e.Timestamp,
@@ -147,6 +165,9 @@ func (c *Client) Poll(ctx context.Context, timeout time.Duration) (kafka.Event, 
 	case ck.Error:
 		if e.IsFatal() {
 			return nil, e
+		}
+		if c.onError != nil {
+			c.onError(e)
 		}
 		return nil, nil // librdkafka retries transient errors (a broker down, a timeout) itself
 	default:

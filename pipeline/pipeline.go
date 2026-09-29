@@ -336,12 +336,17 @@ func (r *run) advance(ctx context.Context) error {
 	return nil
 }
 
-// classify turns a step's error into what the caller should do.
+// classify turns a step's error into what the caller should do. A run that
+// outlives its own deadline (Kafka's ProcessTimeout, the redriver's lease) is held
+// against the step it was in: the message is stored with its progress and the
+// attempt counts, so a message that always hangs is eventually parked instead of
+// being retried for ever, blocking everything behind it. A cancelled context is
+// different: that is the caller stopping, and says nothing about the message.
 func (r *run) classify(ctx context.Context, st *Step, err error) error {
 	switch {
 	case retry.IsPermanent(err):
 		return err
-	case ctx.Err() != nil:
+	case ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return err // the caller is shutting down or gave up: not the dependency's fault
 	case errors.Is(err, breaker.ErrOpen):
 		return &dlq.BlockedError{Dependency: st.dependency(), Err: err, Refund: true}

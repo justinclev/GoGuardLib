@@ -55,7 +55,11 @@ const (
 	// DefaultWALMaxBytes bounds the live data a store holds when
 	// WALOptions.MaxBytes is zero. Payloads live on disk by default, so this is a
 	// disk limit; with PayloadsInMemory it is also the memory the queue can use.
-	DefaultWALMaxBytes    = 512 << 20
+	DefaultWALMaxBytes = 512 << 20
+	// DefaultWALMaxRecords bounds the in-memory index (about 300 bytes a record) when
+	// payloads are on disk and WALOptions.MaxRecords is zero. Without it a flood of
+	// tiny records could fit the byte limit and still need gigabytes of index.
+	DefaultWALMaxRecords  = 1_000_000
 	defaultSegmentBytes   = 64 << 20
 	defaultCompactMin     = 64 << 20
 	defaultCompactRatio   = 2.0
@@ -75,7 +79,9 @@ type walFile interface {
 
 // WALOptions configures OpenWAL. The zero value is a safe production default.
 type WALOptions struct {
-	// MaxRecords caps the number of records; Append beyond it returns ErrFull.
+	// MaxRecords caps the number of records; Append beyond it returns ErrFull. With
+	// payloads on disk it bounds memory and defaults to DefaultWALMaxRecords (a
+	// negative value removes the cap); with PayloadsInMemory it defaults to no cap.
 	MaxRecords int
 	// MaxBytes caps the estimated bytes of live records, payload included; Append
 	// and Checkpoint beyond it return ErrFull. Payloads are on disk by default, so
@@ -132,6 +138,9 @@ type WALOptions struct {
 }
 
 func (o *WALOptions) applyDefaults() error {
+	if o.MaxRecords == 0 && !o.PayloadsInMemory {
+		o.MaxRecords = DefaultWALMaxRecords
+	}
 	if o.MaxBytes == 0 {
 		o.MaxBytes = DefaultWALMaxBytes
 	}

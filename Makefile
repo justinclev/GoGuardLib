@@ -1,4 +1,4 @@
-.PHONY: all fmt fmt-check vet lint test cover build kafka kafka-integration
+.PHONY: all fmt fmt-check vet lint test cover build kafka kafka-integration vuln
 
 all: fmt-check vet lint test build
 
@@ -31,3 +31,7 @@ kafka:
 # Needs a broker: KAFKA_BROKERS=host:9092 make kafka-integration
 kafka-integration:
 	cd kafka && go test -tags integration -count=1 -timeout 15m ./confluent/
+
+# Needs network access to the vulnerability database.
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...

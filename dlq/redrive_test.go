@@ -703,7 +703,7 @@ func TestABlockThatCountsEventuallyParksTheRecord(t *testing.T) {
 	addBlocked(t, store, 1, "pay")
 	var calls atomic.Int32
 	r := newRedriver(t, dlq.RedriveConfig{
-		Store: store, MaxAttempts: 3,
+		Store: store, MaxAttempts: 3, Backoff: retry.Constant(time.Millisecond),
 		Handler: func(ctx context.Context, it *dlq.Item) error {
 			calls.Add(1)
 			return &dlq.BlockedError{Dependency: "pay", Err: errors.New("payments returned 500 for this order")} // Refund: false
@@ -755,5 +755,33 @@ func TestOnParkReceivesTheParkedRecordAndFailuresAreOnlyCounted(t *testing.T) {
 	}
 	if r.Stats().MirrorErrors != 2 {
 		t.Fatalf("MirrorErrors = %d, want 2 (one error, one panic)", r.Stats().MirrorErrors)
+	}
+}
+
+// flakyStore fails Lease a few times with an ordinary error, as a remote store
+// would when its connection drops.
+type flakyStore struct {
+	dlq.Store
+	fails atomic.Int32
+}
+
+func (f *flakyStore) Lease(ctx context.Context, req dlq.LeaseRequest) ([]dlq.Lease, error) {
+	if f.fails.Add(-1) >= 0 {
+		return nil, errors.New("connection reset")
+	}
+	return f.Store.Lease(ctx, req)
+}
+
+func TestRedriverSurvivesTransientStoreErrors(t *testing.T) {
+	inner := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	addBlocked(t, inner, 1, "pay")
+	fs := &flakyStore{Store: inner}
+	fs.fails.Store(2)
+	var handled atomic.Int32
+	r := newRedriver(t, dlq.RedriveConfig{Store: fs, Handler: func(context.Context, *dlq.Item) error { handled.Add(1); return nil }})
+	start(t, r)
+	eventually(t, "the record to be handled after the store recovered", func() bool { return handled.Load() == 1 })
+	if r.Stats().StoreErrors < 2 {
+		t.Fatalf("StoreErrors = %d, want the failures counted", r.Stats().StoreErrors)
 	}
 }

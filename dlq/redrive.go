@@ -213,13 +213,38 @@ func (r *Redriver) Run(ctx context.Context) error {
 
 func (r *Redriver) capacity() int { return r.cfg.Workers * 2 }
 
+// fatalStoreError reports whether err means the store can no longer be used. Other
+// errors (a timeout, a dropped connection to a remote store) are worth retrying.
+func fatalStoreError(err error) bool {
+	return errors.Is(err, ErrStoreFailed) || errors.Is(err, ErrClosed) || errors.Is(err, ErrCorrupt)
+}
+
+const maxStoreRetryDelay = 30 * time.Second
+
 func (r *Redriver) dispatch(ctx context.Context, work chan<- Lease) error {
 	ticker := time.NewTicker(r.cfg.PollInterval)
 	defer ticker.Stop()
+	var retryDelay time.Duration
 	for {
 		if err := r.fill(ctx, work); err != nil {
-			return err
+			if fatalStoreError(err) {
+				return err
+			}
+			// A store that hiccups must not end redriving for good: back off and
+			// try again. The error is counted in Stats().StoreErrors.
+			if retryDelay = retryDelay*2 + 100*time.Millisecond; retryDelay > maxStoreRetryDelay {
+				retryDelay = maxStoreRetryDelay
+			}
+			t := time.NewTimer(retryDelay)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return nil
+			case <-t.C:
+			}
+			continue
 		}
+		retryDelay = 0
 		select {
 		case <-ctx.Done():
 			return nil
@@ -257,6 +282,7 @@ func (r *Redriver) fill(ctx context.Context, work chan<- Lease) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			r.lim.give(granted) // nothing was leased: do not spend the rate limit on it
 			r.storeErrors.Add(1)
 			return fmt.Errorf("dlq: redriver lease: %w", err)
 		}
@@ -431,8 +457,15 @@ func (r *Redriver) block(ctx context.Context, l Lease, dep string, refund bool, 
 		return
 	}
 	hold := r.cfg.PollInterval * 2
+	delay := hold
+	if !refund {
+		// The call was made and failed: back off as for any failure, so a dependency
+		// that is struggling is not hit every second and the attempt budget is not
+		// spent in seconds.
+		delay = max(hold, r.cfg.Backoff(l.Record.Attempts))
+	}
 	err := r.cfg.Store.Nack(ctx, l.Record.ID, l.Token, NackOptions{
-		Delay: hold, Err: r.cfg.Redactor.Error(cause), BlockedOn: dep, Refund: refund,
+		Delay: delay, Err: r.cfg.Redactor.Error(cause), BlockedOn: dep, Refund: refund,
 	})
 	if err != nil {
 		r.storeFailure(err, l, dep, start)
