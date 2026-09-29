@@ -91,7 +91,6 @@ func post(client *http.Client, url, body string, hdr map[string]string) error {
 	return err
 }
 
-
 // The whole story, for both stores: the service is down, requests are saved and
 // not sent; the service returns; a redriver sends each once, with fresh credentials.
 func TestDeferredRequestsAreSavedThenReplayedOnce(t *testing.T) {
