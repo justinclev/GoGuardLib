@@ -5,7 +5,8 @@
   "scripts": {
     "ng": "ng",
     "start": "ng serve --proxy-config proxy.conf.json",
-    "build": "ng build"
+    "build": "ng build",
+    "check:paths": "node scripts/check-flow-paths.mjs"
   },
   "dependencies": {
     "@angular/common": "~21.2.24",

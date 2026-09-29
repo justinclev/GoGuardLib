@@ -108,6 +108,7 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm run build
+          npm run check:paths
 
   # The Kafka adapter is its own Go module (it needs cgo and confluent-kafka-go),
   # so the jobs above, which run at the repository root, do not touch it.

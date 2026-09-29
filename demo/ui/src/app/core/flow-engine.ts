@@ -1,5 +1,5 @@
-import { COLORS, NodeKey, NODES, Pt, TopicNode, gateOf, pos, svcOf, topicNode, H, W } from './layout';
-import { StreamEvent, isStep } from './models';
+import { COLORS, GATE_OFFSET, NodeKey, NODES, Pt, ROW_Y, SERVICE_X, STEP_INDEX, TopicNode, gateOf, pos, svcOf, topicNode, H, W } from './layout';
+import { StepName, StreamEvent, isStep } from './models';
 
 /**
  * Turns the stream of events into particles moving through the diagram. It draws on
@@ -38,6 +38,8 @@ class Particle {
   home: 'topic' | 'dlq' | null = null;
   /** The topic node this message waits in (orders or refunds). */
   tn: TopicNode = 'topic';
+  /** The last step this message started, to route it around the steps its pipeline skips. */
+  lastStep?: StepName;
   slot: Pt;
   angle = Math.random() * Math.PI * 2;
   target: NodeKey | null = null;
@@ -212,7 +214,9 @@ export class FlowEngine {
     switch (ev.status) {
       case 'started':
         if (ev.flow === 'kafka' && !ev.redriven) this.leaveTopic(p);
+        this.skipOver(p, s, ev.flow === 'kafka' && !ev.redriven);
         this.go(p, gateOf(s), 330);
+        p.lastStep = s;
         break;
       case 'ok':
         this.go(p, gateOf(s), 260);
@@ -237,6 +241,33 @@ export class FlowEngine {
         break;
       }
     }
+  }
+
+  /**
+   * A pipeline may skip steps (refunds go from Payments straight to Notifications). The message
+   * must not be drawn passing through a service it never calls, least of all one that is down,
+   * so it goes over the top of the row instead.
+   */
+  private skipOver(p: Particle, next: StepName, fromConsumer: boolean): void {
+    const gateX = SERVICE_X[next] - GATE_OFFSET;
+    if (!p.lastStep) {
+      // Its first step is not the first service (refunds start at Payments): come up from below,
+      // beside the gate, rather than cutting across the services before it.
+      if (fromConsumer && STEP_INDEX[next] >= 1) {
+        p.target = null;
+        p.queue.push({ k: 'go', to: { x: gateX - 6, y: ROW_Y + 100 }, dur: 380, curve: 0 });
+      }
+      return;
+    }
+    if (STEP_INDEX[next] - STEP_INDEX[p.lastStep] < 2) return;
+    const from = SERVICE_X[p.lastStep];
+    p.target = null;
+    const y = ROW_Y - 105; // above the row of services and their labels
+    // Straight up from the last service, across, then straight down beside the next gate.
+    p.queue.push(
+      { k: 'go', to: { x: from + 18, y }, dur: 220, curve: 0 },
+      { k: 'go', to: { x: gateX - 8, y }, dur: 320, curve: 0 },
+    );
   }
 
   private toDlq(p: Particle): void {
@@ -275,6 +306,7 @@ export class FlowEngine {
           p.y = NODES.dlq.y + p.slot.y * 20;
         }
         p.target = null;
+        p.lastStep = undefined; // it comes back from the log, not from the previous step
         p.queue.push({ k: 'color', color: COLORS.redriven }, { k: 'pulse' });
         this.go(p, isStep(ev.step) ? gateOf(ev.step) : gateOf('inventory'), 700, 0.22);
         break;
