@@ -227,8 +227,11 @@ After the fixes above, the code they added or changed (the queue index, the two-
 | T3 | Demo: control API accepted cross-site POSTs from any page in the operator's browser | Medium | Fixed |
 | T4 | Demo: ports were published on all interfaces | Low | Fixed |
 | T5 | Demo: the delivery ledger disagreed with the WAL after a crash restart | Medium | Fixed |
+| T6 | Demo: order IDs restarted at 1 after a crash, colliding with orders already in the log | Medium | Fixed |
 
 **T1.** Both `Run` loops waited on their workers without a limit. `RedriveConfig.ShutdownTimeout` (default 30s) and the consumer's `ShutdownTimeout` now bound the wait; the process can exit and the records stay leased or uncommitted, so they are redelivered. `TestRunReturnsEvenIfAHandlerIgnoresItsContext`, `TestShutdownIsBoundedWhenAStepIgnoresItsContext`.
+
+**T6.** Sequence counters live in memory, so after a hard kill new orders reused `K-1`, `K-2`... while the log still held those IDs, which would merge two different orders in the ledger and the UI. IDs now carry a per-boot tag (`K-<boot>-<n>`). Verified natively: 210 produced, 210 done, log empty, ledger agrees.
 
 **T2-T5.** The demo suppresses duplicate stored events, requires an `X-Requested-With` header on every POST, binds to `127.0.0.1` unless `BIND` is set, adds security headers in nginx, and seeds the ledger from the WAL at startup. The demo shows measured numbers only: no figure is invented, averages come from observed samples, and the success rate is blank until there is data.
 
