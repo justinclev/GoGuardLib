@@ -37,6 +37,11 @@ for v1.0" so it can be adopted early.
   pins govulncheck v1.7.0 (v1.8.0 needs Go 1.26). Also: read-only token, CodeQL, tagged releases; SECURITY.md,
   CODEOWNERS, CONTRIBUTING.md, docs/OPERATIONS.md, docs/SECURITY.md.
 
+### Documentation
+- README rewritten as a step-by-step quick start (any function, HTTP, health checks, a Kafka
+  consumer, a multi-step job) with code compiled from `examples/readme` and `kafka`; the
+  previous README is now docs/GUIDE.md.
+
 ### Planned defaults for v1.0
 `kafka.Config.RequireDurableStore`, `PublisherConfig.RequireEncryption` and
 `BrokersDownTimeout` on; `WALOptions.SyncTimeout` 30s; derived keys by default.
