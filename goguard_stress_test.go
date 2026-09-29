@@ -30,7 +30,7 @@ func TestShardedStress(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			host := fmt.Sprintf("host-%d.com", id)
-			_, _ = transport.getBreaker(host) 
+			_, _ = transport.getBreaker(host)
 			_, _ = transport.getBreaker(host)
 		}(i)
 	}

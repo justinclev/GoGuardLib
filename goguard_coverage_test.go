@@ -19,7 +19,7 @@ func TestCircuitError(t *testing.T) {
 		Err:       ErrCircuitOpen,
 		Retryable: false,
 	}
-	expected := "goguard: circuit breaker is open for host example.com (state: 1, retryable: false)"
+	expected := "goguard: circuit breaker is open for host example.com (state: open, retryable: false)"
 	if err.Error() != expected {
 		t.Errorf("expected %q, got %q", expected, err.Error())
 	}
@@ -145,7 +145,7 @@ func TestResilientTransport_Heartbeat(t *testing.T) {
 	defer rt.Close()
 
 	br, _ := rt.getBreaker(host)
-	
+
 	// Force open
 	br.MarkFailure()
 	if br.State() != engine.StateOpen {
@@ -237,7 +237,7 @@ func TestResilientTransport_RoundTrip_OutlierDetection(t *testing.T) {
 	}
 	rt := NewResilientTransport(Config{Transport: transport})
 	br, _ := rt.getBreaker("example.com")
-	
+
 	// Establish 10ms avg latency
 	for i := 0; i < 10; i++ {
 		br.MarkSuccess(10 * time.Millisecond)
@@ -252,10 +252,10 @@ func TestResilientTransport_RoundTrip_OutlierDetection(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://example.com", nil)
 	// We need to use a real RoundTrip to trigger the isFail check
 	rt.config.MaxLatency = 200 * time.Millisecond // Don't trigger this one
-	
+
 	// The logic in RoundTrip:
 	// if !isFail && duration > br.AvgLatency()*2 && br.AvgLatency() > 0 { isFail = true }
-	
+
 	_, err := rt.RoundTrip(req)
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)

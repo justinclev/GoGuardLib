@@ -29,19 +29,21 @@ type Breaker struct {
 	failureThreshold int64
 	retryBudgetBps   int64
 	sleepWindow      time.Duration
-	
-	inflight       int32
-	maxInflight    int32
-	probing          int32
-	override       int32
-	dryRun         int32
+
+	inflight    int32
+	maxInflight int32
+	probing     int32
+	override    int32
+	dryRun      int32
 
 	OnStateChange func(from, to engine.BreakerState)
 }
 
 func NewBreaker(failureThreshold float64, sleepWindow, samplingWindow, bucketDuration time.Duration, maxInflight int, minSamples int64, dryRun bool, retryBudget float64) *Breaker {
 	dr := int32(0)
-	if dryRun { dr = 1 }
+	if dryRun {
+		dr = 1
+	}
 	return &Breaker{
 		state:            engine.NewAtomicState(),
 		metrics:          engine.NewRollingWindow(samplingWindow, bucketDuration),
@@ -65,76 +67,96 @@ func (b *Breaker) transition(from, to engine.BreakerState) bool {
 	return false
 }
 
-func (b *Breaker) Allow(ctx context.Context, waitTimeout time.Duration, shardSeed *uint64, isVIP bool) bool {
-	override := atomic.LoadInt32(&b.override)
-	if override == 1 { return false }
-	if override == 2 {
+// acquire reserves an in-flight slot. The reservation is a CAS loop so the
+// bulkhead limit can never be exceeded, even under contention.
+func (b *Breaker) acquire(ctx context.Context, waitTimeout time.Duration, isVIP bool) bool {
+	if b.maxInflight <= 0 || isVIP {
 		atomic.AddInt32(&b.inflight, 1)
 		return true
 	}
+	if b.tryAcquire() {
+		return true
+	}
+	if waitTimeout <= 0 {
+		return false
+	}
+	t := time.NewTimer(waitTimeout)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return b.tryAcquire()
+	}
+}
 
-	// 1. Bulkhead Check
-	if b.maxInflight > 0 && !isVIP {
-		if atomic.LoadInt32(&b.inflight) >= b.maxInflight {
-			if waitTimeout <= 0 { return false }
-			t := time.NewTimer(waitTimeout)
-			defer t.Stop()
-			select {
-			case <-ctx.Done(): return false
-			case <-t.C:
-				// Re-check after waiting
-				if atomic.LoadInt32(&b.inflight) >= b.maxInflight {
-					return false
-				}
-			}
+func (b *Breaker) tryAcquire() bool {
+	for {
+		cur := atomic.LoadInt32(&b.inflight)
+		if cur >= b.maxInflight {
+			return false
+		}
+		if atomic.CompareAndSwapInt32(&b.inflight, cur, cur+1) {
+			return true
 		}
 	}
+}
 
+// circuitAllows decides whether the circuit admits a request. It does not touch
+// the in-flight counter.
+func (b *Breaker) circuitAllows(shardSeed *uint64) bool {
 	dryRun := atomic.LoadInt32(&b.dryRun) == 1
-	now := time.Now().UnixNano()
-	currentState := b.state.Get()
 
-	// 2. Circuit Check
-	if currentState == engine.StateOpen {
+	switch b.state.Get() {
+	case engine.StateOpen:
+		now := time.Now().UnixNano()
 		last := atomic.LoadInt64(&b.lastFailure)
 		jitterRange := int64(b.sleepWindow) / 10
 		var jitter int64
 		if jitterRange > 0 {
 			jitter = int64(xorshift64(shardSeed) % uint64(jitterRange))
 		}
-		if now-last > int64(b.sleepWindow) + jitter {
+		if now-last > int64(b.sleepWindow)+jitter {
 			if b.transition(engine.StateOpen, engine.StateHalfOpen) {
 				if atomic.CompareAndSwapInt32(&b.probing, 0, 1) {
-					atomic.AddInt32(&b.inflight, 1)
 					return true
 				}
 			}
 		}
-		if dryRun {
-			atomic.AddInt32(&b.inflight, 1)
-			return true
-		}
-		return false
-	}
-
-	if currentState == engine.StateHalfOpen {
+		return dryRun
+	case engine.StateHalfOpen:
 		if atomic.CompareAndSwapInt32(&b.probing, 0, 1) {
-			atomic.AddInt32(&b.inflight, 1)
 			return true
 		}
-		if dryRun {
-			atomic.AddInt32(&b.inflight, 1)
-			return true
-		}
+		return dryRun
+	default:
+		return true
+	}
+}
+
+func (b *Breaker) Allow(ctx context.Context, waitTimeout time.Duration, shardSeed *uint64, isVIP bool) bool {
+	switch atomic.LoadInt32(&b.override) {
+	case 1:
 		return false
+	case 2:
+		atomic.AddInt32(&b.inflight, 1)
+		return true
 	}
 
-	atomic.AddInt32(&b.inflight, 1)
+	if !b.acquire(ctx, waitTimeout, isVIP) {
+		return false
+	}
+	if !b.circuitAllows(shardSeed) {
+		atomic.AddInt32(&b.inflight, -1)
+		return false
+	}
 	return true
 }
 
 func (b *Breaker) CanRetry() bool {
-	if b.retryBudgetBps <= 0 { return true }
+	if b.retryBudgetBps <= 0 {
+		return true
+	}
 	return b.metrics.RetryRateBps() < b.retryBudgetBps
 }
 
@@ -142,8 +164,26 @@ func (b *Breaker) RecordRetry() {
 	b.metrics.RecordRetry(time.Now().UnixNano())
 }
 
+// MarkSuccess records a successful request and releases its in-flight slot.
 func (b *Breaker) MarkSuccess(latency time.Duration) {
 	atomic.AddInt32(&b.inflight, -1)
+	b.recordSuccess(latency)
+}
+
+// MarkFailure records a failed request and releases its in-flight slot.
+func (b *Breaker) MarkFailure() {
+	atomic.AddInt32(&b.inflight, -1)
+	b.recordFailure()
+}
+
+// ProbeSuccess records a successful out-of-band health probe. Probes never
+// held an in-flight slot, so none is released.
+func (b *Breaker) ProbeSuccess() { b.recordSuccess(time.Millisecond) }
+
+// ProbeFailure records a failed out-of-band health probe.
+func (b *Breaker) ProbeFailure() { b.recordFailure() }
+
+func (b *Breaker) recordSuccess(latency time.Duration) {
 	now := time.Now().UnixNano()
 	lUs := latency.Microseconds()
 	if lUs <= 0 {
@@ -159,8 +199,7 @@ func (b *Breaker) MarkSuccess(latency time.Duration) {
 	}
 }
 
-func (b *Breaker) MarkFailure() {
-	atomic.AddInt32(&b.inflight, -1)
+func (b *Breaker) recordFailure() {
 	now := time.Now().UnixNano()
 	b.metrics.Failure(now)
 	atomic.StoreInt64(&b.lastFailure, now)
@@ -186,6 +225,6 @@ func (b *Breaker) AvgLatency() time.Duration {
 	return time.Duration(b.metrics.AvgLatencyUs()) * time.Microsecond
 }
 
-func (b *Breaker) State() engine.BreakerState { return b.state.Get() }
+func (b *Breaker) State() engine.BreakerState      { return b.state.Get() }
 func (b *Breaker) Stats() (success, failure int64) { return b.metrics.Counts() }
-func (b *Breaker) SetOverride(v int) { atomic.StoreInt32(&b.override, int32(v)) }
+func (b *Breaker) SetOverride(v int)               { atomic.StoreInt32(&b.override, int32(v)) }

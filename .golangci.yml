@@ -1,0 +1,25 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - forbidigo
+    - errorlint
+    - bodyclose
+  settings:
+    forbidigo:
+      # The library never logs or prints: signals go through hooks and Stats().
+      forbid:
+        - pattern: ^(fmt\.(Print|Println|Printf|Fprint|Fprintln|Fprintf)|print|println)$
+          msg: goguard does not write output; surface signals through event hooks instead
+        - pattern: ^(log|slog)\.
+          msg: goguard does not log; surface signals through event hooks instead
+      analyze-types: true
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - forbidigo
+          - errcheck
+          - bodyclose
+          - errorlint

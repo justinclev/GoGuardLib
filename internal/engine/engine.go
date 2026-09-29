@@ -14,6 +14,19 @@ const (
 	StateHalfOpen
 )
 
+func (s BreakerState) String() string {
+	switch s {
+	case StateClosed:
+		return "closed"
+	case StateOpen:
+		return "open"
+	case StateHalfOpen:
+		return "half-open"
+	default:
+		return "unknown"
+	}
+}
+
 type AtomicState struct {
 	current int32
 }

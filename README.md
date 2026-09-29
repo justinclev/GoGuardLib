@@ -30,8 +30,10 @@ cfg := goguard.Config{
     RequestTimeout:   5 * time.Second, // Enforce a 5s timeout per request
     MaxRetries:       2,               // Retry idempotent requests on network errors
     MaxBreakers:      5000,            // LRU limit per shard
-    OnStateChange: func(host string, from, to engine.BreakerState) {
-        log.Printf("Host %s transitioned from %v to %v", host, from, to)
+    // Must not block: it runs on the request path. The library itself never logs;
+    // forward transitions to your own metrics or logging here.
+    OnStateChange: func(host string, from, to goguard.State) {
+        metrics.RecordTransition(host, from.String(), to.String())
     },
 }
 

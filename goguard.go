@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/justinclev/GoGuardLib/internal/breaker"
@@ -21,13 +23,22 @@ const (
 	PriorityKey contextKey = "goguard-priority"
 )
 
+// State is the state of a circuit breaker.
+type State = engine.BreakerState
+
+const (
+	StateClosed   = engine.StateClosed
+	StateOpen     = engine.StateOpen
+	StateHalfOpen = engine.StateHalfOpen
+)
+
 var (
 	ErrCircuitOpen = errors.New("circuit breaker is open")
 )
 
 type CircuitError struct {
 	Host      string
-	State     engine.BreakerState
+	State     State
 	Err       error
 	Retryable bool
 }
@@ -51,7 +62,7 @@ type Config struct {
 	MaxIdleTime         time.Duration
 	HeartbeatInterval   time.Duration
 	IsFailure           func(*http.Response, error) bool
-	OnStateChange       func(host string, from, to engine.BreakerState)
+	OnStateChange       func(host string, from, to State) // must not block: it runs on the request path
 	HeartbeatFunc       func(host string) error
 	RetryBackoff        func(attempt int) time.Duration
 	Transport           http.RoundTripper
@@ -70,7 +81,7 @@ type Config struct {
 type Option func(*Config)
 
 func WithTimeout(d time.Duration) Option { return func(c *Config) { c.RequestTimeout = d } }
-func WithRetries(n int) Option            { return func(c *Config) { c.MaxRetries = n } }
+func WithRetries(n int) Option           { return func(c *Config) { c.MaxRetries = n } }
 func WithRetryBudget(f float64) Option   { return func(c *Config) { c.RetryBudget = f } }
 func WithBulkhead(max int, wait time.Duration) Option {
 	return func(c *Config) {
@@ -79,10 +90,17 @@ func WithBulkhead(max int, wait time.Duration) Option {
 	}
 }
 
+// touchInterval bounds how often a cache hit refreshes LRU position, so the
+// hot path stays on the shard read lock.
+const touchInterval = int64(time.Second)
+
 type lruEntry struct {
 	host       string
 	breaker    *breaker.Breaker
-	lastAccess time.Time
+	ctx        context.Context // cancelled when the entry is evicted or the transport closes
+	cancel     context.CancelFunc
+	lastAccess int64 // unix nanos, atomic
+	hbRunning  int32 // atomic
 }
 
 type shard struct {
@@ -100,6 +118,10 @@ type ResilientTransport struct {
 	config     Config
 	hashPool   sync.Pool
 	shardMask  uint64
+
+	closeMu sync.Mutex
+	closed  bool
+	wg      sync.WaitGroup
 }
 
 func NewResilientTransport(cfg Config, opts ...Option) *ResilientTransport {
@@ -107,21 +129,35 @@ func NewResilientTransport(cfg Config, opts ...Option) *ResilientTransport {
 		opt(&cfg)
 	}
 
-	if cfg.ShardCount <= 0 { cfg.ShardCount = 64 }
-	if (cfg.ShardCount & (cfg.ShardCount - 1)) != 0 { cfg.ShardCount = 64 }
+	if cfg.ShardCount <= 0 {
+		cfg.ShardCount = 64
+	}
+	if (cfg.ShardCount & (cfg.ShardCount - 1)) != 0 {
+		cfg.ShardCount = 64
+	}
 
-	if cfg.SamplingWindow == 0 { cfg.SamplingWindow = 10 * time.Second }
+	if cfg.SamplingWindow == 0 {
+		cfg.SamplingWindow = 10 * time.Second
+	}
 	// Default bucket duration to 1/10th of window. If window < 10ns, fall back to 1s floor to prevent divide-by-zero.
-	if cfg.BucketDuration == 0 { cfg.BucketDuration = cfg.SamplingWindow / 10 }
-	if cfg.BucketDuration == 0 { cfg.BucketDuration = 1 * time.Second }
-	if cfg.SleepWindow == 0 { cfg.SleepWindow = 30 * time.Second }
-	if cfg.MaxBreakers == 0 { cfg.MaxBreakers = 1000 }
+	if cfg.BucketDuration == 0 {
+		cfg.BucketDuration = cfg.SamplingWindow / 10
+	}
+	if cfg.BucketDuration == 0 {
+		cfg.BucketDuration = 1 * time.Second
+	}
+	if cfg.SleepWindow == 0 {
+		cfg.SleepWindow = 30 * time.Second
+	}
+	if cfg.MaxBreakers == 0 {
+		cfg.MaxBreakers = 1000
+	}
 	if cfg.IsFailure == nil {
 		cfg.IsFailure = func(resp *http.Response, err error) bool {
 			return err != nil || (resp != nil && resp.StatusCode >= 500)
 		}
 	}
-	
+
 	underlying := cfg.Transport
 	if underlying == nil {
 		underlying = &http.Transport{
@@ -155,38 +191,67 @@ func NewResilientTransport(cfg Config, opts ...Option) *ResilientTransport {
 		}
 	}
 
-	if cfg.MaxIdleTime > 0 { go rt.janitor() }
+	if cfg.MaxIdleTime > 0 && rt.addWorker() {
+		go rt.janitor()
+	}
 
 	return rt
 }
 
+// Close stops background workers and waits for them to exit. It is safe to
+// call more than once. A custom HeartbeatFunc that ignores its transport
+// context can delay Close.
 func (t *ResilientTransport) Close() error {
+	t.closeMu.Lock()
+	if t.closed {
+		t.closeMu.Unlock()
+		return nil
+	}
+	t.closed = true
+	t.closeMu.Unlock()
+
 	t.cancel()
+	t.wg.Wait()
 	return nil
 }
 
+// addWorker registers a background goroutine, refusing once Close has begun.
+func (t *ResilientTransport) addWorker() bool {
+	t.closeMu.Lock()
+	defer t.closeMu.Unlock()
+	if t.closed {
+		return false
+	}
+	t.wg.Add(1)
+	return true
+}
+
 func (t *ResilientTransport) janitor() {
+	defer t.wg.Done()
 	ticker := time.NewTicker(t.config.MaxIdleTime / 2)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-t.ctx.Done(): return
-		case <-ticker.C: t.pruneIdle()
+		case <-t.ctx.Done():
+			return
+		case <-ticker.C:
+			t.pruneIdle()
 		}
 	}
 }
 
 func (t *ResilientTransport) pruneIdle() {
-	now := time.Now()
+	now := time.Now().UnixNano()
 	for i := 0; i < len(t.shards); i++ {
 		s := t.shards[i]
 		s.mu.Lock()
 		for el := s.lruList.Back(); el != nil; {
 			entry := el.Value.(*lruEntry)
-			if now.Sub(entry.lastAccess) > t.config.MaxIdleTime {
+			if now-atomic.LoadInt64(&entry.lastAccess) > int64(t.config.MaxIdleTime) {
 				prev := el.Prev()
 				s.lruList.Remove(el)
 				delete(s.breakers, entry.host)
+				entry.cancel()
 				el = prev
 				continue
 			}
@@ -210,17 +275,19 @@ func (t *ResilientTransport) getShard(host string) *shard {
 
 func (t *ResilientTransport) getBreaker(host string) (*breaker.Breaker, *shard) {
 	s := t.getShard(host)
-	now := time.Now()
+	now := time.Now().UnixNano()
 
 	s.mu.RLock()
 	el, ok := s.breakers[host]
 	s.mu.RUnlock()
 	if ok {
-		s.mu.Lock()
 		entry := el.Value.(*lruEntry)
-		entry.lastAccess = now
-		s.lruList.MoveToFront(el)
-		s.mu.Unlock()
+		if now-atomic.LoadInt64(&entry.lastAccess) > touchInterval {
+			s.mu.Lock()
+			atomic.StoreInt64(&entry.lastAccess, now)
+			s.lruList.MoveToFront(el) // no-op if the element was evicted meanwhile
+			s.mu.Unlock()
+		}
 		return entry.breaker, s
 	}
 
@@ -228,16 +295,17 @@ func (t *ResilientTransport) getBreaker(host string) (*breaker.Breaker, *shard) 
 	defer s.mu.Unlock()
 	if el, ok = s.breakers[host]; ok {
 		entry := el.Value.(*lruEntry)
-		entry.lastAccess = now
+		atomic.StoreInt64(&entry.lastAccess, now)
 		s.lruList.MoveToFront(el)
 		return entry.breaker, s
 	}
 
 	if s.lruList.Len() >= t.config.MaxBreakers {
-		back := s.lruList.Back()
-		if back != nil {
+		if back := s.lruList.Back(); back != nil {
+			evicted := back.Value.(*lruEntry)
 			s.lruList.Remove(back)
-			delete(s.breakers, back.Value.(*lruEntry).host)
+			delete(s.breakers, evicted.host)
+			evicted.cancel()
 		}
 	}
 
@@ -251,43 +319,78 @@ func (t *ResilientTransport) getBreaker(host string) (*breaker.Breaker, *shard) 
 		t.config.DryRun,
 		t.config.RetryBudget,
 	)
-	if t.config.OnStateChange != nil {
-		br.OnStateChange = func(from, to engine.BreakerState) {
-			t.config.OnStateChange(host, from, to)
-			if to == engine.StateOpen && t.config.HeartbeatInterval > 0 {
-				go t.heartbeat(host, br)
+	ectx, ecancel := context.WithCancel(t.ctx)
+	entry := &lruEntry{host: host, breaker: br, ctx: ectx, cancel: ecancel, lastAccess: now}
+	if t.config.OnStateChange != nil || t.config.HeartbeatInterval > 0 {
+		br.OnStateChange = func(from, to State) {
+			if t.config.OnStateChange != nil {
+				t.config.OnStateChange(host, from, to)
+			}
+			if to == StateOpen && t.config.HeartbeatInterval > 0 {
+				t.startHeartbeat(entry)
 			}
 		}
 	}
 
-	el = s.lruList.PushFront(&lruEntry{host: host, breaker: br, lastAccess: now})
-	s.breakers[host] = el
+	s.breakers[host] = s.lruList.PushFront(entry)
 	return br, s
 }
 
-func (t *ResilientTransport) heartbeat(host string, br *breaker.Breaker) {
+// startHeartbeat launches at most one heartbeat goroutine per breaker.
+func (t *ResilientTransport) startHeartbeat(entry *lruEntry) {
+	if !atomic.CompareAndSwapInt32(&entry.hbRunning, 0, 1) {
+		return
+	}
+	if !t.addWorker() {
+		atomic.StoreInt32(&entry.hbRunning, 0)
+		return
+	}
+	go t.heartbeat(entry)
+}
+
+func (t *ResilientTransport) heartbeat(entry *lruEntry) {
+	defer t.wg.Done()
 	ticker := time.NewTicker(t.config.HeartbeatInterval)
 	defer ticker.Stop()
+	br := entry.breaker
 	probe := t.config.HeartbeatFunc
 	if probe == nil {
 		probe = func(h string) error {
-			req, _ := http.NewRequestWithContext(t.ctx, "HEAD", "http://"+h, nil)
+			req, err := http.NewRequestWithContext(entry.ctx, http.MethodHead, "http://"+h, nil)
+			if err != nil {
+				return err
+			}
 			resp, err := t.underlying.RoundTrip(req)
-			if err != nil { return err }
-			defer resp.Body.Close()
-			if resp.StatusCode >= 500 { return fmt.Errorf("status %d", resp.StatusCode) }
+			if err != nil {
+				return err
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode >= 500 {
+				return fmt.Errorf("status %d", resp.StatusCode)
+			}
 			return nil
 		}
 	}
 	for {
 		select {
-		case <-t.ctx.Done(): return
+		case <-entry.ctx.Done():
+			return
 		case <-ticker.C:
-			if br.State() != engine.StateOpen && br.State() != engine.StateHalfOpen { return }
-			if err := probe(host); err == nil {
-				br.MarkSuccess(1 * time.Millisecond)
+			if st := br.State(); st != StateOpen && st != StateHalfOpen {
+				// Release the slot, then re-check: the breaker may have reopened
+				// between the state read and the release, when startHeartbeat
+				// would have been refused.
+				atomic.StoreInt32(&entry.hbRunning, 0)
+				if st = br.State(); (st == StateOpen || st == StateHalfOpen) &&
+					atomic.CompareAndSwapInt32(&entry.hbRunning, 0, 1) {
+					continue
+				}
+				return
+			}
+			if err := probe(entry.host); err == nil {
+				br.ProbeSuccess()
 			} else {
-				br.MarkFailure()
+				br.ProbeFailure()
 			}
 		}
 	}
@@ -296,7 +399,8 @@ func (t *ResilientTransport) heartbeat(host string, br *breaker.Breaker) {
 func isRetryable(req *http.Request, err error, resp *http.Response) bool {
 	switch req.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
-	default: return false
+	default:
+		return false
 	}
 	if err != nil {
 		var netErr net.Error
@@ -313,7 +417,8 @@ func isRetryable(req *http.Request, err error, resp *http.Response) bool {
 
 func (t *ResilientTransport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	select {
-	case <-t.ctx.Done(): return nil, t.ctx.Err()
+	case <-t.ctx.Done():
+		return nil, t.ctx.Err()
 	default:
 	}
 
@@ -332,7 +437,7 @@ func (t *ResilientTransport) RoundTrip(req *http.Request) (resp *http.Response, 
 
 	attempts := 0
 	for {
-		resp, err, retry := func() (*http.Response, error, bool) {
+		out := func() attemptResult {
 			ctx := req.Context()
 			var cancel context.CancelFunc
 			if t.config.RequestTimeout > 0 {
@@ -341,55 +446,100 @@ func (t *ResilientTransport) RoundTrip(req *http.Request) (resp *http.Response, 
 
 			start := time.Now()
 			currReq := req
-			if cancel != nil { currReq = req.WithContext(ctx) }
+			if cancel != nil {
+				currReq = req.WithContext(ctx)
+			}
 
 			r, e := t.underlying.RoundTrip(currReq)
 			duration := time.Since(start)
-			if cancel != nil { cancel() }
+			// The timeout context must outlive RoundTrip so the caller can still
+			// read the body; it is released when the body is closed.
+			if cancel != nil {
+				if r != nil && r.Body != nil {
+					r.Body = &cancelBody{ReadCloser: r.Body, cancel: cancel}
+				} else {
+					cancel()
+				}
+			}
 
 			isFail := t.config.IsFailure(r, e)
-			if !isFail && t.config.MaxLatency > 0 && duration > t.config.MaxLatency { isFail = true }
-			if !isFail && duration > br.AvgLatency()*2 && br.AvgLatency() > 0 { isFail = true }
+			if !isFail && t.config.MaxLatency > 0 && duration > t.config.MaxLatency {
+				isFail = true
+			}
+			if !isFail && duration > br.AvgLatency()*2 && br.AvgLatency() > 0 {
+				isFail = true
+			}
 
 			if !isFail {
 				br.MarkSuccess(duration)
-				return r, e, false
+				return attemptResult{resp: r, err: e}
 			}
 
 			if attempts < t.config.MaxRetries && isRetryable(req, e, r) && br.CanRetry() {
 				attempts++
 				br.RecordRetry()
 				backoff := time.Duration(0)
-				if t.config.RetryBackoff != nil { backoff = t.config.RetryBackoff(attempts) }
+				if t.config.RetryBackoff != nil {
+					backoff = t.config.RetryBackoff(attempts)
+				}
 				if backoff > 0 {
 					select {
-					case <-req.Context().Done(): return r, e, false
+					case <-req.Context().Done():
+						return attemptResult{resp: r, err: e, failed: true}
 					case <-time.After(backoff):
 					}
 				}
 				if req.GetBody != nil {
 					newBody, bodyErr := req.GetBody()
 					if bodyErr == nil {
+						closeResponse(r)
 						req = req.Clone(req.Context())
 						req.Body = newBody
-						return r, e, true
+						return attemptResult{retry: true, failed: true}
 					}
 				} else if req.Body == nil {
-					return r, e, true
+					closeResponse(r)
+					return attemptResult{retry: true, failed: true}
 				}
 			}
-			return r, e, false
+			return attemptResult{resp: r, err: e, failed: true}
 		}()
 
-		if !retry {
-			if err != nil || t.config.IsFailure(resp, err) {
-				br.MarkFailure()
-				if err != nil {
-					return nil, &CircuitError{Host: req.URL.Host, State: br.State(), Err: err, Retryable: isRetryable(req, err, resp)}
-				}
-				return resp, nil
-			}
-			return resp, nil
+		if out.retry {
+			continue
 		}
+		if out.failed {
+			br.MarkFailure()
+			if out.err != nil {
+				return nil, &CircuitError{Host: req.URL.Host, State: br.State(), Err: out.err, Retryable: isRetryable(req, out.err, out.resp)}
+			}
+		}
+		return out.resp, out.err
+	}
+}
+
+// attemptResult is the outcome of one round trip attempt.
+type attemptResult struct {
+	resp   *http.Response
+	err    error
+	retry  bool // attempt failed but will be retried; resp and err are discarded
+	failed bool // counts as a failure for the breaker
+}
+
+// cancelBody releases the request-timeout context when the body is closed.
+type cancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
+
+func closeResponse(r *http.Response) {
+	if r != nil && r.Body != nil {
+		_ = r.Body.Close()
 	}
 }
