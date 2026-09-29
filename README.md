@@ -176,6 +176,7 @@ A segmented, checksummed write-ahead log: every change is one CRC-32C-framed ent
 **Limits to plan for**
 
 - **`MaxBytes` (default 512 MiB) bounds the live data on disk** and `MaxRecords` (default 1,000,000) bounds the index in memory; beyond either, `Append` returns `ErrFull`. Size them for the worst outage you want to ride out. Set `PayloadsInMemory` to keep everything in RAM (faster leases, and then `MaxBytes` is also your memory budget); compaction then blocks other operations while it writes.
+- **Compaction briefly holds a copy of every record's metadata** (about the size of the in-memory index, up to roughly 300 MB at the default `MaxRecords`) while it copies payloads without the lock.
 - **Unix only.** Directory locking is not implemented elsewhere, so `OpenWAL` refuses to run without it.
 - Quarantine files are kept until you remove them. They hold whatever was in the damaged tail, in the clear unless the store is wrapped with `dlq.Secure`.
 - Wrap it with `dlq.Secure` to encrypt payloads at rest; the log itself only checksums.

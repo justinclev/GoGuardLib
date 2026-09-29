@@ -45,3 +45,26 @@ func BenchmarkLeaseWithDelayedBacklog(b *testing.B) {
 		}
 	}
 }
+
+// Requeueing a large parked queue, oldest first, into a queue that already holds many
+// newer records must not walk the newer records for every insert.
+func BenchmarkRequeueParkedIntoALargeQueue(b *testing.B) {
+	const n = 20_000
+	ctx := context.Background()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		s := dlq.NewMemoryStore(dlq.MemoryOptions{MaxBytes: -1})
+		for j := 0; j < n; j++ {
+			_ = s.Append(ctx, dlq.Record{ID: fmt.Sprintf("p%06d", j), State: dlq.Parked, Value: []byte("x")})
+		}
+		for j := 0; j < n; j++ {
+			_ = s.Append(ctx, dlq.Record{ID: fmt.Sprintf("q%06d", j), Value: []byte("x")})
+		}
+		b.StartTimer()
+		for j := 0; j < n; j++ {
+			if err := s.Requeue(ctx, fmt.Sprintf("p%06d", j)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}

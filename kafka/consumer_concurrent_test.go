@@ -500,3 +500,38 @@ func TestRandomFailuresNeverLoseOrReorder(t *testing.T) {
 		})
 	}
 }
+
+// A message that keeps failing must keep lengthening its backoff even while other
+// messages in the partition finish around it.
+func TestABackoffKeepsGrowingWhileOthersSucceed(t *testing.T) {
+	var mu sync.Mutex
+	maxN := 0
+	r, c, gs := concRig(t, 4, func(ctx context.Context, key, value string) error {
+		if value == "bad" {
+			return errors.New("down")
+		}
+		return nil
+	}, func(cfg *kafka.Config) {
+		cfg.RetryBackoff = func(n int) time.Duration {
+			mu.Lock()
+			if n > maxN {
+				maxN = n
+			}
+			mu.Unlock()
+			return 5 * time.Millisecond
+		}
+	})
+	gs.closed.Store(true) // "bad" can be neither processed nor set aside
+	r.broker.produce(topic, 0, "kb", "bad")
+	r.assign(0)
+	r.run(c)
+	for i := 0; i < 60; i++ { // healthy traffic keeps finishing behind the stuck message
+		r.broker.produce(topic, 0, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+		time.Sleep(4 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if maxN < 4 {
+		t.Fatalf("the backoff attempt number reached only %d: other messages finishing reset it, so a failing dependency is hit at the shortest interval for ever", maxN)
+	}
+}

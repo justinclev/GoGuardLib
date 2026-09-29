@@ -293,3 +293,59 @@ func TestMemoryStoreIsBoundedByDefault(t *testing.T) {
 		t.Fatalf("a negative MaxBytes must remove the cap, got %d", got)
 	}
 }
+
+// Whatever order records come back in, the group stays in Seq order (the insertion
+// hint is only a shortcut).
+func TestRequeueInAnyOrderKeepsTheGroupSorted(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	for name, order := range map[string]func(n int) []int{
+		"ascending": func(n int) []int {
+			o := make([]int, n)
+			for i := range o {
+				o[i] = i
+			}
+			return o
+		},
+		"descending": func(n int) []int {
+			o := make([]int, n)
+			for i := range o {
+				o[i] = n - 1 - i
+			}
+			return o
+		},
+		"shuffled": func(n int) []int { return rand.New(rand.NewSource(3)).Perm(n) },
+		"interleaved": func(n int) []int {
+			var o []int
+			for i := 0; i < n; i += 2 {
+				o = append(o, i)
+			}
+			for i := 1; i < n; i += 2 {
+				o = append(o, i)
+			}
+			return o
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := newMachine(limits{})
+			const n = 200
+			for i := 0; i < n; i++ { // parked and pending records interleaved in Seq order
+				r := Record{ID: fmt.Sprintf("r%03d", i), Value: []byte("x")}
+				if i%2 == 0 {
+					r.State = Parked
+				}
+				rec, _, _ := m.prepare(r, now)
+				m.insert(rec)
+			}
+			for _, i := range order(n) {
+				if i%2 != 0 {
+					continue
+				}
+				m.applyRequeue(m.items[fmt.Sprintf("r%03d", i)], false, nil)
+				checkIndex(t, m, now, i)
+			}
+			if got := m.counts[Pending]; got != n {
+				t.Fatalf("%d pending, want %d", got, n)
+			}
+		})
+	}
+}

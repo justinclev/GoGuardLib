@@ -426,14 +426,20 @@ func (c *Consumer) onRevoked(parts []TopicPartition) error {
 // moves the partition's commit point over every offset that is now contiguous.
 func (c *Consumer) markDone(tp TopicPartition, p *partition, offset int64) {
 	p.completed[offset] = struct{}{}
-	p.failures = 0
+	advanced := false
 	for {
 		if _, ok := p.completed[p.frontier]; !ok {
 			break
 		}
 		delete(p.completed, p.frontier)
 		p.frontier++
+		advanced = true
+	}
+	if advanced {
 		c.safe[tp] = p.frontier
+		// Only progress at the commit point ends a run of failures. A message that keeps
+		// failing must keep lengthening its backoff even while others finish around it.
+		p.failures = 0
 	}
 	c.sinceCommit++
 }

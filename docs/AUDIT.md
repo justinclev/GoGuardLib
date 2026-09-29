@@ -200,6 +200,24 @@ Added a `vuln` CI job (`go mod verify` plus `govulncheck` on both modules), a `m
 
 None open from this audit. `govulncheck` (finding 20) and the real-broker integration suite have not been run in this environment; both run in CI.
 
+## Second pass
+
+After the fixes above, the code they added or changed (the queue index, the two-phase lease and file cache, signing, the disk guard, the concurrent consumer, the sealed mirror) was reviewed again with the same rigour, since new code is where new bugs are.
+
+| # | Finding | Severity | Status |
+|---|---|---|---|
+| S1 | In the concurrent consumer any success reset a stuck message's retry backoff | Medium | Fixed |
+| S2 | Requeueing many parked records walked the whole queue for every record | Medium | Fixed |
+| S3 | Compaction briefly holds a copy of every record's metadata | Low | Documented |
+
+**S1.** `markDone` cleared the partition's failure count on every completed message. With several workers, healthy messages keep finishing around a message that cannot be stored, so its backoff never grew past the first step and the failing store or dependency was retried at the shortest interval indefinitely. The count is now cleared only when the commit point advances. `TestABackoffKeepsGrowingWhileOthersSucceed`; putting the reset back fails it.
+
+**S2.** The queue index inserts a record into its dependency's list in Seq order by searching from the back, which is O(1) for new records but O(queue) for a parked record that is older than everything pending. An operator requeueing a large parked queue (the normal way out of a long outage) was quadratic: 20,000 parked records requeued into 20,000 pending took **3.2 s** under the store lock. Each list now remembers where the last insert landed, so a run of inserts in Seq order is O(1) each: **11 ms**, about 290x faster. `TestRequeueInAnyOrderKeepsTheGroupSorted` (ascending, descending, shuffled and interleaved orders, checked against the index invariants after every insert) and the existing randomized index test cover correctness; `BenchmarkRequeueParkedIntoALargeQueue` covers speed.
+
+**S3.** Compaction captures each record's metadata and payload references under the lock so it can copy without holding it. That is about the size of the in-memory index again (roughly 300 bytes per record, so up to about 300 MB at the default 1,000,000-record cap) for the duration of the compaction. It is bounded by `MaxRecords`, so it was documented in the README rather than changed; streaming the capture in batches would remove it at the cost of a more complex swap.
+
+**Reviewed and found sound in the second pass:** the two-phase lease's every exit path (reservations are released on cancel, close, unreadable payloads and empty results); reads racing a compaction (the locked retry, and the refcounted cache never closing a handle under a reader); the signing format (domain, file kind, LSN, type and body are all bound, a torn tail is still repaired but a forged one never is, legacy files are read-only and the newest segment is always signed); the disk guard's accounting (bytes since the last measurement, refusal wraps `ErrFull`); the consumer's ownership of state (only the polling goroutine touches partitions, commits and queues; workers only run the pipeline), the per-key queues (released on completion, dropped behind a failure or a revocation, no marker left behind), and the pool's channel capacities (sends never block because everything in flight fits).
+
 ## What was checked and found sound
 
 Recorded so the next reviewer does not repeat it.

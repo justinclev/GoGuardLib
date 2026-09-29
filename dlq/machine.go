@@ -43,7 +43,8 @@ type memItem struct {
 // walks records that belong to someone else.
 type group struct {
 	dep   string
-	items *list.List // *memItem
+	items *list.List    // *memItem
+	hint  *list.Element // where the last item was inserted, for runs of inserts in Seq order
 	// wake is the earliest time a scan of this group can find something to lease,
 	// as of the last scan that found nothing; zero means "unknown, scan". Every
 	// change that can make something eligible earlier clears it, and it is never
@@ -76,9 +77,10 @@ type machine struct {
 	seq   uint64
 	bytes int64
 
-	groups map[string]*group // BlockedOn -> Pending and Leased items
-	parked *list.List        // Parked items in Seq order
-	counts [3]int            // items per State
+	groups     map[string]*group // BlockedOn -> Pending and Leased items
+	parked     *list.List        // Parked items in Seq order
+	parkedHint *list.Element
+	counts     [3]int // items per State
 }
 
 func newMachine(lim limits) *machine {
@@ -93,24 +95,42 @@ func newMachine(lim limits) *machine {
 	}
 }
 
-// insertOrdered puts it in l keeping Seq order. New records carry the highest Seq,
-// so searching from the back is O(1) in the common case.
-func insertOrdered(l *list.List, it *memItem) *list.Element {
+// insertOrdered puts it in l keeping Seq order and returns its element. New records
+// carry the highest Seq, so searching from the back is O(1) for them. Records that
+// come back in bulk (a whole parked queue requeued, oldest first) are near the
+// previous insert instead, which hint remembers, so a run of them costs O(1) each
+// rather than a walk over everything newer.
+func insertOrdered(l *list.List, it *memItem, hint **list.Element) *list.Element {
+	seq := it.rec.Seq
+	place := func(e *list.Element) *list.Element {
+		*hint = e
+		return e
+	}
+	if h := *hint; h != nil {
+		if hs := h.Value.(*memItem).rec.Seq; hs < seq {
+			if n := h.Next(); n == nil || n.Value.(*memItem).rec.Seq > seq {
+				return place(l.InsertAfter(it, h))
+			}
+		}
+	}
+	if f := l.Front(); f == nil || f.Value.(*memItem).rec.Seq > seq {
+		return place(l.PushFront(it))
+	}
 	e := l.Back()
-	for e != nil && e.Value.(*memItem).rec.Seq > it.rec.Seq {
+	for e != nil && e.Value.(*memItem).rec.Seq > seq {
 		e = e.Prev()
 	}
 	if e == nil {
-		return l.PushFront(it)
+		return place(l.PushFront(it))
 	}
-	return l.InsertAfter(it, e)
+	return place(l.InsertAfter(it, e))
 }
 
 // link adds it to the index according to its state.
 func (m *machine) link(it *memItem) {
 	m.counts[it.rec.State]++
 	if it.rec.State == Parked {
-		it.grp, it.gel = nil, insertOrdered(m.parked, it)
+		it.grp, it.gel = nil, insertOrdered(m.parked, it, &m.parkedHint)
 		return
 	}
 	g := m.groups[it.rec.BlockedOn]
@@ -118,7 +138,7 @@ func (m *machine) link(it *memItem) {
 		g = &group{dep: it.rec.BlockedOn, items: list.New()}
 		m.groups[g.dep] = g
 	}
-	it.grp, it.gel = g, insertOrdered(g.items, it)
+	it.grp, it.gel = g, insertOrdered(g.items, it, &g.hint)
 	g.wake = time.Time{}
 }
 
@@ -126,12 +146,18 @@ func (m *machine) link(it *memItem) {
 func (m *machine) unlink(it *memItem) {
 	m.counts[it.rec.State]--
 	if g := it.grp; g != nil {
+		if g.hint == it.gel {
+			g.hint = nil
+		}
 		g.items.Remove(it.gel)
 		g.wake = time.Time{}
 		if g.items.Len() == 0 {
 			delete(m.groups, g.dep)
 		}
 	} else {
+		if m.parkedHint == it.gel {
+			m.parkedHint = nil
+		}
 		m.parked.Remove(it.gel)
 	}
 	it.grp, it.gel = nil, nil
