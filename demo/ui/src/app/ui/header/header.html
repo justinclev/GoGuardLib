@@ -23,6 +23,11 @@
         {{ s.backend === 'kafka' ? 'Apache Kafka' : 'Simulated topic' }}
       </span>
     }
+    @if ((store.snapshot()?.droppedEvents ?? 0) > 0) {
+      <span class="pill bad" title="The stream could not keep up, so some events never reached this page. Charts and the request table may undercount; the counters are exact.">
+        {{ store.snapshot()?.droppedEvents }} events dropped
+      </span>
+    }
     <span class="pill" [class.bad]="!store.connected()">
       <i class="dot" [class.live]="store.connected()"></i>
       {{ store.connected() ? 'Live' : 'Reconnecting…' }}

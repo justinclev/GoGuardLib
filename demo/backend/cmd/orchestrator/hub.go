@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,9 +34,14 @@ type Event struct {
 // Hub fans events out to every connected UI without ever blocking the traffic: a
 // client that cannot keep up loses events instead of slowing the demo down.
 type Hub struct {
-	mu   sync.Mutex
-	subs map[chan []byte]struct{}
+	mu      sync.Mutex
+	subs    map[chan []byte]struct{}
+	dropped atomic.Uint64 // messages a slow client did not receive
 }
+
+// Dropped is how many messages were discarded for slow clients. The UI shows it, so
+// a chart that undercounts says so.
+func (h *Hub) Dropped() uint64 { return h.dropped.Load() }
 
 func NewHub() *Hub { return &Hub{subs: map[chan []byte]struct{}{}} }
 
@@ -64,6 +70,7 @@ func (h *Hub) publish(event string, v any) {
 		select {
 		case ch <- msg:
 		default: // slow client: drop
+			h.dropped.Add(1)
 		}
 	}
 	h.mu.Unlock()

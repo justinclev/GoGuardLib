@@ -41,10 +41,14 @@ type app struct {
 
 	orders sync.Map // record ID -> order ID, so store events can name the order
 
-	pipe *pipeline.Pipeline
+	pipe   *pipeline.Pipeline
+	ledger *ledger
 }
 
-func (a *app) emit(e Event) { a.hub.Emit(e) }
+func (a *app) emit(e Event) {
+	a.ledger.observe(e)
+	a.hub.Emit(e)
+}
 
 func (a *app) serviceURL(name, path string) string {
 	return fmt.Sprintf("http://%s:%d%s", a.host, servicePorts[name], path)

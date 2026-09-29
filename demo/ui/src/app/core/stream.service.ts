@@ -12,11 +12,11 @@ export class StreamService {
     if (this.source) return;
     const es = new EventSource(url);
     this.source = es;
-    es.onopen = () => this.store.connected.set(true);
-    es.onerror = () => this.store.connected.set(false); // EventSource reconnects by itself
+    es.onopen = () => this.store.noteConnected();
+    es.onerror = () => this.store.noteDisconnected(); // EventSource reconnects by itself
     es.addEventListener('e', (m) => this.store.handle(JSON.parse((m as MessageEvent<string>).data) as StreamEvent));
     es.addEventListener('s', (m) => {
-      this.store.connected.set(true);
+      this.store.noteConnected();
       this.store.setSnapshot(JSON.parse((m as MessageEvent<string>).data) as Snapshot);
     });
   }

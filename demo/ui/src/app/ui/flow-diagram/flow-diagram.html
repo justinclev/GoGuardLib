@@ -90,7 +90,7 @@
         <rect x="-13" y="-14" width="26" height="8" rx="4" />
         <rect x="20" y="-14" width="26" height="8" rx="4" />
       </g>
-      <text class="big-num" y="24">{{ store.snapshot()?.kafka?.backlog ?? 0 }}</text>
+      <text class="big-num" y="24">{{ store.snapshot()?.ledger?.waiting ?? 0 }}</text>
       <text class="sub" y="40">{{ topicPaused() ? 'paused · waiting safely' : 'waiting to be consumed' }}</text>
     </g>
 
@@ -174,5 +174,6 @@
     <span><i class="dot failed"></i>call failed</span>
     <span><i class="dot deferred"></i>stored in the DLQ</span>
     <span><i class="dot redriven"></i>redriven</span>
+    <span class="note">dots are a sample (at most ~300 shown); the numbers are exact</span>
   </div>
 </div>

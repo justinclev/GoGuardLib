@@ -122,6 +122,13 @@ func (s *service) status() map[string]any {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		resp, err := http.Get("http://localhost:9100/control/state")
+		if err != nil || resp.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
+		return
+	}
 	base := 9101
 	svcs := []*service{
 		{Name: "inventory", Port: base, Latency: 60 * time.Millisecond, mode: modeUp},

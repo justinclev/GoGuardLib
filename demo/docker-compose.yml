@@ -40,6 +40,11 @@ services:
       dockerfile: demo/backend/Dockerfile
       target: services
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/services", "-healthcheck"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
   # Generates HTTP and Kafka traffic through GoGuardLib and streams what happens.
   orchestrator:
@@ -51,14 +56,23 @@ services:
       SERVICES_HOST: services
       KAFKA_BROKERS: kafka:9092
       DLQ_DIR: /data/dlq
+      # Keep the dead-letter log across restarts: that is the point of the crash button.
+      # Wipe it with `docker compose down -v`.
+      DLQ_FRESH: "false"
     volumes:
       - dlq-data:/data
     depends_on:
       kafka:
         condition: service_healthy
       services:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/orchestrator", "-healthcheck"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
     ports:
       - "${API_PORT:-8081}:8080" # the API, for curl and for poking around
 
@@ -67,7 +81,8 @@ services:
     build:
       context: ./ui
     depends_on:
-      - orchestrator
+      orchestrator:
+        condition: service_healthy
     ports:
       - "${UI_PORT:-4280}:80"
 

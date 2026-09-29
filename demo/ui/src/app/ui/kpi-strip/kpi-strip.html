@@ -1,14 +1,14 @@
 <section class="strip">
   <article class="tile">
-    <span class="k">Throughput</span>
+    <span class="k">Outcomes</span>
     <strong>{{ throughput() }}<small> /s</small></strong>
-    <span class="d">requests completed, last 5 s</span>
+    <span class="d">requests reaching an outcome, last 5 s (including those stored in the DLQ)</span>
   </article>
 
-  <article class="tile" [class.good]="healthy()" [class.bad]="!healthy()">
+  <article class="tile" [class.good]="hasRate() && healthy()" [class.bad]="hasRate() && !healthy()">
     <span class="k">Success rate</span>
     <strong>{{ success() }}<small> %</small></strong>
-    <span class="d">last 30 s · breaker rejections and stored orders do not count as success</span>
+    <span class="d">last 30 s · only orders that finished; rejections and stored orders do not count as success</span>
   </article>
 
   <article class="tile amber">
@@ -20,12 +20,18 @@
   <article class="tile purple">
     <span class="k">Fail-fast</span>
     <strong>{{ fastFail() }}<small> ms</small></strong>
-    <span class="d">a rejected call, instead of a 1500 ms timeout</span>
+    <span class="d">
+      @if (failedMs() !== null) {
+        measured for a skipped call; a call that reached the failing service took ~{{ failedMs() }} ms to fail
+      } @else {
+        measured for a call the breaker skips (no failed call measured yet)
+      }
+    </span>
   </article>
 
   <article class="tile teal">
-    <span class="k">Waiting avoided</span>
+    <span class="k">Failed-call time avoided</span>
     <strong>{{ avoided() }}<small> s</small></strong>
-    <span class="d">caller time not spent on a dead service</span>
+    <span class="d">estimate: {{ avoidedCalls() }} skipped calls × the measured time a failing call takes</span>
   </article>
 </section>

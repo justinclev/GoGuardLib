@@ -21,7 +21,7 @@ export interface Bucket {
 }
 
 const MAX_RECORDS = 500;
-const TIMEOUT_MS = 1500; // what one call to a dead service would cost without a breaker
+const TIMEOUT_MS = 1500; // the demo's per-call timeout (only quoted where a service is slow)
 
 /**
  * Everything the panels show. Events arrive at traffic speed, so they mutate plain
@@ -33,9 +33,13 @@ export class DemoStore {
   readonly connected = signal(false);
   readonly story = signal<StoryItem[]>([]);
   readonly buckets = signal<Bucket[]>([]);
-  readonly waitAvoidedSec = signal(0);
+  /** Calls the breaker skipped. */
+  readonly rejectedCalls = signal(0);
+  /** Measured, not assumed: averages over real failed and rejected calls, and how many were seen. */
   readonly avgFailMs = signal(0);
   readonly avgRejectMs = signal(0);
+  readonly failSamples = signal(0);
+  readonly rejectSamples = signal(0);
   private readonly feedVersion = signal(0);
 
   private records = new Map<string, RequestRecord>();
@@ -50,6 +54,9 @@ export class DemoStore {
   private redriving = new Map<string, number>();
   private prev: Snapshot | null = null;
   private failedSteps = new Set<string>();
+  private crashed = false;
+  private recoveredNote = false;
+  private hadSnapshot = false;
 
   constructor() {
     setInterval(() => this.tick(), 1000);
@@ -71,7 +78,8 @@ export class DemoStore {
     return b.reduce((n, x) => n + x.ok + x.failed + x.rejected + x.deferred, 0) / b.length;
   });
 
-  readonly successRate = computed(() => {
+  /** Null when nothing completed in the window: there is no rate to show. */
+  readonly successRate = computed<number | null>(() => {
     const b = this.buckets().slice(-30);
     let ok = 0;
     let all = 0;
@@ -79,8 +87,15 @@ export class DemoStore {
       ok += x.ok;
       all += x.ok + x.failed + x.rejected + x.deferred;
     }
-    return all ? (ok / all) * 100 : 100;
+    return all ? (ok / all) * 100 : null;
   });
+
+  /**
+   * Time the callers did not spend on calls that would have failed: skipped calls times
+   * the measured average latency of calls that really failed. Zero until a failure has
+   * been measured; an estimate, and labelled as one.
+   */
+  readonly avoidedSec = computed(() => (this.rejectedCalls() * this.avgFailMs()) / 1000);
 
   readonly downCount = computed(() => (this.snapshot()?.services ?? []).filter((s) => s.mode === 'down').length);
 
@@ -117,6 +132,40 @@ export class DemoStore {
     this.diffSnapshot(this.prev, s);
     this.prev = s;
     this.snapshot.set(s);
+    this.hadSnapshot = true;
+    if (this.recoveredNote) {
+      this.recoveredNote = false;
+      const stored = s.dlq.pending + s.dlq.leased + s.dlq.parked;
+      this.say(
+        '🔁',
+        'good',
+        'Back online: recovered from disk',
+        stored > 0
+          ? `The process was killed with no warning, no flush and no graceful shutdown, yet ${stored} order${stored === 1 ? ' is' : 's are'} still in the dead-letter log on disk. The redriver is replaying them. Kafka offsets are committed only after an order is safe, so unfinished messages are read again. Traffic is paused after a restart: press Start traffic to continue.`
+          : `The process restarted and recovered its state from disk. Nothing had been stored, so there was nothing to replay. Traffic is paused after a restart: press Start traffic to continue.`,
+      );
+    }
+  }
+
+  noteConnected(): void {
+    if (this.crashed && this.hadSnapshot) {
+      this.crashed = false;
+      this.recoveredNote = true;
+    }
+    this.connected.set(true);
+  }
+
+  noteDisconnected(): void {
+    if (this.connected() && !this.crashed) {
+      this.crashed = true;
+      this.say(
+        '💀',
+        'bad',
+        'Connection lost: the orchestrator was killed',
+        'A hard kill: no shutdown hooks, no final flush. Anything in memory is gone, so what matters now is what was already on disk.',
+      );
+    }
+    this.connected.set(false);
   }
 
   // ---- requests ----
@@ -193,14 +242,14 @@ export class DemoStore {
         info.status = 'failed';
         info.latencyMs = ev.latencyMs;
         info.detail = ev.detail;
-        this.ema('avgFailMs', ev.latencyMs ?? 0);
+        this.ema('avgFailMs', 'failSamples', ev.latencyMs ?? 0);
         break;
       case 'rejected':
         info.status = 'rejected';
         info.latencyMs = ev.latencyMs;
         info.detail = ev.detail;
-        this.ema('avgRejectMs', ev.latencyMs ?? 0);
-        this.waitAvoidedSec.update((v) => v + TIMEOUT_MS / 1000);
+        this.ema('avgRejectMs', 'rejectSamples', ev.latencyMs ?? 0);
+        this.rejectedCalls.update((v) => v + 1);
         break;
     }
   }
@@ -217,7 +266,7 @@ export class DemoStore {
           if (ev.cause === 'rejected') {
             info.status = 'rejected';
             info.detail = ev.detail;
-            this.waitAvoidedSec.update((v) => v + TIMEOUT_MS / 1000);
+            this.rejectedCalls.update((v) => v + 1);
           }
           for (const s of Object.keys(r.steps) as StepName[]) {
             if (s !== step && r.steps[s].status === 'pending') r.steps[s].status = 'skipped';
@@ -243,9 +292,10 @@ export class DemoStore {
     }
   }
 
-  private ema(which: 'avgFailMs' | 'avgRejectMs', v: number): void {
-    const sig = this[which];
-    sig.update((cur) => (cur === 0 ? v : cur * 0.9 + v * 0.1));
+  private ema(which: 'avgFailMs' | 'avgRejectMs', count: 'failSamples' | 'rejectSamples', v: number): void {
+    const first = this[count]() === 0;
+    this[count].update((n) => n + 1);
+    this[which].update((cur) => (first ? v : cur * 0.9 + v * 0.1));
   }
 
   // ---- time series ----
@@ -285,7 +335,7 @@ export class DemoStore {
         '⛔',
         'bad',
         `${name} circuit OPENED`,
-        `Failures crossed the threshold, so the breaker stopped calling ${name}. New HTTP requests are rejected in about a millisecond instead of waiting ${TIMEOUT_MS} ms on a dead service, and Kafka messages are set aside with their progress.`,
+        `Failures crossed the threshold, so the breaker stopped calling ${name}. New HTTP requests are rejected immediately instead of being attempted against a service that is failing, and Kafka messages are set aside with their progress.`,
       );
     } else if (ev.to === 'open') {
       this.say('⛔', 'bad', `${name} still failing`, `The canary call failed, so the circuit opened again. Health checks keep probing with backoff.`);
@@ -318,7 +368,7 @@ export class DemoStore {
       } else if (s.mode === 'up') {
         this.say('🔧', 'accent', `${name} is back online`, `The breaker does not take its word for it: health probes must pass twice, then a canary call, before the circuit closes.`);
       } else if (s.mode === 'slow') {
-        this.say('🐢', 'accent', `${name} is now slow`, `Responses take longer than the ${TIMEOUT_MS} ms timeout, so calls time out and count as failures.`);
+        this.say('🐢', 'accent', `${name} is now slow`, `Its responses now take longer than the demo's ${TIMEOUT_MS} ms call timeout, so calls time out and count as failures.`);
       } else if (s.mode === 'flaky') {
         this.say('🎲', 'accent', `${name} is now flaky`, `About half of its calls fail. Watch the failure rate hover around the threshold.`);
       }
@@ -336,6 +386,10 @@ export class DemoStore {
     if (cur.dlq.parked > prev.dlq.parked) {
       this.say('🧯', 'bad', 'Message parked for a human', `A message failed too many times and was set aside for an operator. It is never deleted automatically.`);
     }
+  }
+
+  private fmtMs(v: number): string {
+    return v < 1 ? 'under 1 ms' : `${Math.round(v)} ms`;
   }
 
   private flushAggregates(): void {
@@ -379,11 +433,16 @@ export class DemoStore {
       );
     }
     const s = this.snapshot();
-    if (s && this.downCount() > 0 && s.traffic.httpRps > 0 && this.once('fastfail', 12000) && this.avgRejectMs() < 50) {
-      // only while something is actually down and rejecting
+    if (s && this.downCount() > 0 && s.traffic.httpRps > 0 && this.rejectSamples() > 0 && this.failSamples() > 0 && this.once('fastfail', 12000)) {
+      // Only with real measurements of both: a rejected call and a call that really failed.
       const rej = this.cur.rejected + (this.closed.at(-1)?.rejected ?? 0);
       if (rej > 0) {
-        this.say('⚡', 'info', 'Failing fast', `HTTP calls to the dead service are being rejected in ~${Math.max(0, Math.round(this.avgRejectMs()))} ms instead of a ${TIMEOUT_MS} ms timeout: that is thread and connection pressure the caller never takes on.`);
+        this.say(
+          '⚡',
+          'info',
+          'Failing fast',
+          `Measured so far: a call the breaker skips returns in ~${this.fmtMs(this.avgRejectMs())}, while a call that actually reached the failing service took ~${this.fmtMs(this.avgFailMs())} to fail. The skipped calls also put no load on the struggling service.`,
+        );
       }
     }
   }

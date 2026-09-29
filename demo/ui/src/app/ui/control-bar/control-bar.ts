@@ -53,6 +53,10 @@ export class ControlBar {
     void this.api.restoreAll();
   }
 
+  crash(): void {
+    void this.api.crash();
+  }
+
   toggleScenario(): void {
     if (this.scenario.running()) this.scenario.stop();
     else void this.scenario.start();

@@ -80,6 +80,31 @@ jobs:
       - name: Scan the Kafka module
         run: cd kafka && $(go env GOPATH)/bin/govulncheck ./...
 
+  # The demo (backend and UI) is built on every push so it cannot rot.
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.3"
+          cache: false
+      - name: Backend
+        working-directory: demo/backend
+        run: |
+          out=$(gofmt -l .); if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
+          go vet ./...
+          go build ./...
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: UI
+        working-directory: demo/ui
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
   # The Kafka adapter is its own Go module (it needs cgo and confluent-kafka-go),
   # so the jobs above, which run at the repository root, do not touch it.
   kafka:

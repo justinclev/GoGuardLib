@@ -28,6 +28,9 @@
       }
     </div>
     <button type="button" class="ghost" [disabled]="!anyDown()" (click)="restoreAll()">Restore all</button>
+    <button type="button" class="crash" (click)="crash()" title="Kill the consumer process without warning. The dead-letter log is on disk, so nothing stored is lost.">
+      ⚡ Crash consumer
+    </button>
     <button type="button" class="guided" [class.on]="scenario.running()" (click)="toggleScenario()">
       {{ scenario.running() ? 'Stop guided demo' : '✦ Guided demo' }}
     </button>

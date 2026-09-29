@@ -21,6 +21,11 @@ export class ApiService {
     return this.post(`/api/services/${service}/mode`, { mode });
   }
 
+  /** Hard-kills the orchestrator (no graceful shutdown). The container restarts and recovers from disk. */
+  crash(): Promise<void> {
+    return this.post('/api/crash');
+  }
+
   restoreAll(): Promise<void> {
     return this.post('/api/reset');
   }

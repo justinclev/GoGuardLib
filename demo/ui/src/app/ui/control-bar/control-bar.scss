@@ -163,6 +163,16 @@ button {
   }
 }
 
+.crash {
+  border-color: rgba(255, 77, 109, 0.6);
+  background: linear-gradient(180deg, rgba(255, 77, 109, 0.2), rgba(255, 77, 109, 0.06));
+  color: #ffd6de;
+
+  &:hover:not(:disabled) {
+    box-shadow: 0 0 22px rgba(255, 77, 109, 0.35);
+  }
+}
+
 .guided {
   border-color: rgba(143, 134, 255, 0.7);
   background: linear-gradient(180deg, rgba(143, 134, 255, 0.34), rgba(143, 134, 255, 0.12));

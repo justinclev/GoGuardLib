@@ -99,7 +99,7 @@ export class FlowDiagram implements AfterViewInit {
     return Math.min(1, (d.pending + d.leased + d.parked) / 120);
   });
 
-  readonly topicFill = computed(() => Math.min(1, (this.store.snapshot()?.kafka.backlog ?? 0) / 120));
+  readonly topicFill = computed(() => Math.min(1, (this.store.snapshot()?.ledger.waiting ?? 0) / 120));
 
   readonly topicPaused = computed(() => (this.store.snapshot()?.kafka.pausedPartitions ?? 0) > 0);
 

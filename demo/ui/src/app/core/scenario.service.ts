@@ -46,7 +46,7 @@ export class ScenarioService {
       {
         title: 'The system protects itself',
         caption:
-          'HTTP requests are rejected instantly instead of hanging. The Kafka consumer pauses and stores in-flight orders, with their progress, in the durable dead-letter log. Nothing is lost.',
+          'HTTP requests are rejected immediately instead of being attempted against a failing service. The Kafka consumer pauses and stores in-flight orders, with their progress, in the durable dead-letter log. The ledger below checks that what is stored matches what is on disk.',
         seconds: 14,
         run: async () => undefined,
       },
@@ -59,7 +59,7 @@ export class ScenarioService {
       },
       {
         title: 'Back to normal',
-        caption: 'The dead-letter log drains and traffic is healthy again. No order was lost or processed twice from the start.',
+        caption: 'The dead-letter log drains and traffic is healthy again. Delivery is at-least-once: an order can be attempted more than once, so every call carries an idempotency key to make a repeat harmless.',
         seconds: 8,
         run: async () => undefined,
       },

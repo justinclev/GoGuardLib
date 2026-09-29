@@ -14,6 +14,11 @@ export class PipelinePanel {
   readonly kafka = computed(() => this.store.snapshot()?.kafka);
   readonly dlq = computed(() => this.store.snapshot()?.dlq);
   readonly http = computed(() => this.store.snapshot()?.http);
+  readonly ledger = computed(() => this.store.snapshot()?.ledger);
+  readonly accounted = computed(() => {
+    const l = this.ledger();
+    return l ? l.done + l.parked + l.waiting + l.inFlight + l.stored : 0;
+  });
 
   readonly oldest = computed(() => {
     const s = this.dlq()?.oldestSec ?? 0;

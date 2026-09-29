@@ -72,6 +72,18 @@ export interface Snapshot {
     backlog: number;
   };
   http: { sent: number; ok: number; failed: number; rejected: number };
+  ledger: {
+    produced: number;
+    done: number;
+    parked: number;
+    waiting: number;
+    inFlight: number;
+    stored: number;
+    stuck: number;
+    onDisk: number;
+    agrees: boolean;
+  };
+  droppedEvents: number;
 }
 
 export type StepStatus = 'pending' | 'running' | 'ok' | 'failed' | 'rejected' | 'skipped';

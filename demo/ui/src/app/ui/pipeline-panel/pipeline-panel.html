@@ -1,7 +1,7 @@
 <section class="panel">
   <header>
     <h2>Where every message is</h2>
-    <span class="hint">nothing is dropped between these boxes</span>
+    <span class="hint">checked against the on-disk log in the ledger below</span>
   </header>
 
   <div class="cols">
@@ -9,9 +9,9 @@
       <h3><i></i>Kafka consumer</h3>
       <dl>
         <div><dt>produced</dt><dd>{{ kafka()?.produced ?? 0 }}</dd></div>
-        <div><dt>waiting in topic</dt><dd>{{ kafka()?.backlog ?? 0 }}</dd></div>
+        <div><dt>waiting in topic</dt><dd>{{ ledger()?.waiting ?? 0 }}</dd></div>
         <div><dt>in flight</dt><dd>{{ kafka()?.inFlight ?? 0 }}</dd></div>
-        <div><dt>completed</dt><dd class="g">{{ kafka()?.done ?? 0 }}</dd></div>
+        <div><dt>finished first time</dt><dd class="g">{{ kafka()?.done ?? 0 }}</dd></div>
         <div><dt>stored in DLQ</dt><dd class="a">{{ kafka()?.deferred ?? 0 }}</dd></div>
         <div><dt>partitions paused</dt><dd [class.a]="(kafka()?.pausedPartitions ?? 0) > 0">{{ kafka()?.pausedPartitions ?? 0 }}</dd></div>
       </dl>
@@ -39,4 +39,34 @@
       </dl>
     </article>
   </div>
+
+  @if (ledger(); as l) {
+    <div class="ledger" [class.bad]="l.stuck > 0 || !l.agrees">
+      <div class="head">
+        <h3>Delivery ledger <small>every Kafka order followed from produce to done, from events only</small></h3>
+        @if (l.stuck === 0 && l.agrees) {
+          <span class="ok">✓ 0 unaccounted for · matches the on-disk log</span>
+        } @else if (l.stuck > 0) {
+          <span class="warn">⚠ {{ l.stuck }} order(s) started a step and never finished</span>
+        } @else {
+          <span class="warn">⚠ ledger says {{ l.stored }} stored, the on-disk log says {{ l.onDisk }}</span>
+        }
+      </div>
+      <dl>
+        <div><dt>produced</dt><dd>{{ l.produced }}@if (l.adopted > 0) {<small> +{{ l.adopted }} from disk</small>}</dd></div>
+        <div><dt>done</dt><dd class="g">{{ l.done }}</dd></div>
+        <div><dt>stored (ledger)</dt><dd class="a">{{ l.stored }}</dd></div>
+        <div><dt>stored (on disk)</dt><dd class="a">{{ l.onDisk }}</dd></div>
+        <div><dt>waiting in topic</dt><dd>{{ l.waiting }}</dd></div>
+        <div><dt>in flight</dt><dd>{{ l.inFlight }}</dd></div>
+        <div><dt>parked</dt><dd>{{ l.parked }}</dd></div>
+        <div><dt>accounted</dt><dd>{{ accounted() }}<small> of {{ l.produced + l.adopted }}</small></dd></div>
+      </dl>
+      <p class="fine">
+        Counted since the orchestrator last started. Orders a crashed run left in the log are counted once, at
+        startup, as <em>from disk</em>; messages that were still in Kafka when it died are read again and counted as
+        produced only if this run produced them.
+      </p>
+    </div>
+  }
 </section>

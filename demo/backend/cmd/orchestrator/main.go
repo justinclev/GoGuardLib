@@ -38,6 +38,13 @@ func env(k, def string) string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		resp, err := http.Get("http://localhost:" + env("PORT", "8080") + "/healthz")
+		if err != nil || resp.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "orchestrator:", err)
 		os.Exit(1)
@@ -51,6 +58,7 @@ func run() error {
 	host := env("SERVICES_HOST", "localhost")
 	a := &app{
 		hub:     NewHub(),
+		ledger:  newLedger(),
 		host:    host,
 		control: fmt.Sprintf("http://%s:9100", host),
 		client: &http.Client{Transport: &http.Transport{
@@ -81,6 +89,9 @@ func run() error {
 	}
 	defer func() { _ = wal.Close() }()
 	store := &eventStore{Store: wal, a: a}
+	if st, err := wal.Stats(ctx); err == nil {
+		a.ledger.seed(st.Pending + st.Leased) // orders a crashed run left in the log
+	}
 
 	client, producer, mode, closeKafka, err := kafkaBackend(ctx, env("KAFKA_BROKERS", ""), topic)
 	if err != nil {
@@ -245,7 +256,7 @@ type breakerState struct {
 	Rejected      uint64  `json:"rejected"`
 	Opens         uint64  `json:"opens"`
 	AvgLatencyMs  int64   `json:"avgLatencyMs"`
-	LastChangedMs int64   `json:"lastChangedMs"`
+	LastChangedMs int64   `json:"lastChangedMs,omitempty"`
 }
 
 type Snapshot struct {
@@ -276,7 +287,9 @@ type Snapshot struct {
 		InFlight int    `json:"inFlight"`
 		Backlog  int64  `json:"backlog"`
 	} `json:"kafka"`
-	HTTP struct {
+	Ledger        LedgerView `json:"ledger"`
+	DroppedEvents uint64     `json:"droppedEvents"`
+	HTTP          struct {
 		Sent     uint64 `json:"sent"`
 		OK       uint64 `json:"ok"`
 		Failed   uint64 `json:"failed"`
@@ -302,16 +315,24 @@ func (s *snapshotter) take(ctx context.Context) Snapshot {
 	sn.Services = s.sv.get()
 	for _, name := range steps {
 		st := s.a.breakers[name].Stats()
+		var changed int64
+		if !st.LastTransition.IsZero() {
+			changed = st.LastTransition.UnixMilli()
+		}
 		sn.Breakers = append(sn.Breakers, breakerState{
 			Name: name, State: st.State.String(), FailureRate: float64(st.FailureRateBps) / 100,
 			Success: st.Success, Failure: st.Failure, Inflight: st.Inflight, Rejected: st.Rejected, Opens: st.Opens,
-			AvgLatencyMs: st.AvgLatency.Milliseconds(), LastChangedMs: st.LastTransition.UnixMilli(),
+			AvgLatencyMs: st.AvgLatency.Milliseconds(), LastChangedMs: changed,
 		})
 	}
+	onDisk := 0
 	if ds, err := s.store.Stats(ctx); err == nil {
 		sn.DLQ.Pending, sn.DLQ.Leased, sn.DLQ.Parked = ds.Pending, ds.Leased, ds.Parked
 		sn.DLQ.OldestSec = ds.OldestPending.Seconds()
+		onDisk = ds.Pending + ds.Leased
 	}
+	sn.Ledger = s.a.ledger.view(onDisk)
+	sn.DroppedEvents = s.a.hub.Dropped()
 	rs := s.redriver.Stats()
 	sn.DLQ.Redriven, sn.DLQ.Blocked = rs.Succeeded, rs.Blocked
 	cs := s.consumer.Stats()
@@ -424,6 +445,18 @@ func (a *app) routes(snap *snapshotter) http.Handler {
 		}
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<12))
 		a.forward(w, r, a.control+"/control/"+name, body)
+	})
+	// A hard kill, on purpose: no shutdown, no flush, no deferred Close. It shows what
+	// the durable log is for. The container restarts and recovers from disk.
+	mux.HandleFunc("POST /api/crash", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		go func() {
+			time.Sleep(150 * time.Millisecond)
+			os.Exit(137)
+		}()
 	})
 	mux.HandleFunc("POST /api/reset", func(w http.ResponseWriter, r *http.Request) {
 		a.forward(w, r, a.control+"/control/reset", nil)
