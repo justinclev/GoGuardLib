@@ -52,3 +52,26 @@ func ExampleOpenWAL() {
 	rep := store.Recovery() // what was found and repaired at startup
 	_ = rep.TruncatedBytes  // alert on this: a torn tail means the last process died mid-write
 }
+
+// Replay stored work when its dependency recovers.
+func ExampleRedriver() {
+	store := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	r, err := dlq.NewRedriver(dlq.RedriveConfig{
+		Store: store,
+		Handler: func(ctx context.Context, item *dlq.Item) error {
+			return reprocess(ctx, item.Record) // nil removes it; retry.Permanent parks it
+		},
+		Rate:        200,
+		RampUp:      30 * time.Second,
+		MaxAttempts: 10,
+	})
+	if err != nil {
+		return
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	go func() { _ = r.Run(ctx) }()
+	_ = r.Stats() // counters: succeeded, retried, blocked, parked
+}
+
+func reprocess(context.Context, dlq.Record) error { return nil }

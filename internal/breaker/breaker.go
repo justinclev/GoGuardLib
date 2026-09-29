@@ -35,6 +35,8 @@ type Breaker struct {
 	probing     int32
 	override    int32
 	dryRun      int32
+	healthGated int32 // 1: only a health check may end the open state (until maxOpen)
+	maxOpen     time.Duration
 
 	OnStateChange func(from, to engine.BreakerState)
 }
@@ -59,6 +61,9 @@ func NewBreaker(failureThreshold float64, sleepWindow, samplingWindow, bucketDur
 
 func (b *Breaker) transition(from, to engine.BreakerState) bool {
 	if b.state.Transition(from, to) {
+		if to == engine.StateClosed {
+			b.metrics.Reset() // start the recovered circuit from a clean slate
+		}
 		if b.OnStateChange != nil {
 			b.OnStateChange(from, to)
 		}
@@ -111,6 +116,11 @@ func (b *Breaker) circuitAllows(shardSeed *uint64) bool {
 	case engine.StateOpen:
 		now := time.Now().UnixNano()
 		last := atomic.LoadInt64(&b.lastFailure)
+		if atomic.LoadInt32(&b.healthGated) == 1 && (b.maxOpen <= 0 || now-last < int64(b.maxOpen)) {
+			// A health check owns the way out of the open state. Real requests are
+			// not spent probing a dependency that has not said it is back.
+			return dryRun
+		}
 		jitterRange := int64(b.sleepWindow) / 10
 		var jitter int64
 		if jitterRange > 0 {
@@ -209,12 +219,41 @@ func (b *Breaker) MarkFailure() {
 	b.recordFailure()
 }
 
-// ProbeSuccess records a successful out-of-band health probe. Probes never
-// held an in-flight slot, so none is released.
-func (b *Breaker) ProbeSuccess() { b.recordSuccess(time.Millisecond) }
+// SetHealthGate hands the way out of the open state to a health check: while
+// gated, an open circuit stays open until BeginProbe or ResetClosed is called.
+// After maxOpen (if positive) the timer-based canary resumes anyway, so a health
+// check that never reports healthy cannot block traffic forever.
+func (b *Breaker) SetHealthGate(maxOpen time.Duration) {
+	b.maxOpen = maxOpen
+	atomic.StoreInt32(&b.healthGated, 1)
+}
 
-// ProbeFailure records a failed out-of-band health probe.
-func (b *Breaker) ProbeFailure() { b.recordFailure() }
+// BeginProbe moves an open circuit to half-open so the next request is admitted
+// as a canary. It reports whether it changed anything.
+func (b *Breaker) BeginProbe() bool {
+	atomic.StoreInt32(&b.probing, 0)
+	return b.transition(engine.StateOpen, engine.StateHalfOpen)
+}
+
+// ResetClosed closes an open or half-open circuit without waiting for a canary.
+func (b *Breaker) ResetClosed() bool {
+	atomic.StoreInt32(&b.probing, 0)
+	return b.transition(engine.StateHalfOpen, engine.StateClosed) || b.transition(engine.StateOpen, engine.StateClosed)
+}
+
+// ReopenFromProbe returns a half-open circuit to open because a health check
+// found the dependency unhealthy again. It records nothing in the window.
+func (b *Breaker) ReopenFromProbe() bool {
+	// Only a real reopening restarts the open clock. Refreshing it on every
+	// unhealthy probe of an already open circuit would keep the MaxOpen fallback
+	// from ever expiring.
+	if b.transition(engine.StateHalfOpen, engine.StateOpen) {
+		atomic.StoreInt64(&b.lastFailure, time.Now().UnixNano())
+		atomic.StoreInt32(&b.probing, 0)
+		return true
+	}
+	return false
+}
 
 func (b *Breaker) recordSuccess(latency time.Duration) {
 	now := time.Now().UnixNano()

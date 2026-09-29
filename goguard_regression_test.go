@@ -1,11 +1,9 @@
 package goguard
 
 import (
-	"context"
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -122,76 +120,8 @@ func TestCloseIsIdempotentAndBlocksNewRequests(t *testing.T) {
 	}
 }
 
-func heartbeatPolicy(probe func(string) error) Policy {
-	return Policy{
-		FailureThreshold: 0.5, MinSamples: 1, SleepWindow: time.Hour,
-		HeartbeatInterval: 5 * time.Millisecond, HeartbeatFunc: probe,
-	}
-}
-
 func downTransport() http.RoundTripper {
 	return &mockTransport{roundTrip: func(*http.Request) (*http.Response, error) { return nil, errors.New("down") }}
-}
-
-// The heartbeat used to start only when OnStateChange was configured.
-func TestHeartbeatRunsWithoutAnyHook(t *testing.T) {
-	var probes int32
-	rt := NewResilientTransport(Config{Transport: downTransport()},
-		WithEndpoint("svc", Host("hb.test"), heartbeatPolicy(func(string) error {
-			atomic.AddInt32(&probes, 1)
-			return errors.New("still down")
-		})))
-
-	_, _ = get(t, rt, "http://hb.test/") // trips the circuit
-
-	deadline := time.Now().Add(2 * time.Second)
-	for atomic.LoadInt32(&probes) == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if atomic.LoadInt32(&probes) == 0 {
-		t.Fatal("heartbeat never probed an open circuit")
-	}
-
-	rt.Close() // must wait for the heartbeat goroutine
-	n := atomic.LoadInt32(&probes)
-	time.Sleep(30 * time.Millisecond)
-	if atomic.LoadInt32(&probes) != n {
-		t.Fatal("heartbeat kept probing after Close returned")
-	}
-	if got := rt.Stats().Breakers[0].Inflight; got != 0 {
-		t.Fatalf("probes drifted the in-flight count to %d", got)
-	}
-}
-
-func TestHeartbeatDefaultProbeHitsHost(t *testing.T) {
-	var hits int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			atomic.AddInt32(&hits, 1)
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	rt := NewResilientTransport(Config{}, WithEndpoint("svc", Host(hostOf(srv)), Policy{
-		FailureThreshold: 0.1, MinSamples: 1, SleepWindow: time.Hour, HeartbeatInterval: 20 * time.Millisecond,
-	}))
-	defer rt.Close()
-
-	e := rt.getEntry(rt.endpoints[0], hostOf(srv))
-	p, err := e.breaker.Acquire(context.Background(), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p.Failure() // opens the circuit and starts the heartbeat
-
-	deadline := time.Now().Add(3 * time.Second)
-	for atomic.LoadInt32(&hits) == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if atomic.LoadInt32(&hits) == 0 {
-		t.Fatal("default heartbeat never sent a HEAD request")
-	}
 }
 
 func TestStateStringAndAliases(t *testing.T) {
@@ -207,22 +137,15 @@ type sinkFunc func()
 
 func (f sinkFunc) Emit(obs.Event) { f() }
 
-func TestWithEventsAndNoHeartbeatAfterClose(t *testing.T) {
+func TestWithEventsSinkReceivesStateChanges(t *testing.T) {
 	var got int32
 	rt := NewResilientTransport(Config{Transport: downTransport()},
 		WithEvents(sinkFunc(func() { atomic.AddInt32(&got, 1) })),
-		WithEndpoint("svc", Host("ev.test"), heartbeatPolicy(func(string) error { return errors.New("down") })))
+		WithEndpoint("svc", Host("ev.test"), tripOnFirstFailure()))
+	defer rt.Close()
 
 	_, _ = get(t, rt, "http://ev.test/") // trips the circuit
 	if atomic.LoadInt32(&got) == 0 {
 		t.Fatal("WithEvents sink received no StateChanged event")
-	}
-	rt.Close()
-
-	// After Close no worker may be started, and the transport refuses requests.
-	e := &entry{ep: rt.endpoints[0]}
-	rt.startHeartbeat(e)
-	if atomic.LoadInt32(&e.hbRunning) != 0 {
-		t.Fatal("heartbeat started after Close")
 	}
 }

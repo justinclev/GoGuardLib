@@ -408,8 +408,11 @@ func (w *WALStore) Nack(ctx context.Context, id, token string, o NackOptions) er
 			e.time(next)
 			e.str(o.Err)
 			e.str(o.BlockedOn)
+			if o.Refund { // optional trailing flag: entries written before it existed still decode
+				e.u8(1)
+			}
 		},
-		func(it *memItem) { w.m.applyNack(it, now, next, o.Err, o.BlockedOn) })
+		func(it *memItem) { w.m.applyNack(it, now, next, o.Err, o.BlockedOn, o.Refund) })
 }
 
 // Park implements Store.

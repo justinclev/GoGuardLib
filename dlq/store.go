@@ -14,6 +14,10 @@ var ErrInvalidRequest = errors.New("dlq: invalid request")
 type LeaseRequest struct {
 	// BlockedOn, if not empty, only leases records waiting on that dependency.
 	BlockedOn string
+	// Skip lists dependencies whose records must not be leased now, typically the
+	// ones whose circuit is open. Records blocked on anything else, including
+	// records blocked on nothing, are still offered.
+	Skip []string
 	// Max is the largest number of records to return (at least 1).
 	Max int
 	// TTL is how long the worker may hold each record before it is offered again
@@ -49,6 +53,10 @@ type NackOptions struct {
 	// BlockedOn, if not empty, replaces the record's BlockedOn: a later step may
 	// be waiting on a different dependency than the earlier one.
 	BlockedOn string
+	// Refund does not count this attempt, as Release does, while still recording
+	// the error, delay and BlockedOn. Use it when the work was never really tried
+	// because the dependency was known to be down.
+	Refund bool
 }
 
 // StoreStats summarises a store. All fields are cheap to compute.

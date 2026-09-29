@@ -27,6 +27,8 @@ type Kind string
 const (
 	KindStateChanged Kind = "state_changed"
 	KindRetried      Kind = "retried"
+	KindProbeResult  Kind = "probe_result"
+	KindRedrive      Kind = "redrive"
 )
 
 // Event is a signal emitted by the library.
@@ -52,6 +54,43 @@ type Retried struct {
 }
 
 func (Retried) EventKind() Kind { return KindRetried }
+
+// ProbeResult reports one health check of a dependency whose circuit is open.
+// It carries no error text: a check's error can embed the URL it called.
+type ProbeResult struct {
+	Dependency  string
+	OK          bool
+	Status      int // HTTP status when the check reported one, else 0
+	Latency     time.Duration
+	Consecutive int // healthy checks in a row, including this one
+	At          time.Time
+}
+
+func (ProbeResult) EventKind() Kind { return KindProbeResult }
+
+// RedriveOutcome says what happened to a stored record when it was retried.
+type RedriveOutcome string
+
+const (
+	RedriveSucceeded RedriveOutcome = "succeeded" // handled and removed
+	RedriveRetry     RedriveOutcome = "retry"     // failed; will be tried again later
+	RedriveBlocked   RedriveOutcome = "blocked"   // its dependency is down; returned without penalty
+	RedriveParked    RedriveOutcome = "parked"    // needs a human
+	RedriveLeaseLost RedriveOutcome = "lease_lost"
+)
+
+// Redrive reports one attempt to reprocess a stored record. RecordID is the
+// record's identifier (never its contents).
+type Redrive struct {
+	Dependency string
+	RecordID   string
+	Outcome    RedriveOutcome
+	Attempts   int
+	Latency    time.Duration
+	At         time.Time
+}
+
+func (Redrive) EventKind() Kind { return KindRedrive }
 
 // Sink receives events. Emit is called on hot paths, so implementations must
 // return quickly and must not block; use a Dispatcher to hand events to code

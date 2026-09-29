@@ -1,10 +1,13 @@
 package goguard
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/justinclev/GoGuardLib/breaker"
+	"github.com/justinclev/GoGuardLib/health"
 	"github.com/justinclev/GoGuardLib/retry"
 )
 
@@ -49,10 +52,19 @@ type Policy struct {
 	// Default: a transport error or a status of 500 or above.
 	IsFailure func(*http.Response, error) bool
 
-	// HeartbeatInterval enables active probing while the circuit is open.
-	HeartbeatInterval time.Duration
-	// HeartbeatFunc probes an endpoint; default is HEAD http://host.
-	HeartbeatFunc func(host string) error
+	// Health makes recovery depend on the endpoint's own health check instead of
+	// a timer: while the circuit is open it is probed with backoff, and only after
+	// enough healthy checks does real traffic resume as a canary. If Check is nil,
+	// HealthPath supplies it. See package health.
+	Health *health.Config
+	// HealthPath (for example "/health") builds an HTTP health check against the
+	// same scheme and host as the traffic, so one policy works for many hosts
+	// (GuardAll, PerHost). Probes use the underlying transport, never the guarded
+	// one, and follow no redirects.
+	HealthPath string
+	// HealthHeader is sent with HealthPath probes, for an auth token the health
+	// endpoint needs. Nothing else from the request is ever copied.
+	HealthHeader http.Header
 
 	// DryRun tracks state and emits events but never rejects a request.
 	DryRun bool
@@ -82,13 +94,24 @@ func defaultIsFailure(resp *http.Response, err error) bool {
 	return err != nil || (resp != nil && resp.StatusCode >= 500)
 }
 
+func (p *Policy) validate(name string) error {
+	if p.Health != nil && p.Health.Check == nil && p.HealthPath == "" {
+		return fmt.Errorf("goguard: endpoint %q sets Health without a Check or HealthPath", name)
+	}
+	if p.HealthPath != "" && !strings.HasPrefix(p.HealthPath, "/") {
+		return fmt.Errorf("goguard: endpoint %q HealthPath must start with \"/\"", name)
+	}
+	return nil
+}
+
 func (p *Policy) applyDefaults() {
 	if p.IsFailure == nil {
 		p.IsFailure = defaultIsFailure
 	}
 }
 
-func (p Policy) breakerConfig(name string) breaker.Config {
+func (p Policy) breakerConfig(name string) breaker.Config { // Health is attached per circuit
+
 	return breaker.Config{
 		Name:             name,
 		FailureThreshold: p.FailureThreshold,

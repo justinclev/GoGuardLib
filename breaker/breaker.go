@@ -14,9 +14,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/justinclev/GoGuardLib/health"
 	ibreaker "github.com/justinclev/GoGuardLib/internal/breaker"
 	"github.com/justinclev/GoGuardLib/obs"
 )
@@ -96,7 +98,14 @@ type Config struct {
 	// Default: any non-nil error. Errors caused by the caller cancelling its own
 	// context are never counted.
 	IsFailure func(error) bool
-	// Events receives StateChanged events. Emit must not block; wrap slow
+	// Health, when set, makes recovery depend on the dependency's own health
+	// check instead of a timer. While the circuit is open a background prober
+	// (see package health) calls Health.Check with backoff; after
+	// Health.SuccessThreshold healthy checks in a row the circuit moves to
+	// half-open, and the next real call is the canary that closes it. A healthy
+	// dependency sees no probe traffic. Call Close to stop the prober.
+	Health *health.Config
+	// Events receives StateChanged and ProbeResult events. Emit must not block; wrap slow
 	// consumers in an obs.Dispatcher.
 	Events obs.Sink
 }
@@ -152,12 +161,21 @@ type Breaker struct {
 	rejectedBulk atomic.Uint64
 	opens        atomic.Uint64
 	lastChange   atomic.Int64
+
+	hc            *health.Config
+	proberRunning atomic.Bool
+	ctx           context.Context
+	cancel        context.CancelFunc
+	closeMu       sync.Mutex
+	closed        bool
+	wg            sync.WaitGroup
 }
 
 // New creates a Breaker.
 func New(cfg Config) *Breaker {
 	cfg.applyDefaults()
 	b := &Breaker{cfg: cfg, seed: uint64(time.Now().UnixNano())}
+	b.ctx, b.cancel = context.WithCancel(context.Background())
 	b.in = ibreaker.NewBreaker(cfg.FailureThreshold, cfg.SleepWindow, cfg.SamplingWindow,
 		cfg.BucketDuration, cfg.MaxInflight, cfg.MinSamples, cfg.DryRun, cfg.RetryBudget)
 	b.in.OnStateChange = func(from, to State) {
@@ -167,8 +185,95 @@ func New(cfg Config) *Breaker {
 			b.opens.Add(1)
 		}
 		obs.Emit(cfg.Events, obs.StateChanged{Dependency: cfg.Name, From: from, To: to, At: now})
+		if to == StateOpen {
+			b.startProber()
+		}
+	}
+	if cfg.Health != nil && cfg.Health.Check != nil {
+		hc := cfg.Health.WithDefaults()
+		b.hc = &hc
+		maxOpen := hc.MaxOpen
+		if maxOpen < 0 {
+			maxOpen = 0 // never fall back to the timer
+		}
+		b.in.SetHealthGate(maxOpen)
 	}
 	return b
+}
+
+// Close stops the health prober and waits for it. The breaker keeps working, but
+// without a prober a health-gated circuit that opens can only recover through the
+// MaxOpen fallback. It is safe to call more than once.
+func (b *Breaker) Close() {
+	b.closeMu.Lock()
+	b.closed = true
+	b.closeMu.Unlock()
+	b.cancel()
+	b.wg.Wait()
+}
+
+func (b *Breaker) addWorker() bool {
+	b.closeMu.Lock()
+	defer b.closeMu.Unlock()
+	if b.closed {
+		return false
+	}
+	b.wg.Add(1)
+	return true
+}
+
+// startProber launches the health prober if one is configured and not already
+// running.
+func (b *Breaker) startProber() {
+	if b.hc == nil || !b.proberRunning.CompareAndSwap(false, true) {
+		return
+	}
+	if !b.addWorker() {
+		b.proberRunning.Store(false)
+		return
+	}
+	go func() {
+		defer b.wg.Done()
+		t := healthTarget{b}
+		for {
+			health.Run(b.ctx, *b.hc, b.cfg.Name, t, b.cfg.Events)
+			b.proberRunning.Store(false)
+			// The circuit may have reopened between Run's last look and the flag
+			// being released, when startProber would have refused to start a second
+			// prober. Check again so it is never left open with nobody watching.
+			if b.ctx.Err() != nil || !t.Active() || !b.proberRunning.CompareAndSwap(false, true) {
+				return
+			}
+		}
+	}()
+}
+
+// healthTarget connects the prober to the breaker.
+type healthTarget struct{ b *Breaker }
+
+func (t healthTarget) Active() bool {
+	s := t.b.in.State()
+	return s == StateOpen || s == StateHalfOpen
+}
+
+func (t healthTarget) Generation() uint64 { return t.b.opens.Load() }
+
+// Result acts on one probe. It deliberately records nothing in the breaker's
+// window or counters: probes are not traffic.
+func (t healthTarget) Result(healthy bool, consecutive int) {
+	b := t.b
+	if !healthy {
+		b.in.ReopenFromProbe() // only acts on a half-open circuit
+		return
+	}
+	if consecutive < b.hc.SuccessThreshold {
+		return
+	}
+	if b.hc.TrustHealth {
+		b.in.ResetClosed()
+		return
+	}
+	b.in.BeginProbe() // only acts on an open circuit; the next real call is the canary
 }
 
 // Name returns the configured name.
@@ -214,17 +319,6 @@ func (b *Breaker) CanRetry() bool { return b.in.CanRetry() }
 
 // RecordRetry counts a retry against the retry budget.
 func (b *Breaker) RecordRetry() { b.in.RecordRetry() }
-
-// RecordProbe records the result of an out-of-band health probe. Probes never
-// held a call slot, so they do not touch the in-flight count. A healthy probe
-// closes a half-open circuit; an unhealthy one reopens it.
-func (b *Breaker) RecordProbe(healthy bool) {
-	if healthy {
-		b.in.ProbeSuccess()
-	} else {
-		b.in.ProbeFailure()
-	}
-}
 
 // Permit is an admitted call. Exactly one of Success, Failure or Abandon takes
 // effect; later calls are ignored.

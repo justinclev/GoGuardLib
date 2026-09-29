@@ -120,6 +120,11 @@ func (m *machine) eligible(it *memItem, now time.Time, req LeaseRequest) bool {
 	if req.BlockedOn != "" && it.rec.BlockedOn != req.BlockedOn {
 		return false
 	}
+	for _, skip := range req.Skip {
+		if it.rec.BlockedOn == skip {
+			return false
+		}
+	}
 	if k := it.rec.OrderKey; k != "" && m.byKey[k][0] != it {
 		return false // an earlier record with this key is still in the store
 	}
@@ -205,8 +210,11 @@ func (m *machine) setCheckpoint(it *memItem, cp []byte) {
 	m.resize(it)
 }
 
-func (m *machine) applyNack(it *memItem, at, next time.Time, errText, blockedOn string) {
+func (m *machine) applyNack(it *memItem, at, next time.Time, errText, blockedOn string, refund bool) {
 	it.rec.State = Pending
+	if refund && it.rec.Attempts > 0 {
+		it.rec.Attempts--
+	}
 	it.rec.LastFailed = at
 	it.rec.NextAttempt = next
 	it.rec.LastError = errText
@@ -282,9 +290,9 @@ func (m *machine) replayAck(id string) {
 	}
 }
 
-func (m *machine) replayNack(id string, at, next time.Time, errText, blockedOn string) {
+func (m *machine) replayNack(id string, at, next time.Time, errText, blockedOn string, refund bool) {
 	if it, ok := m.items[id]; ok {
-		m.applyNack(it, at, next, errText, blockedOn)
+		m.applyNack(it, at, next, errText, blockedOn, refund)
 	}
 }
 

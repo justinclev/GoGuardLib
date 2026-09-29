@@ -140,7 +140,7 @@ func (s *MemoryStore) Nack(ctx context.Context, id, token string, opts NackOptio
 		return err
 	}
 	now := s.clock()
-	s.m.applyNack(it, now, now.Add(opts.Delay), opts.Err, opts.BlockedOn)
+	s.m.applyNack(it, now, now.Add(opts.Delay), opts.Err, opts.BlockedOn, opts.Refund)
 	return nil
 }
 

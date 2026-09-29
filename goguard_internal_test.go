@@ -70,8 +70,8 @@ func TestJanitorPrunesIdleCircuits(t *testing.T) {
 	rt, ep := perHostTransport(t, Config{MaxIdleTime: 100 * time.Millisecond, MaxBreakers: 2, ShardCount: 1})
 	defer rt.Close()
 
-	rt.getEntry(ep, "host1")
-	rt.getEntry(ep, "host2")
+	rt.getEntry(ep, "http", "host1")
+	rt.getEntry(ep, "http", "host2")
 	s := rt.shards[0]
 	s.mu.RLock()
 	n := len(s.entries)
@@ -97,9 +97,9 @@ func TestLRUEvictionCancelsEvictedCircuit(t *testing.T) {
 	rt, ep := perHostTransport(t, Config{MaxBreakers: 2, ShardCount: 1})
 	defer rt.Close()
 
-	first := rt.getEntry(ep, "host1")
-	rt.getEntry(ep, "host2")
-	rt.getEntry(ep, "host3") // evicts host1
+	first := rt.getEntry(ep, "http", "host1")
+	rt.getEntry(ep, "http", "host2")
+	rt.getEntry(ep, "http", "host3") // evicts host1
 
 	s := rt.shards[0]
 	s.mu.RLock()
@@ -109,19 +109,15 @@ func TestLRUEvictionCancelsEvictedCircuit(t *testing.T) {
 	if has1 || !has3 {
 		t.Fatalf("has1=%v has3=%v, want host1 evicted and host3 present", has1, has3)
 	}
-	select {
-	case <-first.ctx.Done():
-	default:
-		t.Fatal("evicted circuit's context was not cancelled")
-	}
+	_ = first // its breaker was closed when it was evicted (see TestEvictedCircuitsStopProbing)
 }
 
 func TestGetEntryReusesAndRefreshesCircuit(t *testing.T) {
 	rt, ep := perHostTransport(t, Config{ShardCount: 1})
 	defer rt.Close()
-	a := rt.getEntry(ep, "h")
+	a := rt.getEntry(ep, "http", "h")
 	atomic.StoreInt64(&a.lastAccess, time.Now().Add(-time.Minute).UnixNano()) // force an LRU touch
-	if b := rt.getEntry(ep, "h"); a != b {
+	if b := rt.getEntry(ep, "http", "h"); a != b {
 		t.Fatal("same host must reuse its circuit")
 	}
 	if time.Since(time.Unix(0, atomic.LoadInt64(&a.lastAccess))) > time.Second {
@@ -138,8 +134,8 @@ func TestConcurrentEntryCreationAndEviction(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			host := fmt.Sprintf("host-%d.com", id)
-			rt.getEntry(ep, host)
-			rt.getEntry(ep, host)
+			rt.getEntry(ep, "http", host)
+			rt.getEntry(ep, "http", host)
 		}(i)
 	}
 	wg.Wait()

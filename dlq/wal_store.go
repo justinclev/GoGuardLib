@@ -638,10 +638,14 @@ func (w *WALStore) applyEntry(fr frame) error {
 		}
 	case entNack:
 		id, at, next, text, blocked := d.str(), d.time(), d.time(), d.str(), d.str()
+		refund := false
+		if len(d.b) > 0 {
+			refund = d.u8() == 1
+		}
 		if err := d.done(); err != nil {
 			return err
 		}
-		w.m.replayNack(id, at, next, text, blocked)
+		w.m.replayNack(id, at, next, text, blocked, refund)
 	case entPark:
 		id, at, reason := d.str(), d.time(), d.str()
 		if err := d.done(); err != nil {

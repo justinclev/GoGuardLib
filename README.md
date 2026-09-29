@@ -95,6 +95,28 @@ err := retry.Do(ctx, retry.Policy{
 
 Return `retry.Permanent(err)` from the function to stop immediately. A breaker's `*OpenError` is never retried.
 
+## Recovery: ask the dependency, don't guess
+
+Every dependency's API can tell you whether it is back. Give a circuit a health check and recovery stops depending on a timer:
+
+```go
+goguard.WithEndpoint("payments", goguard.Host("payments.internal"), goguard.Policy{
+    HealthPath: "/health", // probed on the same scheme and host as the traffic
+    Health:     &health.Config{Interval: 5 * time.Second, SuccessThreshold: 2},
+})
+
+// or, for any call:
+b := breaker.New(breaker.Config{Name: "inventory", Health: &health.Config{Check: pingInventory}})
+defer b.Close() // stops the prober
+```
+
+- **A healthy dependency sees no probe traffic.** Probing starts when the circuit opens and stops when it closes.
+- **Probes back off with jitter** while the dependency is down (`Interval` up to `MaxInterval`), so a struggling service is not hammered and many instances do not probe in lockstep.
+- **Health opens the door; real traffic proves it.** After `SuccessThreshold` healthy checks the circuit moves to half-open, and the next real request is a canary that closes it. A dependency can answer `/health` and still fail real work. `TrustHealth` skips the canary if you would rather trust the check.
+- **A health check that lies cannot block traffic forever.** After `MaxOpen` (default 5 minutes; negative disables) the timer-based canary resumes whatever the check says.
+- **Probes are not traffic.** They go through the underlying transport, never the guarded one, and never touch the circuit's counts. They send no payload, follow no redirects, read a few KiB at most, and send only the headers you set (`HealthHeader`). Probe events (`obs.ProbeResult`) carry the outcome, status and latency, never the URL or error text.
+- Without `Health`, a circuit still recovers on its `SleepWindow` timer.
+
 ## Dead-letter records: the `dlq` package
 
 A `dlq.Record` captures work that could not be finished (a Kafka message, a request) together with where it came from and what was blocking it. A `dlq.Store` keeps records safe until they can be retried. The contract every store honours:
@@ -171,6 +193,53 @@ store, _ := dlq.Secure(dlq.NewMemoryStore(dlq.MemoryOptions{}), dlq.SecureOption
 
 The redactor recognises common credential shapes. It is a safety net for diagnostics, not a guarantee; encrypt payloads rather than relying on it.
 
+## Redriving stored work: `dlq.Redriver`
+
+```go
+r, _ := dlq.NewRedriver(dlq.RedriveConfig{
+    Store:    store,
+    Handler:  func(ctx context.Context, item *dlq.Item) error { return reprocess(ctx, item.Record) },
+    Breakers: map[string]*breaker.Breaker{"payments": paymentsBreaker},
+    Rate:     200, RampUp: 30 * time.Second, // don't flood a dependency that just came back
+    MaxAttempts: 10,
+})
+go r.Run(ctx) // returns when ctx ends, after finishing or releasing what it holds
+```
+
+- **Records wait for their dependency.** A record is tagged with what blocked it (`BlockedOn`). While that dependency's circuit is open its records are not even leased: a long outage costs no attempts and no churn.
+- **Recovery drains the backlog gently.** A rate limit spreads the replay, and after a recovery the rate ramps up from 10% over `RampUp`. Add `r.Sink()` to your breakers' events to react to recovery at once instead of at the next poll.
+- **The handler's return value decides what happens:** `nil` removes the record; a `*dlq.BlockedError` or a `breaker.ErrOpen` holds it for that dependency (an open circuit costs no attempt); `retry.Permanent(err)` parks it for a human; any other error retries with backoff.
+- **Poison pills park; outages don't.** A record that fails `MaxAttempts` times is parked, and so is one whose lease was taken `MaxAttempts` times without finishing (a handler that keeps crashing on it never sees it again). Being rejected by an open circuit is not the record's fault and is never counted. A `BlockedError` for a call that was made and failed *is* counted, so a message that itself breaks a dependency cannot loop forever; set `Refund` only when the call was never made.
+- **Safe under failure.** One record is never handled twice at once, even by a handler that outlives its lease; the handler's context ends before the lease does; a handler that panics is treated as a failure without keeping the panic text; stored error text is redacted; on shutdown, unfinished records are released without penalty.
+- Events (`obs.Redrive`) and `Stats()` report every outcome. Per-key ordering (`OrderKey`) is preserved with any number of workers.
+
+## Multi-step work that resumes: the `pipeline` package
+
+A message that triggers several calls should not start over, or be lost, when the third is down.
+
+```go
+p, _ := pipeline.New("orders", "v3", []pipeline.Step{
+    {Name: "reserve", Breaker: inventory, Run: reserveStock},
+    {Name: "charge",  Breaker: payments,  Run: chargeCard, Compensate: refund},
+    {Name: "ship",    Breaker: shipping,  Run: createShipment},
+    {Name: "notify",  Run: sendEmail},
+}, pipeline.Saga())
+
+// A message arrives (for example from Kafka):
+res, err := p.Execute(ctx, store, pipeline.Input{ID: dlq.KafkaID(topic, part, off), Key: k, Value: v})
+// Done, Deferred and Parked are safe to acknowledge. Failed is not: do not commit the offset.
+
+// Elsewhere, once:
+r, _ := dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: p.Handler(), Breakers: breakers})
+```
+
+- **Each step is checkpointed as it finishes**, along with the data it saved with `x.Set`. If `charge` cannot finish, the message and its progress are stored, tagged with `charge`'s dependency. When that recovers, the redriver resumes at `charge`: `reserve` is **not** run again, and `ship` can still read what `reserve` produced.
+- **Only the blocking dependency matters.** Records blocked on `payments` wait while its circuit is open; records blocked on `shipping` are unaffected.
+- **At-least-once, made safe.** If the process dies after a step's work but before its checkpoint is durable, that step runs again. `x.IdempotencyKey()` is stable for the message and step across every attempt and restart: pass it to the downstream call so a repeat is harmless. Progress made *live* is only stored when a step defers, so a crash mid-run redelivers the message and reruns from the top with the same keys.
+- **`Saga()`** undoes completed steps, newest first, when a step fails permanently. Each compensation is checkpointed, so an outage or crash mid-way resumes compensating and never undoes a step twice. The record is then parked, so a person can see what happened; a compensation that itself fails permanently says so.
+- **A checkpoint that does not fit the deployed pipeline is never resumed.** Renaming, reordering or removing a step that a stored record already completed, or a checkpoint from another pipeline, parks the record with `ErrPipelineMismatch`. Adding steps at the end, or changing the version label, resumes fine.
+- Steps can have a `Timeout`, in-process `Retry`, and a `Breaker`; an open circuit defers the message without calling the dependency.
+
 ## Upgrading from the guard-everything transport
 
 This release changes behaviour deliberately:
@@ -183,10 +252,13 @@ This release changes behaviour deliberately:
 - `CircuitError.Host` is the circuit name: the endpoint name, or the host for per-host circuits.
 - A bulkhead rejection is now reported as `breaker.ErrBulkhead`, not `ErrCircuitOpen`.
 - The retry budget now counts failed requests as traffic, so it limits retries when every request is failing.
+- `Policy.HeartbeatInterval` and `HeartbeatFunc` are replaced by `Policy.Health` / `HealthPath` (see "Recovery"), and `breaker.RecordProbe` is gone: probes are driven by package `health`.
+- A circuit that closes starts with a clean sampling window, so failures from before an outage cannot reopen it on the first new error.
+- `Breaker.Close` now exists; call it if the breaker has a health check.
 
 ## Roadmap
 
-Next: health-check-driven recovery with automatic redrive, multi-step pipelines that resume from the failed step, and a Kafka consumer adapter.
+Next: a Kafka consumer adapter that pauses partitions while a dependency is down, defers to the DLQ, and resumes on recovery.
 
 ## License
 

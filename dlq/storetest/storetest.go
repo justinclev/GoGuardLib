@@ -149,6 +149,8 @@ func Run(t *testing.T, f Factory) {
 		{"AppendParkedDirectly", appendParked},
 		{"CheckpointSurvivesRetry", checkpoint},
 		{"BlockedOnFilter", blockedOnFilter},
+		{"SkipExcludesDependencies", skipDependencies},
+		{"NackRefundDoesNotCountTheAttempt", nackRefund},
 		{"OrderKeyIsHeadOfLine", orderKey},
 		{"ParkedHeadBlocksOrderedSuccessors", parkedHeadBlocks},
 		{"SeqFollowsAppendOrder", seqOrder},
@@ -580,5 +582,49 @@ func concurrentWorkers(e *env) {
 	}
 	if e.stats().Total() != 0 {
 		e.t.Fatal("records left after everything was acked")
+	}
+}
+
+func skipDependencies(e *env) {
+	e.append(rec("p1", func(r *dlq.Record) { r.BlockedOn = "payments" }))
+	e.append(rec("i1", func(r *dlq.Record) { r.BlockedOn = "inventory" }))
+	e.append(rec("n1", func(r *dlq.Record) { r.BlockedOn = "" }))
+
+	lease := func(skip ...string) []string {
+		ls, err := e.s.Lease(e.ctx, dlq.LeaseRequest{Max: 10, TTL: time.Second, Skip: skip})
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		for _, l := range ls {
+			wantErr(e.t, e.s.Release(e.ctx, l.Record.ID, l.Token), nil)
+		}
+		return ids(ls)
+	}
+	if got := lease("payments"); fmt.Sprint(got) != "[i1 n1]" {
+		e.t.Fatalf("skip payments leased %v, want [i1 n1]", got)
+	}
+	if got := lease("payments", "inventory"); fmt.Sprint(got) != "[n1]" {
+		e.t.Fatalf("skip both leased %v, want [n1]: unblocked records are always offered", got)
+	}
+	if got := lease(); fmt.Sprint(got) != "[p1 i1 n1]" {
+		e.t.Fatalf("no skip leased %v", got)
+	}
+}
+
+func nackRefund(e *env) {
+	e.append(rec("r"))
+	l := e.leaseOne()
+	wantErr(e.t, e.s.Nack(e.ctx, "r", l.Token, dlq.NackOptions{Refund: true, BlockedOn: "inventory", Err: "circuit open", Delay: 5 * time.Second}), nil)
+	e.expectNone() // the delay still applies
+	e.clock.Advance(6 * time.Second)
+
+	l2 := e.leaseOne()
+	r := l2.Record
+	if r.Attempts != 1 || r.BlockedOn != "inventory" || r.LastError != "circuit open" {
+		e.t.Fatalf("record = %+v: a refunded nack keeps the error and BlockedOn but not the attempt", r)
+	}
+	wantErr(e.t, e.s.Nack(e.ctx, "r", l2.Token, dlq.NackOptions{}), nil) // an ordinary nack does count
+	if l3 := e.leaseOne(); l3.Record.Attempts != 2 {
+		e.t.Fatalf("Attempts = %d, want 2", l3.Record.Attempts)
 	}
 }

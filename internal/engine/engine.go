@@ -107,6 +107,23 @@ func (w *RollingWindow) rotate(now int64) {
 	atomic.StoreInt64(&w.lastUpdate, now)
 }
 
+// Reset forgets everything recorded so far. A circuit that has just recovered
+// starts from a clean slate, so failures from before the outage cannot reopen it
+// on the first new error.
+func (w *RollingWindow) Reset() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i := range w.buckets {
+		w.buckets[i] = bucket{}
+	}
+	atomic.StoreInt64(&w.totalSuccess, 0)
+	atomic.StoreInt64(&w.totalFailure, 0)
+	atomic.StoreInt64(&w.totalLatency, 0)
+	atomic.StoreInt64(&w.totalRetries, 0)
+	w.head = 0
+	atomic.StoreInt64(&w.lastUpdate, time.Now().UnixNano())
+}
+
 func (w *RollingWindow) Success(now int64, latencyUs int64) {
 	w.rotate(now)
 	w.mu.RLock()

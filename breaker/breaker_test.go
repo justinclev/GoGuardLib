@@ -319,19 +319,6 @@ func TestConcurrentUseIsRaceFree(t *testing.T) {
 	}
 }
 
-func TestRecordProbeDoesNotTouchInflight(t *testing.T) {
-	b := New(quick(nil))
-	b.RecordProbe(false)
-	b.RecordProbe(false)
-	if b.State() != StateOpen {
-		t.Fatalf("state = %v, want open after unhealthy probes", b.State())
-	}
-	b.RecordProbe(true)
-	if b.Stats().Inflight != 0 {
-		t.Fatalf("inflight = %d, want 0", b.Stats().Inflight)
-	}
-}
-
 func TestBulkheadWaitEndsWithContext(t *testing.T) {
 	cfg := quick(nil)
 	cfg.MaxInflight = 1
@@ -346,5 +333,21 @@ func TestBulkheadWaitEndsWithContext(t *testing.T) {
 	_, err := b.Acquire(ctx, false)
 	if !errors.Is(err, ErrBulkhead) || time.Since(start) > 2*time.Second {
 		t.Fatalf("err=%v after %v; the wait must end with the context", err, time.Since(start))
+	}
+}
+
+// After a recovery the window starts clean; otherwise failures from before the
+// outage would reopen the circuit on the first new error.
+func TestRecoveryStartsFromACleanWindow(t *testing.T) {
+	b := New(quick(nil)) // MinSamples 2
+	_ = fail(b)
+	_ = fail(b)
+	time.Sleep(120 * time.Millisecond)
+	if err := b.Do(context.Background(), func(context.Context) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	_ = fail(b) // one failure after recovery is below MinSamples
+	if b.State() != StateClosed {
+		t.Fatalf("state = %v: old failures leaked into the recovered circuit", b.State())
 	}
 }

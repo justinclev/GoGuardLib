@@ -53,19 +53,6 @@ func TestRejectedRequestReleasesSlot(t *testing.T) {
 	}
 }
 
-// Health probes never held a slot, so recording their result must not drift
-// the in-flight counter.
-func TestProbeResultsDoNotTouchInflight(t *testing.T) {
-	b := NewBreaker(0.5, time.Second, time.Second, 100*time.Millisecond, 3, 0, false, 0)
-	for i := 0; i < 5; i++ {
-		b.ProbeFailure()
-		b.ProbeSuccess()
-	}
-	if got := atomic.LoadInt32(&b.inflight); got != 0 {
-		t.Fatalf("inflight = %d after probes, want 0", got)
-	}
-}
-
 func TestAllowExReportsWhyRejected(t *testing.T) {
 	var seed uint64 = 1
 	ctx := context.Background()

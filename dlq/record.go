@@ -235,3 +235,24 @@ var (
 	// ErrClosed means the store has been closed.
 	ErrClosed = errors.New("dlq: store is closed")
 )
+
+// BlockedError tells the redriver that a record could not be processed because a
+// dependency is unavailable. The record is returned to the queue tagged with that
+// dependency, so it is held until the dependency recovers.
+type BlockedError struct {
+	// Dependency names what is unavailable (a circuit breaker or step name).
+	Dependency string
+	// Err is the underlying failure.
+	Err error
+	// Refund, when true, does not count the attempt against the record's budget.
+	// Set it when the call was never made because the circuit was open; leave it
+	// false when the call was made and failed, so a message that itself breaks the
+	// dependency is eventually parked instead of retried forever.
+	Refund bool
+}
+
+func (e *BlockedError) Error() string {
+	return fmt.Sprintf("dlq: blocked on %s: %v", e.Dependency, e.Err)
+}
+
+func (e *BlockedError) Unwrap() error { return e.Err }

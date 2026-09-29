@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/justinclev/GoGuardLib/breaker"
+	"github.com/justinclev/GoGuardLib/health"
 	"github.com/justinclev/GoGuardLib/obs"
 )
 
@@ -138,11 +139,7 @@ type entry struct {
 	name       string
 	ep         *endpoint
 	breaker    *breaker.Breaker
-	probeHost  string
-	ctx        context.Context // cancelled when the entry is evicted or the transport closes
-	cancel     context.CancelFunc
 	lastAccess int64 // unix nanos, atomic
-	hbRunning  int32 // atomic
 }
 
 type shard struct {
@@ -211,11 +208,19 @@ func New(cfg Config, opts ...Option) (*ResilientTransport, error) {
 			cancel()
 			return nil, fmt.Errorf("goguard: duplicate endpoint name %q", e.Name)
 		}
+		if err := e.Policy.validate(e.Name); err != nil {
+			cancel()
+			return nil, err
+		}
 		ep := newEndpoint(len(rt.endpoints), e)
 		rt.endpoints = append(rt.endpoints, ep)
 		rt.byName[e.Name] = ep
 	}
 	if cfg.GuardAll != nil {
+		if err := cfg.GuardAll.validate(guardAllName); err != nil {
+			cancel()
+			return nil, err
+		}
 		rt.guardAll = newEndpoint(len(rt.endpoints), Endpoint{
 			Name: guardAllName, Match: func(*http.Request) bool { return true },
 			Policy: *cfg.GuardAll, PerHost: true,
@@ -276,7 +281,7 @@ func newEndpoint(idx int, e Endpoint) *endpoint {
 }
 
 // Close stops background workers and waits for them, then delivers any queued
-// events. It is safe to call more than once. A custom HeartbeatFunc that ignores
+// events. It is safe to call more than once. A custom health Check that ignores
 // its context, or an OnStateChange that never returns, can delay Close.
 func (t *ResilientTransport) Close() error {
 	t.closeMu.Lock()
@@ -288,11 +293,36 @@ func (t *ResilientTransport) Close() error {
 	t.closeMu.Unlock()
 
 	t.cancel()
+	for _, s := range t.shards {
+		s.mu.RLock()
+		entries := make([]*entry, 0, len(s.entries))
+		for _, el := range s.entries {
+			entries = append(entries, el.Value.(*entry))
+		}
+		s.mu.RUnlock()
+		for _, e := range entries {
+			e.breaker.Close() // stops its health prober
+		}
+	}
 	t.wg.Wait()
 	if t.dispatcher != nil {
 		t.dispatcher.Close()
 	}
 	return nil
+}
+
+// retire stops the background work of a circuit that has been evicted or pruned.
+// It does not wait inline, because it is called with a shard lock held and a
+// health check may take a while to notice it was cancelled.
+func (t *ResilientTransport) retire(e *entry) {
+	if !t.addWorker() {
+		e.breaker.Close()
+		return
+	}
+	go func() {
+		defer t.wg.Done()
+		e.breaker.Close()
+	}()
 }
 
 // addWorker registers a background goroutine, refusing once Close has begun.
@@ -356,7 +386,7 @@ func (t *ResilientTransport) pruneIdle() {
 				prev := el.Prev()
 				s.lru.Remove(el)
 				delete(s.entries, e.key)
-				e.cancel()
+				t.retire(e)
 				el = prev
 				continue
 			}
@@ -380,7 +410,7 @@ func (t *ResilientTransport) shardFor(name string) *shard {
 
 // getEntry returns the circuit for a request to host under ep, creating it on
 // first use.
-func (t *ResilientTransport) getEntry(ep *endpoint, host string) *entry {
+func (t *ResilientTransport) getEntry(ep *endpoint, scheme, host string) *entry {
 	k := key{idx: ep.idx}
 	shardKey := ep.Name
 	if ep.perHost {
@@ -418,19 +448,16 @@ func (t *ResilientTransport) getEntry(ep *endpoint, host string) *entry {
 			evicted := back.Value.(*entry)
 			s.lru.Remove(back)
 			delete(s.entries, evicted.key)
-			evicted.cancel()
+			t.retire(evicted)
 		}
 	}
 
-	ectx, ecancel := context.WithCancel(t.ctx)
-	e := &entry{key: k, name: circuitName(ep, host), ep: ep, probeHost: host, ctx: ectx, cancel: ecancel, lastAccess: now}
 	cfg := ep.bcfg
-	cfg.Name = e.name
+	name := circuitName(ep, host)
+	cfg.Name = name
 	cfg.Events = t.sink
-	if ep.policy.HeartbeatInterval > 0 {
-		cfg.Events = obs.Multi(heartbeatTrigger{t: t, e: e}, t.sink)
-	}
-	e.breaker = breaker.New(cfg)
+	cfg.Health = t.healthFor(ep, scheme, host)
+	e := &entry{key: k, name: name, ep: ep, breaker: breaker.New(cfg), lastAccess: now}
 
 	s.entries[k] = s.lru.PushFront(e)
 	return e
@@ -447,73 +474,34 @@ func circuitName(ep *endpoint, host string) string {
 	}
 }
 
-// heartbeatTrigger starts probing when a circuit opens. It runs synchronously
-// with the transition but only spawns a goroutine.
-type heartbeatTrigger struct {
-	t *ResilientTransport
-	e *entry
-}
-
-func (h heartbeatTrigger) Emit(ev obs.Event) {
-	if sc, ok := ev.(obs.StateChanged); ok && sc.To == StateOpen {
-		h.t.startHeartbeat(h.e)
+// healthFor builds the health configuration for a circuit, or nil when the
+// endpoint has none.
+func (t *ResilientTransport) healthFor(ep *endpoint, scheme, host string) *health.Config {
+	pol := ep.policy
+	if pol.Health == nil && pol.HealthPath == "" {
+		return nil
 	}
-}
-
-// startHeartbeat launches at most one heartbeat goroutine per circuit.
-func (t *ResilientTransport) startHeartbeat(e *entry) {
-	if !atomic.CompareAndSwapInt32(&e.hbRunning, 0, 1) {
-		return
+	var hc health.Config
+	if pol.Health != nil {
+		hc = *pol.Health
 	}
-	if !t.addWorker() {
-		atomic.StoreInt32(&e.hbRunning, 0)
-		return
-	}
-	go t.heartbeat(e)
-}
-
-func (t *ResilientTransport) heartbeat(e *entry) {
-	defer t.wg.Done()
-	ticker := time.NewTicker(e.ep.policy.HeartbeatInterval)
-	defer ticker.Stop()
-	br := e.breaker
-	probe := e.ep.policy.HeartbeatFunc
-	if probe == nil {
-		probe = func(h string) error {
-			req, err := http.NewRequestWithContext(e.ctx, http.MethodHead, "http://"+h, nil)
-			if err != nil {
-				return err
+	if hc.Check == nil {
+		var opts []health.HTTPOption
+		for k, vs := range pol.HealthHeader {
+			for _, v := range vs {
+				opts = append(opts, health.WithHeader(k, v))
 			}
-			resp, err := t.underlying.RoundTrip(req)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = resp.Body.Close() }()
-			if resp.StatusCode >= 500 {
-				return fmt.Errorf("status %d", resp.StatusCode)
-			}
-			return nil
 		}
-	}
-	for {
-		select {
-		case <-e.ctx.Done():
-			return
-		case <-ticker.C:
-			if st := br.State(); st != StateOpen && st != StateHalfOpen {
-				// Release the slot, then re-check: the circuit may have reopened
-				// between the state read and the release, when startHeartbeat
-				// would have been refused.
-				atomic.StoreInt32(&e.hbRunning, 0)
-				if st = br.State(); (st == StateOpen || st == StateHalfOpen) &&
-					atomic.CompareAndSwapInt32(&e.hbRunning, 0, 1) {
-					continue
-				}
-				return
-			}
-			br.RecordProbe(probe(e.probeHost) == nil)
+		// Probes go through the underlying transport: they must not count against
+		// the circuit they are checking.
+		opts = append(opts, health.WithRoundTripper(t.underlying))
+		check, err := health.HTTP(scheme+"://"+host+pol.HealthPath, opts...)
+		if err != nil {
+			return nil // a host that is not a valid URL cannot be probed; the timer applies
 		}
+		hc.Check = check
 	}
+	return &hc
 }
 
 func isRetryable(req *http.Request, err error, resp *http.Response) bool {
@@ -585,7 +573,7 @@ type attemptResult struct {
 }
 
 func (t *ResilientTransport) guarded(ep *endpoint, req *http.Request) (*http.Response, error) {
-	ent := t.getEntry(ep, req.URL.Host)
+	ent := t.getEntry(ep, req.URL.Scheme, req.URL.Host)
 	br := ent.breaker
 	pol := ep.policy
 
