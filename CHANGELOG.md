@@ -7,6 +7,9 @@ for v1.0" so it can be adopted early.
 ## Unreleased
 
 ### Reliability
+- `kafka.RedriveFor(bindings)`: one redrive handler and breaker map for a consumer with
+  several topics. Before, a redriver built from one pipeline parked the other topics'
+  records as mismatched, or ran records with no progress through the wrong pipeline.
 - Consumer: `OnUnstorable` (halt by default, or skip and count) for a message the
   store can never hold; `IDNamespace` and `dlq.KafkaIDIn` so a recreated topic or a
   failover cannot dedupe a new message against an old one; `MirrorTimeout`,

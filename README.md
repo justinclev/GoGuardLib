@@ -176,6 +176,22 @@ What that gives you:
 
 Your `Handle` function can run twice for the same order (after a crash, say), so make it safe to repeat. `m.ID` is the same every time, so you can use it to spot a repeat.
 
+### Reading several topics
+
+Give `kafka.Config` one binding per topic. The redriver needs to know which topic each saved order came from, so build it with `RedriveFor` instead of using one pipeline's handler:
+
+```go
+func newRedriver(store dlq.Store, bindings []kafka.Binding) (*dlq.Redriver, error) {
+	rd, err := kafka.RedriveFor(bindings)
+	if err != nil {
+		return nil, err
+	}
+	return dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: rd.Handler, Breakers: rd.Breakers})
+}
+```
+
+Each saved order is finished by the pipeline of its own topic, and every breaker is watched. An order from a topic you no longer read is set aside for a person, not run through the wrong pipeline.
+
 ## Step 5: a job with several steps
 
 Say each order has to reserve stock, then charge the card. If charging fails, you don't want to reserve the stock a second time. A *pipeline* remembers how far each order got, and retries start from the step that failed.

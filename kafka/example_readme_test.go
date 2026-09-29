@@ -67,3 +67,16 @@ func runOrders(ctx context.Context, brokers, dataDir string) error {
 func Example_readmeSimple() {
 	_ = runOrders
 }
+
+// newRedriver is the README's "several topics" example.
+func newRedriver(store dlq.Store, bindings []kafka.Binding) (*dlq.Redriver, error) {
+	rd, err := kafka.RedriveFor(bindings)
+	if err != nil {
+		return nil, err
+	}
+	return dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: rd.Handler, Breakers: rd.Breakers})
+}
+
+func Example_readmeSeveralTopics() {
+	_ = newRedriver
+}
