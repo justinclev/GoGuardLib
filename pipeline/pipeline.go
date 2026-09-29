@@ -164,6 +164,20 @@ func New(name, version string, steps []Step, opts ...Option) (*Pipeline, error) 
 	return p, nil
 }
 
+// Breakers returns the distinct circuit breakers that guard the steps. A consumer
+// pauses its topic while any of them is open.
+func (p *Pipeline) Breakers() []*breaker.Breaker {
+	seen := map[*breaker.Breaker]bool{}
+	var out []*breaker.Breaker
+	for _, s := range p.steps {
+		if s.Breaker != nil && !seen[s.Breaker] {
+			seen[s.Breaker] = true
+			out = append(out, s.Breaker)
+		}
+	}
+	return out
+}
+
 // StepNames lists the steps in order.
 func (p *Pipeline) StepNames() []string {
 	out := make([]string, len(p.steps))

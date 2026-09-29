@@ -715,3 +715,45 @@ func TestABlockThatCountsEventuallyParksTheRecord(t *testing.T) {
 		t.Fatalf("handler ran %d times, want MaxAttempts (3)", calls.Load())
 	}
 }
+
+func TestOnParkReceivesTheParkedRecordAndFailuresAreOnlyCounted(t *testing.T) {
+	store := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	addBlocked(t, store, 3, "pay")
+	var mu sync.Mutex
+	got := map[string]string{}
+	var calls atomic.Int32
+	r := newRedriver(t, dlq.RedriveConfig{
+		Store: store,
+		Handler: func(ctx context.Context, it *dlq.Item) error {
+			return retry.Permanent(errors.New("rejected: " + it.Record.ID))
+		},
+		OnPark: func(ctx context.Context, rec dlq.Record, reason string) error {
+			mu.Lock()
+			got[rec.ID] = string(rec.Value) + "|" + reason
+			mu.Unlock()
+			switch calls.Add(1) {
+			case 1:
+				return errors.New("kafka is down") // a failing mirror must not un-park
+			case 2:
+				panic("mirror bug")
+			}
+			return nil
+		},
+	})
+	start(t, r)
+	eventually(t, "three records parked", func() bool { return r.Stats().Parked == 3 && calls.Load() == 3 })
+
+	mu.Lock()
+	defer mu.Unlock()
+	for id, v := range got {
+		if !strings.HasPrefix(v, "payload|permanent failure: rejected: "+id) {
+			t.Fatalf("OnPark saw %q for %s", v, id)
+		}
+	}
+	if st, _ := store.Stats(context.Background()); st.Parked != 3 {
+		t.Fatalf("stats = %+v: a failing mirror must not affect parking", st)
+	}
+	if r.Stats().MirrorErrors != 2 {
+		t.Fatalf("MirrorErrors = %d, want 2 (one error, one panic)", r.Stats().MirrorErrors)
+	}
+}

@@ -87,18 +87,25 @@ type RedriveConfig struct {
 	Redactor *secure.Redactor
 	// Events receives an obs.Redrive event per attempt. It must not block.
 	Events obs.Sink
+	// OnPark, if set, is called after a record has been parked, with the record and
+	// the reason, for example to copy it to a Kafka dead-letter topic for other
+	// tooling. The record is already safely parked, so a failure here loses
+	// nothing: return an error only to have it counted in Stats().MirrorErrors.
+	// The record contains the message payload; sending it elsewhere is your choice.
+	OnPark func(ctx context.Context, rec Record, reason string) error
 }
 
 // RedriveStats counts what a Redriver has done.
 type RedriveStats struct {
-	Leased      uint64
-	Succeeded   uint64
-	Retried     uint64
-	Blocked     uint64
-	Parked      uint64
-	LeaseLost   uint64
-	StoreErrors uint64
-	InFlight    int
+	Leased       uint64
+	Succeeded    uint64
+	Retried      uint64
+	Blocked      uint64
+	Parked       uint64
+	LeaseLost    uint64
+	StoreErrors  uint64
+	MirrorErrors uint64
+	InFlight     int
 }
 
 // Redriver replays stored records when their dependencies are usable again. It
@@ -112,7 +119,7 @@ type Redriver struct {
 	wake     chan struct{}
 	inflight atomic.Int32
 
-	leased, succeeded, retried, blocked, parked, leaseLost, storeErrors atomic.Uint64
+	leased, succeeded, retried, blocked, parked, leaseLost, storeErrors, mirrorErrors atomic.Uint64
 
 	active sync.Map // IDs of records a worker is handling right now
 
@@ -179,7 +186,7 @@ func (r *Redriver) Stats() RedriveStats {
 	return RedriveStats{
 		Leased: r.leased.Load(), Succeeded: r.succeeded.Load(), Retried: r.retried.Load(),
 		Blocked: r.blocked.Load(), Parked: r.parked.Load(), LeaseLost: r.leaseLost.Load(),
-		StoreErrors: r.storeErrors.Load(), InFlight: int(r.inflight.Load()),
+		StoreErrors: r.storeErrors.Load(), MirrorErrors: r.mirrorErrors.Load(), InFlight: int(r.inflight.Load()),
 	}
 }
 
@@ -443,6 +450,23 @@ func (r *Redriver) park(ctx context.Context, l Lease, reason string, start time.
 	}
 	r.parked.Add(1)
 	r.emit(l, l.Record.BlockedOn, obs.RedriveParked, start)
+	if r.cfg.OnPark != nil {
+		rec := l.Record.Clone()
+		rec.State, rec.LastError = Parked, reason
+		if err := r.mirror(ctx, rec, reason); err != nil {
+			r.mirrorErrors.Add(1)
+		}
+	}
+}
+
+// mirror calls OnPark, treating a panic as a failure: the record is parked either way.
+func (r *Redriver) mirror(ctx context.Context, rec Record, reason string) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("OnPark panicked")
+		}
+	}()
+	return r.cfg.OnPark(ctx, rec, reason)
 }
 
 func (r *Redriver) storeFailure(err error, l Lease, dep string, start time.Time) {

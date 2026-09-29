@@ -215,6 +215,16 @@ func (s *MemoryStore) parked(id string) (*memItem, error) {
 	return it, nil
 }
 
+// HasOrderKey implements Store.
+func (s *MemoryStore) HasOrderKey(ctx context.Context, orderKey string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.begin(ctx); err != nil {
+		return false, err
+	}
+	return s.m.hasOrderKey(orderKey), nil
+}
+
 // Stats implements Store.
 func (s *MemoryStore) Stats(ctx context.Context) (StoreStats, error) {
 	s.mu.Lock()

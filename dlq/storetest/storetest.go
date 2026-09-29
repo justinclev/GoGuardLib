@@ -153,6 +153,7 @@ func Run(t *testing.T, f Factory) {
 		{"NackRefundDoesNotCountTheAttempt", nackRefund},
 		{"OrderKeyIsHeadOfLine", orderKey},
 		{"ParkedHeadBlocksOrderedSuccessors", parkedHeadBlocks},
+		{"HasOrderKeyReflectsContents", hasOrderKey},
 		{"SeqFollowsAppendOrder", seqOrder},
 		{"StatsReflectContents", statsContents},
 		{"ClosedStoreRefusesWork", closed},
@@ -626,5 +627,36 @@ func nackRefund(e *env) {
 	wantErr(e.t, e.s.Nack(e.ctx, "r", l2.Token, dlq.NackOptions{}), nil) // an ordinary nack does count
 	if l3 := e.leaseOne(); l3.Record.Attempts != 2 {
 		e.t.Fatalf("Attempts = %d, want 2", l3.Record.Attempts)
+	}
+}
+
+func hasOrderKey(e *env) {
+	has := func(k string) bool {
+		ok, err := e.s.HasOrderKey(e.ctx, k)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		return ok
+	}
+	if has("a") || has("") {
+		e.t.Fatal("an empty store has no keys, and the empty key is never present")
+	}
+	key := func(k string) func(*dlq.Record) { return func(r *dlq.Record) { r.OrderKey = k } }
+	e.append(rec("a1", key("a")))
+	e.append(rec("plain", key("")))
+	if !has("a") || has("b") || has("") {
+		e.t.Fatalf("has(a)=%v has(b)=%v has(empty)=%v", has("a"), has("b"), has(""))
+	}
+	l := e.lease(1, "")[0] // a1 is leased, and still counts
+	if !has("a") {
+		e.t.Fatal("a leased record still holds its key")
+	}
+	wantErr(e.t, e.s.Park(e.ctx, l.Record.ID, l.Token, "x"), nil)
+	if !has("a") {
+		e.t.Fatal("a parked record still holds its key")
+	}
+	wantErr(e.t, e.s.Discard(e.ctx, "a1"), nil)
+	if has("a") {
+		e.t.Fatal("the key must be free once its last record is gone")
 	}
 }

@@ -464,6 +464,16 @@ func (w *WALStore) Discard(ctx context.Context, id string) error {
 	return w.withParked(ctx, id, entDiscard, func(it *memItem) { w.m.remove(it) })
 }
 
+// HasOrderKey implements Store.
+func (w *WALStore) HasOrderKey(ctx context.Context, orderKey string) (bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.begin(ctx); err != nil {
+		return false, err
+	}
+	return w.m.hasOrderKey(orderKey), nil
+}
+
 // Stats implements Store.
 func (w *WALStore) Stats(ctx context.Context) (StoreStats, error) {
 	w.mu.Lock()

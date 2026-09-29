@@ -198,7 +198,10 @@ func (s *secureStore) Park(ctx context.Context, id, token, reason string) error 
 	return s.inner.Park(ctx, id, token, s.o.Redactor.String(reason))
 }
 
-func (s *secureStore) Requeue(ctx context.Context, id string) error  { return s.inner.Requeue(ctx, id) }
-func (s *secureStore) Discard(ctx context.Context, id string) error  { return s.inner.Discard(ctx, id) }
+func (s *secureStore) Requeue(ctx context.Context, id string) error { return s.inner.Requeue(ctx, id) }
+func (s *secureStore) Discard(ctx context.Context, id string) error { return s.inner.Discard(ctx, id) }
+func (s *secureStore) HasOrderKey(ctx context.Context, orderKey string) (bool, error) {
+	return s.inner.HasOrderKey(ctx, s.orderKey(orderKey)) // the stored key is the keyed hash
+}
 func (s *secureStore) Stats(ctx context.Context) (StoreStats, error) { return s.inner.Stats(ctx) }
 func (s *secureStore) Close() error                                  { return s.inner.Close() }

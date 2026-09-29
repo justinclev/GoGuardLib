@@ -711,3 +711,19 @@ func TestWithRedactorScrubsStoredErrors(t *testing.T) {
 		t.Fatalf("custom pattern not applied: %q", ls[0].Record.LastError)
 	}
 }
+
+func TestBreakersListsEachGuardingBreakerOnce(t *testing.T) {
+	b1 := breaker.New(breaker.Config{Name: "one"})
+	b2 := breaker.New(breaker.Config{Name: "two"})
+	run := func(context.Context, *pipeline.Exec) error { return nil }
+	p := mustPipeline(t, []pipeline.Step{
+		{Name: "a", Breaker: b1, Run: run}, {Name: "b", Run: run}, {Name: "c", Breaker: b2, Run: run}, {Name: "d", Breaker: b1, Run: run},
+	})
+	got := p.Breakers()
+	if len(got) != 2 || got[0] != b1 || got[1] != b2 {
+		t.Fatalf("Breakers = %v", got)
+	}
+	if len(mustPipeline(t, []pipeline.Step{{Name: "x", Run: run}}).Breakers()) != 0 {
+		t.Fatal("an unguarded pipeline has no breakers")
+	}
+}

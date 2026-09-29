@@ -113,6 +113,12 @@ type Store interface {
 	// records. It returns ErrNotParked otherwise.
 	Discard(ctx context.Context, id string) error
 
+	// HasOrderKey reports whether any record with that OrderKey is still in the
+	// store, in any state. A producer of ordered work uses it to avoid processing a
+	// later message ahead of an earlier one that is waiting. The empty key is never
+	// present.
+	HasOrderKey(ctx context.Context, orderKey string) (bool, error)
+
 	// Stats summarises the store.
 	Stats(ctx context.Context) (StoreStats, error)
 

@@ -247,6 +247,8 @@ func (m *machine) applyRequeue(it *memItem) {
 	it.rec.NextAttempt = time.Time{}
 }
 
+func (m *machine) hasOrderKey(k string) bool { return k != "" && len(m.byKey[k]) > 0 }
+
 func (m *machine) stats(now time.Time) StoreStats {
 	st := StoreStats{Bytes: m.bytes}
 	oldest := true

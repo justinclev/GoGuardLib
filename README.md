@@ -240,6 +240,38 @@ r, _ := dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: p.Handler(), Br
 - **A checkpoint that does not fit the deployed pipeline is never resumed.** Renaming, reordering or removing a step that a stored record already completed, or a checkpoint from another pipeline, parks the record with `ErrPipelineMismatch`. Adding steps at the end, or changing the version label, resumes fine.
 - Steps can have a `Timeout`, in-process `Retry`, and a `Breaker`; an open circuit defers the message without calling the dependency.
 
+## Kafka consumers: the `kafka` module
+
+Kafka support lives in its own Go module, `github.com/justinclev/GoGuardLib/kafka`, so HTTP-only users never pull in the Kafka client or cgo. The consumer logic (package `kafka`) is written against a small `Client` interface and imports no Kafka library; package `kafka/confluent` adapts [confluent-kafka-go](https://github.com/confluentinc/confluent-kafka-go) (which bundles librdkafka; it needs cgo).
+
+```go
+client, _ := confluent.NewClient(ck.ConfigMap{
+    "bootstrap.servers": brokers, "group.id": "orders-service", "auto.offset.reset": "earliest",
+    // security.protocol, sasl.*, ssl.*: yours to set; nothing here logs them
+}, []string{"orders"})
+defer client.Close()
+
+consumer, _ := kafka.NewConsumer(kafka.Config{
+    Client:   client,
+    Store:    walStore, // a durable dlq.Store
+    Bindings: []kafka.Binding{{Topic: "orders", Pipeline: ordersPipeline}},
+    Mirror:   dlqPublisher, // optional: copy parked messages to "orders.dlq"
+})
+err := consumer.Run(ctx) // returns nil when ctx ends; an error only if it can no longer be safe
+```
+
+Only the topics you bind are consumed and guarded. For every message the consumer builds a stable ID (`dlq.KafkaID(topic, partition, offset)`) and runs it through the topic's pipeline.
+
+- **An offset is committed only when its message is safe:** fully processed, or durably stored in the `Store` together with its progress. Commits are batched (`CommitInterval`, `CommitBatch`) and always made on rebalance and shutdown. A crash between commits redelivers messages that were already safe, which is harmless: storing is idempotent by ID and pipeline steps carry idempotency keys.
+- **While a dependency is down, the topic pauses and the messages stay in Kafka.** If any circuit breaker used by a topic's pipeline is open, its partitions are paused. Kafka retains the backlog far more cheaply than a local queue, nothing is copied out, and the consumer keeps polling, so the group does not think it died (verified against a real broker for longer than both `session.timeout.ms` and `max.poll.interval.ms`). When the circuit half-opens, consumption resumes and a real message is the canary.
+- **A message that cannot finish is stored, not blocking.** A failing step defers the message with its checkpoint to the `Store`; the topic keeps flowing and a `dlq.Redriver` running `pipeline.Handler()` completes it when its dependency recovers, resuming at the failed step.
+- **A message is never skipped.** If a message can neither be processed nor stored (the store is full, a timeout), the partition is pointed back at it and paused for a backoff (`Stats().Backpressure` counts store-full cases); nothing behind it is processed first. The consumer also refuses any message that is not exactly the next offset, so a gap or a stale delivery can never be committed past. If the store fails closed, or the consumer cannot seek back, `Run` stops with an error instead of continuing past a message it cannot protect.
+- **Per-key ordering.** While a message with a key is waiting in the store, later messages with the same key are stored behind it (`dlq.Store.HasOrderKey`) instead of being processed ahead of it, and the redriver replays them in order. Other keys are unaffected. `IgnoreKeyOrder` turns this off.
+- **Rebalances are safe.** Progress on partitions being revoked is committed before they are released; pauses are re-applied to partitions that come back. Both the eager and cooperative protocols work. On shutdown the final commit keeps polling and retrying (`ShutdownTimeout`), because a commit is refused while a rebalance is in progress.
+- **Parked messages can be mirrored to a dead-letter topic** (`kafka.NewDLQPublisher`, default `<topic>.dlq`) with the original key, value and headers plus `x-goguard-*` metadata (original topic, partition, offset, reason, attempts, record ID). Pass `publisher.Publish` as `dlq.RedriveConfig.OnPark` for messages the redriver parks. The mirror is best effort: the message is already parked in the store. The producer is idempotent with `acks=all`. The mirrored payload leaves the store, so this is opt-in.
+
+**Requirements and limits.** Processing is sequential per consumer (scale by running more consumers in the group), and one message's processing must stay under `max.poll.interval.ms` (`ProcessTimeout` bounds it). Set `auto.offset.reset` yourself; auto-commit and offset-storing are forced off. Run the integration tests against a broker with `KAFKA_BROKERS=host:9092 make kafka-integration`.
+
 ## Upgrading from the guard-everything transport
 
 This release changes behaviour deliberately:
@@ -255,10 +287,11 @@ This release changes behaviour deliberately:
 - `Policy.HeartbeatInterval` and `HeartbeatFunc` are replaced by `Policy.Health` / `HealthPath` (see "Recovery"), and `breaker.RecordProbe` is gone: probes are driven by package `health`.
 - A circuit that closes starts with a clean sampling window, so failures from before an outage cannot reopen it on the first new error.
 - `Breaker.Close` now exists; call it if the breaker has a health check.
+- `dlq.Store` gained `HasOrderKey` (implement it in custom stores), and `NackOptions.Refund`, `LeaseRequest.Skip`.
 
 ## Roadmap
 
-Next: a Kafka consumer adapter that pauses partitions while a dependency is down, defers to the DLQ, and resumes on recovery.
+Possible follow-ups: keeping payloads on disk instead of in memory for very large queues, resuming a parked record from a chosen step, and metrics adapters (Prometheus / OpenTelemetry) as separate modules.
 
 ## License
 
