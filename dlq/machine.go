@@ -30,6 +30,12 @@ type memItem struct {
 	// BlockedOn, a Parked item in the parked list (grp is nil then).
 	grp *group
 	gel *list.Element
+
+	// reserved marks an item a Lease has picked and is still reading: other leases
+	// skip it. ver changes whenever the item's state or checkpoint changes, so a
+	// lease can tell that what it read is stale.
+	reserved bool
+	ver      uint64
 }
 
 // group holds the Pending and Leased items that wait on one dependency, in Seq
@@ -135,6 +141,7 @@ func (m *machine) unlink(it *memItem) {
 // group (Pending to Leased and back) keeps its place, so leasing the head of a
 // huge group and returning it costs O(1).
 func (m *machine) move(it *memItem, state State, dep string) {
+	it.ver++
 	if it.grp != nil && state != Parked && it.rec.BlockedOn == dep {
 		m.counts[it.rec.State]--
 		m.counts[state]++
@@ -207,6 +214,9 @@ func (m *machine) insert(rec Record) {
 // eligible reports whether it may be leased at now. Which dependency it waits on
 // is decided a level up, by group.
 func (m *machine) eligible(it *memItem, now time.Time) bool {
+	if it.reserved {
+		return false
+	}
 	switch it.rec.State {
 	case Parked:
 		return false
@@ -309,6 +319,20 @@ func (m *machine) selectLease(now time.Time, req LeaseRequest) []*memItem {
 	return out
 }
 
+// reserve keeps other leases away from an item while its payload is read.
+func (m *machine) reserve(it *memItem) { it.reserved = true }
+
+// unreserve releases a reservation and lets the next scan see the item at once.
+func (m *machine) unreserve(it *memItem) {
+	if !it.reserved {
+		return
+	}
+	it.reserved = false
+	if it.grp != nil {
+		it.grp.wake = time.Time{}
+	}
+}
+
 // grant leases the selected items under fresh tokens.
 func (m *machine) grant(items []*memItem, now time.Time, ttl time.Duration) []Lease {
 	out := make([]Lease, 0, len(items))
@@ -341,6 +365,7 @@ func (m *machine) resize(it *memItem) {
 }
 
 func (m *machine) remove(it *memItem) {
+	it.ver++
 	m.unlink(it)
 	m.order.Remove(it.el)
 	delete(m.items, it.rec.ID)
@@ -383,6 +408,7 @@ func (m *machine) checkCheckpoint(it *memItem, cp []byte) error {
 }
 
 func (m *machine) setCheckpoint(it *memItem, cp []byte) {
+	it.ver++
 	it.rec.Checkpoint = cloneBytes(cp)
 	it.ckptRef, it.ckptN = blobRef{}, 0
 	m.resize(it)
@@ -391,6 +417,7 @@ func (m *machine) setCheckpoint(it *memItem, cp []byte) {
 // setCheckpointRef records that the checkpoint (n bytes) now lives on disk at ref.
 // A nil checkpoint (ref zero) is simply absent.
 func (m *machine) setCheckpointRef(it *memItem, n int, ref blobRef) {
+	it.ver++
 	it.rec.Checkpoint = nil
 	it.ckptRef, it.ckptN = ref, n
 	m.resize(it)

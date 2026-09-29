@@ -298,7 +298,24 @@ func (w *WALStore) Append(ctx context.Context, r Record) error {
 	return w.finish(seq)
 }
 
+// leaseCand is a record a Lease has picked and reserved.
+type leaseCand struct {
+	it   *memItem
+	id   string
+	ver  uint64
+	snap itemSnap
+	rec  Record // the payload as read; valid when err is nil
+	err  error
+}
+
 // Lease implements Store.
+//
+// It works in three steps so that reading payloads from disk never holds the lock
+// that Append needs: pick and reserve records under the lock, read their payloads
+// with the lock released, then take the lock again to confirm nothing changed, log
+// the lease and hand the records out. A record whose state or checkpoint changed in
+// between (an old worker finishing an expired lease) is dropped rather than handed
+// out stale; the caller simply polls again.
 func (w *WALStore) Lease(ctx context.Context, req LeaseRequest) ([]Lease, error) {
 	if err := validateLease(req); err != nil {
 		return nil, err
@@ -308,40 +325,107 @@ func (w *WALStore) Lease(ctx context.Context, req LeaseRequest) ([]Lease, error)
 		w.mu.Unlock()
 		return nil, err
 	}
-	now := w.opts.Clock()
-	items := w.m.selectLease(now, req)
+	items := w.m.selectLease(w.opts.Clock(), req)
 	if len(items) == 0 {
 		w.mu.Unlock()
 		return nil, nil
 	}
-	// Read payloads before logging anything. A record whose payload cannot be read
-	// is parked instead of leased: handing out a truncated message would be worse
-	// than holding it for an operator.
-	hydrated := make([]Record, 0, len(items))
-	good := items[:0:0]
+	cands := make([]leaseCand, len(items))
+	for i, it := range items {
+		w.m.reserve(it)
+		cands[i] = leaseCand{it: it, id: it.rec.ID, ver: it.ver}
+		if w.offload {
+			cands[i].snap = snapshotItem(it)
+		}
+	}
+
+	if w.offload {
+		w.mu.Unlock()
+		w.leaseHook("selected")
+		for i := range cands {
+			if ctx.Err() != nil {
+				break // the commit step reports it and releases the reservations
+			}
+			c := &cands[i]
+			c.rec, c.err = w.hydrateSnap(&c.snap)
+		}
+		w.leaseHook("read")
+		w.mu.Lock()
+	} else {
+		for i := range cands { // payloads are in memory: nothing to wait for
+			c := &cands[i]
+			c.rec, c.err = w.hydrate(c.it)
+		}
+	}
+
+	leases, seq, err := w.commitLease(ctx, req, cands)
+	if err != nil || leases == nil {
+		w.mu.Unlock()
+		return nil, err
+	}
+	w.maybeCompactLocked()
+	if err := w.finish(seq); err != nil {
+		return nil, err
+	}
+	if len(leases) == 0 {
+		return nil, nil
+	}
+	return leases, nil
+}
+
+// commitLease is the last step of Lease. It runs with the lock held and releases
+// every reservation before it returns. A nil result with a nil error means nothing
+// was handed out and nothing needs to wait for the disk.
+func (w *WALStore) commitLease(ctx context.Context, req LeaseRequest, cands []leaseCand) ([]Lease, uint64, error) {
+	release := func() {
+		for i := range cands {
+			w.m.unreserve(cands[i].it)
+		}
+	}
+	if err := w.begin(ctx); err != nil {
+		release()
+		return nil, 0, err
+	}
+	release() // from here on eligible() may judge each candidate on its own merits
+	now := w.opts.Clock()
+
+	var good []*memItem
+	var payloads []Record
 	var bad []*memItem
-	for _, it := range items {
-		rec, err := w.hydrate(it)
-		if err != nil {
-			bad = append(bad, it)
+	for i := range cands {
+		c := &cands[i]
+		if cur, ok := w.m.items[c.id]; !ok || cur != c.it || c.it.ver != c.ver || !w.m.eligible(c.it, now) {
+			continue // changed while we were reading
+		}
+		if c.err != nil {
+			// The read may only have failed because a compaction moved the file: look
+			// again with the lock held, where the references are current.
+			c.rec, c.err = w.hydrate(c.it)
+		}
+		if c.err != nil {
+			bad = append(bad, c.it)
 			continue
 		}
-		good = append(good, it)
-		hydrated = append(hydrated, rec)
+		good = append(good, c.it)
+		payloads = append(payloads, c.rec)
 	}
+
 	var lastSeq uint64
-	for _, it := range bad {
+	for _, it := range bad { // a payload that cannot be read is set aside, never handed out
 		seq, err := w.parkUnreadableLocked(it, now)
 		if err != nil {
-			w.mu.Unlock()
-			return nil, err
+			return nil, 0, err
 		}
 		lastSeq = seq
 	}
 	if len(good) == 0 {
+		if len(bad) == 0 {
+			return nil, 0, nil
+		}
 		w.maybeCompactLocked()
-		return nil, w.finish(lastSeq)
+		return []Lease{}, lastSeq, nil // parked something: wait for that entry to be durable
 	}
+
 	var e encoder
 	e.uvarint(uint64(len(good)))
 	for _, it := range good {
@@ -351,20 +435,15 @@ func (w *WALStore) Lease(ctx context.Context, req LeaseRequest) ([]Lease, error)
 	// that crashes on a poison pill cannot reset its own counter.
 	seq, _, err := w.logLocked(entLease, e.b)
 	if err != nil {
-		w.mu.Unlock()
-		return nil, err
+		return nil, 0, err
 	}
 	leases := w.m.grant(good, now, req.TTL)
 	for i := range leases {
-		h := hydrated[i]
-		leases[i].Record.Key, leases[i].Record.Value = h.Key, h.Value
-		leases[i].Record.Headers, leases[i].Record.Checkpoint = h.Headers, h.Checkpoint
+		p := payloads[i]
+		leases[i].Record.Key, leases[i].Record.Value = p.Key, p.Value
+		leases[i].Record.Headers, leases[i].Record.Checkpoint = p.Headers, p.Checkpoint
 	}
-	w.maybeCompactLocked()
-	if err := w.finish(seq); err != nil {
-		return nil, err
-	}
-	return leases, nil
+	return leases, seq, nil
 }
 
 // unreadableReason is the fixed text a record is parked with when its payload
@@ -555,40 +634,97 @@ func (w *WALStore) RequeueWith(ctx context.Context, id string, o RequeueOptions)
 	return w.finish(seq)
 }
 
-// Get implements Store.
+// Get implements Store. The payload is read with the lock released.
 func (w *WALStore) Get(ctx context.Context, id string) (Record, error) {
+	w.mu.Lock()
+	if err := w.begin(ctx); err != nil {
+		w.mu.Unlock()
+		return Record{}, err
+	}
+	it, ok := w.m.items[id]
+	if !ok {
+		w.mu.Unlock()
+		return Record{}, ErrNotFound
+	}
+	if !w.offload {
+		defer w.mu.Unlock()
+		return w.hydrate(it)
+	}
+	snap := snapshotItem(it)
+	w.mu.Unlock()
+
+	if rec, err := w.hydrateSnap(&snap); err == nil {
+		return rec, nil
+	}
+	// The read may have raced a compaction: try once more with current references.
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.begin(ctx); err != nil {
 		return Record{}, err
 	}
-	it, ok := w.m.items[id]
+	it, ok = w.m.items[id]
 	if !ok {
 		return Record{}, ErrNotFound
 	}
 	return w.hydrate(it)
 }
 
-// Parked implements Store.
+// Parked implements Store. Payloads are read with the lock released.
 func (w *WALStore) Parked(ctx context.Context, q ParkedQuery) ([]Record, error) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if err := w.begin(ctx); err != nil {
+		w.mu.Unlock()
 		return nil, err
 	}
 	items := w.m.parkedItems(q.After, q.Limit)
-	out := make([]Record, 0, len(items))
-	for _, it := range items {
-		rec, err := w.hydrate(it)
-		if err != nil {
-			// Still list it, so an operator can see it and discard it, but without
-			// a payload we cannot vouch for.
-			rec = it.rec.Clone()
-			rec.Key, rec.Value, rec.Headers, rec.Checkpoint = nil, nil, nil, nil
+	snaps := make([]itemSnap, len(items))
+	for i, it := range items {
+		snaps[i] = snapshotItem(it)
+	}
+	if !w.offload {
+		defer w.mu.Unlock()
+		out := make([]Record, 0, len(items))
+		for _, it := range items {
+			out = append(out, w.hydrateOrBare(it))
 		}
-		out = append(out, rec)
+		return out, nil
+	}
+	w.mu.Unlock()
+
+	out := make([]Record, len(snaps))
+	var retry []int
+	for i := range snaps {
+		rec, err := w.hydrateSnap(&snaps[i])
+		if err != nil {
+			retry = append(retry, i)
+			continue
+		}
+		out[i] = rec
+	}
+	if len(retry) > 0 {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		for _, i := range retry {
+			// Still list it, so an operator can see it and discard it, but without a
+			// payload we cannot vouch for.
+			out[i] = snaps[i].tmp.rec.Clone()
+			if it, ok := w.m.items[snaps[i].id]; ok {
+				out[i] = w.hydrateOrBare(it)
+			}
+		}
 	}
 	return out, nil
+}
+
+// hydrateOrBare returns the full record, or its metadata alone if the payload
+// cannot be read. The lock must be held.
+func (w *WALStore) hydrateOrBare(it *memItem) Record {
+	rec, err := w.hydrate(it)
+	if err != nil {
+		rec = it.rec.Clone()
+		rec.Key, rec.Value, rec.Headers, rec.Checkpoint = nil, nil, nil, nil
+	}
+	return rec
 }
 
 // Discard implements Store.

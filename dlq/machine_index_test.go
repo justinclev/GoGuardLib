@@ -12,6 +12,9 @@ func naiveSelect(m *machine, now time.Time, req LeaseRequest) []string {
 	var out []string
 	for el := m.order.Front(); el != nil && len(out) < req.Max; el = el.Next() {
 		it := el.Value.(*memItem)
+		if it.reserved {
+			continue
+		}
 		switch it.rec.State {
 		case Parked:
 			continue
@@ -152,7 +155,7 @@ func TestQueueIndexAgreesWithAFullScan(t *testing.T) {
 		}
 
 		for step := 0; step < 600; step++ {
-			switch op := rng.Intn(12); op {
+			switch op := rng.Intn(14); op {
 			case 0, 1, 2: // append
 				next++
 				r := Record{ID: fmt.Sprintf("r%d", next), BlockedOn: deps[rng.Intn(len(deps))], OrderKey: keys[rng.Intn(len(keys))], Value: []byte("v")}
@@ -209,6 +212,20 @@ func TestQueueIndexAgreesWithAFullScan(t *testing.T) {
 			case 10: // a pending record is removed outright (a snapshot-style discard of a head)
 				if it := pick(Pending); it != nil && rng.Intn(3) == 0 {
 					m.remove(it)
+				}
+			case 12: // a lease picks something to read
+				if it := pick(Pending); it != nil {
+					m.reserve(it)
+				}
+			case 13: // a lease finishes or gives up
+				var held []*memItem
+				for el := m.order.Front(); el != nil; el = el.Next() {
+					if it := el.Value.(*memItem); it.reserved {
+						held = append(held, it)
+					}
+				}
+				if len(held) > 0 {
+					m.unreserve(held[rng.Intn(len(held))])
 				}
 			case 11: // time passes, sometimes less than a wake-skew
 				now = now.Add(time.Duration(rng.Intn(1500)) * time.Millisecond)

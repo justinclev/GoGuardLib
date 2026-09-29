@@ -135,6 +135,7 @@ type WALOptions struct {
 	maxEntryBytes int
 	openFile      func(name string, flag int, perm os.FileMode) (walFile, error)
 	compactHook   func(stage string) // "captured" and "copied", to interleave work with a compaction
+	leaseHook     func(stage string) // "selected" and "read", to interleave work with a lease's unlocked read
 }
 
 func (o *WALOptions) applyDefaults() error {
@@ -266,6 +267,12 @@ type WALStore struct {
 }
 
 var _ Store = (*WALStore)(nil)
+
+func (w *WALStore) leaseHook(stage string) {
+	if h := w.opts.leaseHook; h != nil {
+		h(stage)
+	}
+}
 
 func segmentName(start uint64) string { return fmt.Sprintf("wal-%020d.log", start) }
 func snapshotName(lsn uint64) string  { return fmt.Sprintf("snapshot-%020d.snap", lsn) }

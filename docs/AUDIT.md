@@ -30,7 +30,7 @@ A review of every non-test source file (about 7,000 lines across the core module
 | 18 | Ordered-key removal O(n) | Scalability | Low | Fixed |
 | 19 | Confluent adapter hides broker errors and message-level errors | Reliability / usability | Medium | Fixed |
 | 20 | No dependency vulnerability scanning or update automation | Security | Medium | Added (unverified locally) |
-| 21 | Lease, Get and Parked read payloads from disk under the store lock | Scalability | Medium | Mitigated, open |
+| 21 | Lease, Get and Parked read payloads from disk under the store lock | Scalability | Medium | Fixed (two-phase lease) |
 | 22 | Kafka consumer processes one message at a time | Scalability | Medium | Open (design) |
 | 23 | Records are protected by CRC only; `Secure` does not authenticate metadata | Security | Medium | Open (documented) |
 | 24 | No free-disk-space guard; compaction needs up to 2x live data | Reliability | Medium | Open (documented) |
@@ -156,11 +156,15 @@ Removing the head of a key's list copied the whole list, so draining a hot key w
 
 Added a `vuln` CI job (`go mod verify` plus `govulncheck` on both modules), a `make vuln` target and weekly Dependabot updates for both Go modules and the GitHub Actions. Not run locally (the vulnerability database is blocked in this environment), so treat the first CI run as its verification.
 
+### 21. Payload reads under the store lock (Medium, scalability)
+
+**Was.** `Lease` had to read a record's payload before it could log the lease, and `Get` and `Parked` read payloads too, all while holding the lock `Append` needs. The reads are small, but a slow disk stretched the pause and `Append` tail latency inherited it.
+
+**Now.** A lease works in three steps: pick and *reserve* records under the lock (other leases skip reserved records, so concurrent leasers get disjoint sets), read their payloads with the lock released, then take the lock again, confirm each record is unchanged (a version counter, bumped by every state or checkpoint change), log the lease and hand the records out. A record that changed in between (an old worker finishing an expired lease) is dropped rather than handed out stale, and a read that failed is retried once under the lock before a record is ever parked as unreadable, so a compaction that deletes a file mid-read is not mistaken for corruption. `Get` and `Parked` read unlocked with the same locked retry. The file cache now hands out reference-counted handles and preads outside its own mutex, so readers do not serialise, and evicted or closed handles are closed by their last reader.
+
+**Verified by.** With every lease read stalled for 20 ms, the worst `Append` took 0.27 ms (`TestAppendLatencyIsIndependentOfSlowReads`); other operations and a second lease proceed while a read is in flight; twelve concurrent leasers over 300 records never share one; a checkpoint, ack or park by an old worker mid-read is never handed out stale; a compaction mid-read returns intact payloads and parks nothing; reservations are released on cancellation, close and unreadable payloads; the file cache survives concurrent eviction, drops and close under `-race`. Five mutations each fail a test: skipping the version check, the reservation, the locked retry, the release on error, and holding the lock across the read. Single-threaded lease cost is unchanged within noise (about 9 µs for a lease and release on disk).
+
 ## Findings that remain, and why
-
-### 21. Payload reads under the store lock (Medium, open)
-
-`Lease` must read a record's payload before it can log the lease, and `Get` and `Parked` read payloads too, all while holding the store lock. The reads are positioned `pread` calls on cached handles and are bounded (the redriver leases at most eight records; `Parked` pages are capped at 32 MiB), so the worst pause is in the low milliseconds, but a slow disk stretches it and `Append` waits behind it. Removing this needs a two-phase lease (select, read unlocked, revalidate and grant). It was left alone because that adds a race window on the most safety-critical path for a gain that only shows with slow storage; measure `Append` tail latency under lease load before doing it. Compaction, the operation that could have blocked for seconds, already copies without the lock.
 
 ### 22. Sequential consumer (Medium, open by design)
 
@@ -190,6 +194,5 @@ Recorded so the next reviewer does not repeat it.
 ## Suggested next steps
 
 1. Run `make kafka-integration` against a broker and the new `vuln` job once in CI.
-2. Load-test `Append` latency while leasing under a slow disk to decide whether finding 21 is worth a two-phase lease.
-3. Decide on finding 23 (frame signing) if the threat model includes someone with write access to the volume.
-4. Add Prometheus / OpenTelemetry adapters as separate modules so `Stats()` and events are scraped without glue code.
+2. Decide on finding 23 (frame signing) if the threat model includes someone with write access to the volume.
+3. Add Prometheus / OpenTelemetry adapters as separate modules so `Stats()` and events are scraped without glue code.
