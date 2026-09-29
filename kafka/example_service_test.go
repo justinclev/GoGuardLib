@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync/atomic"
 	"time"
 
 	ck "github.com/confluentinc/confluent-kafka-go/v2/kafka"
@@ -17,161 +16,117 @@ import (
 	"github.com/justinclev/GoGuardLib/health"
 	"github.com/justinclev/GoGuardLib/kafka"
 	"github.com/justinclev/GoGuardLib/kafka/confluent"
-	"github.com/justinclev/GoGuardLib/obs"
 	"github.com/justinclev/GoGuardLib/pipeline"
 	"github.com/justinclev/GoGuardLib/retry"
 	"github.com/justinclev/GoGuardLib/secure"
 )
 
-// ordersService is everything the orders service needs to run.
-type ordersService struct {
-	Brokers      string
-	DataDir      string // must be on a persistent volume
-	EncryptKey   []byte // 32 bytes, from your secret store; never stored beside the data
-	InventoryURL string
-	PaymentsURL  string
-	Events       obs.Sink // circuit and redrive events for your metrics; may be nil
+// This file is the orders service from the README, kept here so that it compiles.
+//
+// For every order on the "orders" topic the service does two things:
+//  1. reserves the stock, by calling the inventory service
+//  2. charges the card, by calling the payments service
+//
+// If either service is down, the order is saved to disk with a note of how far it
+// got, and finished later, starting from the step that failed.
+
+// serviceConfig is what the service needs from its environment.
+type serviceConfig struct {
+	Brokers        string // "kafka-1:9092,kafka-2:9092"
+	DataDir        string // where the dead-letter log lives: a persistent volume, not the container's own disk
+	InventoryURL   string // "http://inventory.internal"
+	PaymentsURL    string // "http://payments.internal"
+	EncryptionKey  []byte // 32 bytes, from your secret store
+	OrderKeyPepper []byte // another secret; hides the Kafka key (the customer) in the log
 }
 
-// A complete service: it consumes orders, calls two dependencies for each, sets aside
-// what cannot finish, and completes it when the dependency recovers.
-func Example_ordersService() {
-	svc := ordersService{
-		Brokers:      "kafka:9092",
-		DataDir:      "/var/lib/orders/dlq",
-		InventoryURL: "http://inventory.internal",
-		PaymentsURL:  "http://payments.internal",
-	}
-	ctx, stop := context.WithCancel(context.Background())
-	defer stop()
-	_ = svc.Run(ctx) // returns when ctx ends, or with the error that made continuing unsafe
-}
-
-// Run wires the components and runs the consumer and the redriver until ctx ends.
-func (s ordersService) Run(ctx context.Context) error {
-	// The breakers need the redriver's wake-up sink and the redriver needs the
-	// breakers, so the sink reaches it through a pointer that is set once it exists.
-	var redriver atomic.Pointer[dlq.Redriver]
-	events := obs.Multi(s.Events, obs.SinkFunc(func(e obs.Event) {
-		if r := redriver.Load(); r != nil {
-			r.Sink().Emit(e)
-		}
-	}))
-
-	inventory, err := newBreaker("inventory", s.InventoryURL+"/health", events)
+// runOrdersService runs until ctx ends, or returns the error that made it unsafe to go on.
+func runOrdersService(ctx context.Context, cfg serviceConfig) error {
+	// One breaker per service we call.
+	inventory, err := newBreaker("inventory", cfg.InventoryURL)
 	if err != nil {
 		return err
 	}
 	defer inventory.Close()
-	payments, err := newBreaker("payments", s.PaymentsURL+"/health", events)
+	payments, err := newBreaker("payments", cfg.PaymentsURL)
 	if err != nil {
 		return err
 	}
 	defer payments.Close()
 
-	store, err := s.openStore()
+	// The durable log where orders wait when a service is down.
+	store, err := openStore(cfg)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
 
+	// The two steps every order goes through, each behind its own breaker.
 	orders, err := pipeline.New("orders", "v1", []pipeline.Step{
-		{Name: "reserve", Breaker: inventory, Timeout: 5 * time.Second, Run: post(s.InventoryURL + "/reserve")},
-		{Name: "charge", Breaker: payments, Timeout: 5 * time.Second, Run: post(s.PaymentsURL + "/charge")},
+		{Name: "reserve", Breaker: inventory, Timeout: 5 * time.Second, Run: post(cfg.InventoryURL + "/reserve")},
+		{Name: "charge", Breaker: payments, Timeout: 5 * time.Second, Run: post(cfg.PaymentsURL + "/charge")},
 	})
 	if err != nil {
 		return fmt.Errorf("building the pipeline: %w", err)
 	}
 
-	producer, err := confluent.NewProducer(ck.ConfigMap{"bootstrap.servers": s.Brokers})
-	if err != nil {
-		return fmt.Errorf("creating the dead-letter producer: %w", err)
-	}
-	defer producer.Close()
-	mirror, err := kafka.NewDLQPublisher(kafka.PublisherConfig{Producer: producer}) // "orders.dlq"
-	if err != nil {
-		return err
-	}
-
-	rd, err := dlq.NewRedriver(dlq.RedriveConfig{
-		Store:    store,
-		Handler:  orders.Handler(),
-		Breakers: map[string]*breaker.Breaker{"inventory": inventory, "payments": payments},
-		Rate:     100, RampUp: 30 * time.Second, // do not flood a dependency that just came back
-		OnPark: mirror.Publish,
-		Events: s.Events,
-	})
-	if err != nil {
-		return fmt.Errorf("creating the redriver: %w", err)
-	}
-	redriver.Store(rd)
-
 	client, err := confluent.NewClient(ck.ConfigMap{
-		"bootstrap.servers": s.Brokers,
+		"bootstrap.servers": cfg.Brokers,
 		"group.id":          "orders-service",
 		"auto.offset.reset": "earliest",
 	}, []string{"orders"})
 	if err != nil {
-		return fmt.Errorf("creating the consumer client: %w", err)
+		return fmt.Errorf("creating the Kafka client: %w", err)
 	}
 	defer func() { _ = client.Close() }()
 
+	// The consumer reads orders and runs them through the pipeline.
 	consumer, err := kafka.NewConsumer(kafka.Config{
-		Client:         client,
-		Store:          store,
-		Bindings:       []kafka.Binding{{Topic: "orders", Pipeline: orders}},
-		Workers:        4,
-		ProcessTimeout: 30 * time.Second,
-		Mirror:         mirror,
+		Client:   client,
+		Store:    store,
+		Bindings: []kafka.Binding{{Topic: "orders", Pipeline: orders}},
 	})
 	if err != nil {
 		return fmt.Errorf("creating the consumer: %w", err)
 	}
 
-	return runBoth(ctx, consumer.Run, rd.Run)
+	// The redriver finishes stored orders once the service they waited for is healthy.
+	redriver, err := dlq.NewRedriver(dlq.RedriveConfig{
+		Store:    store,
+		Handler:  orders.Handler(),
+		Breakers: map[string]*breaker.Breaker{"inventory": inventory, "payments": payments},
+		Rate:     100, // orders per second, so a service that just came back is not flooded
+		RampUp:   30 * time.Second,
+	})
+	if err != nil {
+		return fmt.Errorf("creating the redriver: %w", err)
+	}
+
+	return runTogether(ctx, consumer.Run, redriver.Run)
 }
 
-// newBreaker guards one dependency. While its circuit is open, its health endpoint is
-// probed; real traffic resumes, one canary first, only after it answers.
-func newBreaker(name, healthURL string, events obs.Sink) (*breaker.Breaker, error) {
-	check, err := health.HTTP(healthURL)
+// newBreaker guards one service. While its circuit is open, the service's /health
+// endpoint is probed. When it answers, one real call is tried, and only if that
+// succeeds does normal traffic resume.
+func newBreaker(name, baseURL string) (*breaker.Breaker, error) {
+	check, err := health.HTTP(baseURL + "/health")
 	if err != nil {
 		return nil, fmt.Errorf("health check for %s: %w", name, err)
 	}
 	return breaker.New(breaker.Config{
 		Name:             name,
-		FailureThreshold: 0.5,
-		MinSamples:       20,
-		SleepWindow:      30 * time.Second,
-		// A 4xx says the request was wrong, not that the service is unhealthy.
+		FailureThreshold: 0.5, // open when half of the recent calls fail...
+		MinSamples:       20,  // ...but only after at least 20 calls, so one early error does not trip it
+		// A 4xx means the request was wrong, not that the service is unhealthy.
 		IsFailure: func(err error) bool { return !retry.IsPermanent(err) },
 		Health:    &health.Config{Check: check, Interval: 5 * time.Second, SuccessThreshold: 2},
-		Events:    events,
 	}), nil
 }
 
-// openStore opens the durable log that holds messages which could not finish, with
-// their payloads encrypted at rest.
-func (s ordersService) openStore() (dlq.Store, error) {
-	wal, err := dlq.OpenWAL(s.DataDir, dlq.WALOptions{MaxBytes: 2 << 30}) // your disk budget
-	if err != nil {
-		return nil, fmt.Errorf("opening the dead-letter log: %w", err)
-	}
-	enc, err := secure.NewAESGCM(secure.Key{ID: "2026-09", Material: s.EncryptKey})
-	if err != nil {
-		_ = wal.Close()
-		return nil, fmt.Errorf("building the encryptor: %w", err)
-	}
-	store, err := dlq.Secure(wal, dlq.SecureOptions{Encryptor: enc})
-	if err != nil {
-		_ = wal.Close()
-		return nil, err
-	}
-	return store, nil
-}
-
-// post is one pipeline step: send the message to a dependency. The idempotency key is
-// the same for this message and step on every attempt, so a repeat does no harm.
+// post is one pipeline step: send the order to a service.
+//
+// The idempotency key is the same for a given order and step on every attempt, so if
+// the step runs twice (after a crash, say) the service can recognise the repeat.
 func post(url string) func(context.Context, *pipeline.Exec) error {
 	return func(ctx context.Context, x *pipeline.Exec) error {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(x.Value))
@@ -183,7 +138,7 @@ func post(url string) func(context.Context, *pipeline.Exec) error {
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return err // the dependency is unreachable: transient
+			return err // the service is unreachable: a temporary problem
 		}
 		defer func() { _ = resp.Body.Close() }()
 		_, _ = io.Copy(io.Discard, resp.Body)
@@ -192,28 +147,88 @@ func post(url string) func(context.Context, *pipeline.Exec) error {
 		case resp.StatusCode < 300:
 			return nil
 		case resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests:
-			// The message itself is wrong; retrying cannot help. It is parked for a person.
+			// The order itself is wrong (a declined card, say). Retrying cannot help, so
+			// mark it permanent: it is parked for a person instead of retried for ever.
 			return retry.Permanent(fmt.Errorf("%s answered %d", url, resp.StatusCode))
 		default:
-			return fmt.Errorf("%s answered %d", url, resp.StatusCode)
+			return fmt.Errorf("%s answered %d", url, resp.StatusCode) // temporary: retried later
 		}
 	}
 }
 
-// runBoth runs the given loops, stops the rest when one ends, and returns every error.
-func runBoth(ctx context.Context, loops ...func(context.Context) error) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+// openStore opens the dead-letter log on disk, with every stored order encrypted.
+func openStore(cfg serviceConfig) (dlq.Store, error) {
+	wal, err := dlq.OpenWAL(cfg.DataDir, dlq.WALOptions{MaxBytes: 2 << 30}) // 2 GiB: your disk budget
+	if err != nil {
+		return nil, fmt.Errorf("opening the dead-letter log: %w", err)
+	}
+	enc, err := secure.NewAESGCM(secure.Key{ID: "2026-09", Material: cfg.EncryptionKey})
+	if err != nil {
+		_ = wal.Close()
+		return nil, fmt.Errorf("building the encryptor: %w", err)
+	}
+	store, err := dlq.Secure(wal, dlq.SecureOptions{Encryptor: enc, OrderKeyPepper: cfg.OrderKeyPepper})
+	if err != nil {
+		_ = wal.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// runTogether runs the loops until ctx ends. If one stops, it stops the rest, and it
+// returns every error.
+func runTogether(ctx context.Context, loops ...func(context.Context) error) error {
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	results := make(chan error, len(loops))
 	for _, loop := range loops {
-		go func() { results <- loop(ctx) }()
+		go func() {
+			results <- loop(ctx)
+			stop()
+		}()
 	}
 	var errs []error
 	for range loops {
-		if err := <-results; err != nil {
-			errs = append(errs, err)
-		}
-		cancel()
+		errs = append(errs, <-results)
 	}
 	return errors.Join(errs...)
+}
+
+// parkedOrder is an order waiting for a person, and how far it got.
+type parkedOrder struct {
+	RecordID string
+	Reason   string
+	Done     []string // steps that finished
+	Next     string   // the step it stopped at
+}
+
+// listParked returns the orders that need a person. They are never retried and never
+// deleted on their own, so this list is the operator's to-do list.
+func listParked(ctx context.Context, store dlq.Store, orders *pipeline.Pipeline) ([]parkedOrder, error) {
+	records, err := store.Parked(ctx, dlq.ParkedQuery{Limit: 100})
+	if err != nil {
+		return nil, fmt.Errorf("listing parked orders: %w", err)
+	}
+	var parked []parkedOrder
+	for _, rec := range records {
+		progress, err := orders.Describe(rec.Checkpoint)
+		if err != nil {
+			return nil, fmt.Errorf("reading the checkpoint of %s: %w", rec.ID, err)
+		}
+		parked = append(parked, parkedOrder{RecordID: rec.ID, Reason: rec.LastError, Done: progress.Completed, Next: progress.Next})
+	}
+	return parked, nil
+}
+
+// resumeParked puts a parked order back in the queue at the given step, once whatever
+// stopped it has been fixed. Steps before that one are not repeated.
+func resumeParked(ctx context.Context, store dlq.Store, orders *pipeline.Pipeline, recordID, fromStep string) error {
+	return orders.Redrive(ctx, store, recordID, fromStep)
+}
+
+// Example_ordersService only makes sure the service above compiles; it needs a broker to run.
+func Example_ordersService() {
+	_ = runOrdersService
+	_ = listParked
+	_ = resumeParked
 }

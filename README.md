@@ -16,9 +16,23 @@ go get github.com/justinclev/GoGuardLib        # HTTP, breaker, retry, dlq, pipe
 go get github.com/justinclev/GoGuardLib/kafka  # Kafka consumer (needs cgo, uses confluent-kafka-go v2)
 ```
 
-## Quickstart: HTTP
+## Example: an orders service
 
-Protection is opt-in. Register the endpoints you want guarded; everything else goes straight through untouched.
+Every example below is one service. It handles each order in two steps:
+
+1. reserve the stock, by calling the **inventory** service
+2. charge the card, by calling the **payments** service
+
+Orders arrive on a Kafka topic. The same service also makes a plain HTTP call to payments to get a price quote. That gives two kinds of work with two different needs:
+
+- **The quote** is an HTTP call that someone is waiting for. When payments is down, the right answer is a fast error.
+- **An order** must not be lost. When payments is down, the right answer is to save the order and finish it later.
+
+The code below is copied from files that compile: [`examples/httpclient/httpclient_test.go`](examples/httpclient/httpclient_test.go) for the HTTP part and [`kafka/example_service_test.go`](kafka/example_service_test.go) for the Kafka part.
+
+### The quote: an HTTP call that fails fast
+
+Two functions set it up. `newGuardedClient` returns an ordinary `http.Client` in which only calls to the payments host are guarded, and everything else goes straight through. `getQuote` is the code that uses it.
 
 ```go
 // newGuardedClient returns an http.Client whose calls to payments are protected.
@@ -28,7 +42,7 @@ func newGuardedClient(paymentsHost string, events obs.Sink) (*http.Client, func(
 		goguard.WithEvents(events),
 		goguard.WithEndpoint("payments", onHost(paymentsHost), goguard.Policy{
 			FailureThreshold: 0.5,              // open at a 50% failure rate...
-			MinSamples:       3,                // ...once this many calls have been seen
+			MinSamples:       3,                // ...once this many calls have been seen (20 or more in production)
 			SleepWindow:      30 * time.Second, // how long to stay open without a health check
 			RequestTimeout:   2 * time.Second,
 			MaxRetries:       2, // idempotent requests only (GET, HEAD, OPTIONS, TRACE)
@@ -47,95 +61,312 @@ func onHost(host string) goguard.Matcher {
 }
 ```
 
-When the circuit is open, `client.Do` returns an error instead of calling the service. A 5xx from a service that is still answering comes back as a normal response; only a refusal is an error:
-
 ```go
-_, err = client.Post(payments.URL+"/charge", "application/json", nil)
+// ErrPaymentsUnavailable means payments is failing and the call was not attempted.
+var ErrPaymentsUnavailable = errors.New("payments is unavailable, try again shortly")
 
-var circuit *goguard.CircuitError
-switch {
-case errors.Is(err, goguard.ErrCircuitOpen) && errors.As(err, &circuit):
-	fmt.Printf("refused: %s circuit is %s\n", "payments", circuit.State)
-case err != nil:
-	fmt.Println("other error:", err)
+// getQuote asks payments for a price. When payments is failing, it returns at once
+// with ErrPaymentsUnavailable instead of waiting for a timeout.
+func getQuote(client *http.Client, paymentsURL string) (string, error) {
+	resp, err := client.Get(paymentsURL + "/quote")
+	if err != nil {
+		if errors.Is(err, goguard.ErrCircuitOpen) {
+			return "", ErrPaymentsUnavailable // the call was refused: payments was not contacted
+		}
+		return "", fmt.Errorf("asking payments for a quote: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("payments answered %d", resp.StatusCode)
+	}
+	price, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading the quote: %w", err)
+	}
+	return string(price), nil
 }
 ```
 
-That snippet runs as a test in [`examples/httpclient`](examples/httpclient/httpclient_test.go). A refused request is not stored or replayed. If you can't afford to drop it, use the Kafka route.
-
-## Quickstart: Kafka
-
-Each message goes to your handler. If the handler fails, the message is saved to a log on disk, the offset moves on, and a redriver finishes the message once the failing service is healthy again.
+Now run `getQuote` four times while payments answers 503 to everything:
 
 ```go
-// runOrders consumes the "orders" topic and calls the payments API for each message.
-// When payments is down, messages are written to disk and finished after it recovers.
-func runOrders(ctx context.Context, brokers string, payments *breaker.Breaker) error {
-	store, err := dlq.OpenWAL("/var/lib/orders/dlq", dlq.WALOptions{})
-	if err != nil {
-		return fmt.Errorf("open dead-letter log: %w", err)
-	}
-	defer func() { _ = store.Close() }()
+for call := 1; call <= 4; call++ {
+	_, err := getQuote(client, payments.URL)
+	fmt.Printf("call %d: %v\n", call, err)
+}
+```
 
-	orders, err := kafka.HandlerBinding(kafka.HandlerConfig{
-		Topic:   "orders",
-		Breaker: payments,
-		Handle: func(ctx context.Context, m kafka.HandledMessage) error {
-			return charge(ctx, m.ID, m.Value) // m.ID is stable across retries: use it as an idempotency key
-		},
-	})
+It prints:
+
+```
+call 1: payments answered 503
+call 2: payments answered 503
+call 3: payments answered 503
+call 4: payments is unavailable, try again shortly
+}
+```
+
+- Calls 1 to 3 reached payments, which answered 503. The caller gets that as an ordinary error, and the breaker counts a failure. (`MaxRetries: 2` means each call also retried its GET twice on the 503, out of sight. Only idempotent methods are ever retried.)
+- After `MinSamples` calls with at least half failing, the circuit opened.
+- Call 4 was refused at once, without calling payments, so the caller isn't left waiting on a timeout.
+- Nothing is stored. Over HTTP, what to do about a refused request is up to the caller.
+- The breaker checks whether payments is back on its own. See [The circuit breaker](#the-circuit-breaker).
+
+### The orders: process them without losing any
+
+The Kafka side has five parts. Each one is a short function.
+
+**1. What the service needs from its environment.**
+
+```go
+// serviceConfig is what the service needs from its environment.
+type serviceConfig struct {
+	Brokers        string // "kafka-1:9092,kafka-2:9092"
+	DataDir        string // where the dead-letter log lives: a persistent volume, not the container's own disk
+	InventoryURL   string // "http://inventory.internal"
+	PaymentsURL    string // "http://payments.internal"
+	EncryptionKey  []byte // 32 bytes, from your secret store
+	OrderKeyPepper []byte // another secret; hides the Kafka key (the customer) in the log
+}
+```
+
+**2. One breaker per service.** A breaker watches the recent results of calls to one service and stops calling it when it is clearly failing.
+
+```go
+// newBreaker guards one service. While its circuit is open, the service's /health
+// endpoint is probed. When it answers, one real call is tried, and only if that
+// succeeds does normal traffic resume.
+func newBreaker(name, baseURL string) (*breaker.Breaker, error) {
+	check, err := health.HTTP(baseURL + "/health")
+	if err != nil {
+		return nil, fmt.Errorf("health check for %s: %w", name, err)
+	}
+	return breaker.New(breaker.Config{
+		Name:             name,
+		FailureThreshold: 0.5, // open when half of the recent calls fail...
+		MinSamples:       20,  // ...but only after at least 20 calls, so one early error does not trip it
+		// A 4xx means the request was wrong, not that the service is unhealthy.
+		IsFailure: func(err error) bool { return !retry.IsPermanent(err) },
+		Health:    &health.Config{Check: check, Interval: 5 * time.Second, SuccessThreshold: 2},
+	}), nil
+}
+```
+
+**3. The step that calls a service.** Both steps use the same function. Its return value tells the library what to do with an order that failed:
+
+```go
+// The idempotency key is the same for a given order and step on every attempt, so if
+// the step runs twice (after a crash, say) the service can recognise the repeat.
+func post(url string) func(context.Context, *pipeline.Exec) error {
+	return func(ctx context.Context, x *pipeline.Exec) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(x.Value))
+		if err != nil {
+			return retry.Permanent(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", x.IdempotencyKey())
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err // the service is unreachable: a temporary problem
+		}
+		defer func() { _ = resp.Body.Close() }()
+		_, _ = io.Copy(io.Discard, resp.Body)
+
+		switch {
+		case resp.StatusCode < 300:
+			return nil
+		case resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests:
+			// The order itself is wrong (a declined card, say). Retrying cannot help, so
+			// mark it permanent: it is parked for a person instead of retried for ever.
+			return retry.Permanent(fmt.Errorf("%s answered %d", url, resp.StatusCode))
+		default:
+			return fmt.Errorf("%s answered %d", url, resp.StatusCode) // temporary: retried later
+		}
+	}
+}
+```
+
+| The step returns | What the library does with the order |
+|---|---|
+| `nil` | goes on to the next step |
+| an ordinary error | the service had a problem: save the order, retry it later |
+| `retry.Permanent(err)` | the order itself is bad: park it for a person |
+
+**4. The place where waiting orders are kept.** An order that can't finish is written here, with a note of which steps are done. The log is on disk and every order in it is encrypted.
+
+```go
+// openStore opens the dead-letter log on disk, with every stored order encrypted.
+func openStore(cfg serviceConfig) (dlq.Store, error) {
+	wal, err := dlq.OpenWAL(cfg.DataDir, dlq.WALOptions{MaxBytes: 2 << 30}) // 2 GiB: your disk budget
+	if err != nil {
+		return nil, fmt.Errorf("opening the dead-letter log: %w", err)
+	}
+	enc, err := secure.NewAESGCM(secure.Key{ID: "2026-09", Material: cfg.EncryptionKey})
+	if err != nil {
+		_ = wal.Close()
+		return nil, fmt.Errorf("building the encryptor: %w", err)
+	}
+	store, err := dlq.Secure(wal, dlq.SecureOptions{Encryptor: enc, OrderKeyPepper: cfg.OrderKeyPepper})
+	if err != nil {
+		_ = wal.Close()
+		return nil, err
+	}
+	return store, nil
+}
+```
+
+`DataDir` must be a persistent volume. Anything stored in a container's own filesystem is gone when the container is replaced.
+
+**5. Put it together.** This is the whole service:
+
+```go
+// runOrdersService runs until ctx ends, or returns the error that made it unsafe to go on.
+func runOrdersService(ctx context.Context, cfg serviceConfig) error {
+	// One breaker per service we call.
+	inventory, err := newBreaker("inventory", cfg.InventoryURL)
 	if err != nil {
 		return err
 	}
+	defer inventory.Close()
+	payments, err := newBreaker("payments", cfg.PaymentsURL)
+	if err != nil {
+		return err
+	}
+	defer payments.Close()
+
+	// The durable log where orders wait when a service is down.
+	store, err := openStore(cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+
+	// The two steps every order goes through, each behind its own breaker.
+	orders, err := pipeline.New("orders", "v1", []pipeline.Step{
+		{Name: "reserve", Breaker: inventory, Timeout: 5 * time.Second, Run: post(cfg.InventoryURL + "/reserve")},
+		{Name: "charge", Breaker: payments, Timeout: 5 * time.Second, Run: post(cfg.PaymentsURL + "/charge")},
+	})
+	if err != nil {
+		return fmt.Errorf("building the pipeline: %w", err)
+	}
 
 	client, err := confluent.NewClient(ck.ConfigMap{
-		"bootstrap.servers": brokers,
+		"bootstrap.servers": cfg.Brokers,
 		"group.id":          "orders-service",
 		"auto.offset.reset": "earliest",
 	}, []string{"orders"})
 	if err != nil {
-		return fmt.Errorf("kafka client: %w", err)
+		return fmt.Errorf("creating the Kafka client: %w", err)
 	}
 	defer func() { _ = client.Close() }()
 
+	// The consumer reads orders and runs them through the pipeline.
 	consumer, err := kafka.NewConsumer(kafka.Config{
 		Client:   client,
 		Store:    store,
-		Bindings: []kafka.Binding{orders},
+		Bindings: []kafka.Binding{{Topic: "orders", Pipeline: orders}},
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("creating the consumer: %w", err)
 	}
 
+	// The redriver finishes stored orders once the service they waited for is healthy.
 	redriver, err := dlq.NewRedriver(dlq.RedriveConfig{
 		Store:    store,
-		Handler:  orders.Pipeline.Handler(),
-		Breakers: map[string]*breaker.Breaker{"payments": payments},
-		Rate:     100, RampUp: 30 * time.Second,
+		Handler:  orders.Handler(),
+		Breakers: map[string]*breaker.Breaker{"inventory": inventory, "payments": payments},
+		Rate:     100, // orders per second, so a service that just came back is not flooded
+		RampUp:   30 * time.Second,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("creating the redriver: %w", err)
 	}
 
-	ctx, stop := context.WithCancel(ctx) // if one loop ends, stop the other
-	defer stop()
-	errc := make(chan error, 2)
-	go func() { errc <- consumer.Run(ctx); stop() }()
-	go func() { errc <- redriver.Run(ctx); stop() }()
-	return errors.Join(<-errc, <-errc)
+	return runTogether(ctx, consumer.Run, redriver.Run)
 }
 ```
 
-This compiles as a test in [`kafka/example_quickstart_test.go`](kafka/example_quickstart_test.go) but needs a broker to run.
+Call `runOrdersService` from `main` with a context that ends on shutdown (`signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)`). The consumer and the redriver run side by side, and `runTogether` stops one if the other stops.
 
-What you need to do:
+```go
+// runTogether runs the loops until ctx ends. If one stops, it stops the rest, and it
+// returns every error.
+func runTogether(ctx context.Context, loops ...func(context.Context) error) error {
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	results := make(chan error, len(loops))
+	for _, loop := range loops {
+		go func() {
+			results <- loop(ctx)
+			stop()
+		}()
+	}
+	var errs []error
+	for range loops {
+		errs = append(errs, <-results)
+	}
+	return errors.Join(errs...)
+}
+```
 
-- **Make the handler idempotent.** Delivery is at-least-once, so after a crash the handler can see the same message twice. `m.ID` is the same for a message on every attempt; pass it to the downstream call as an idempotency key.
-- **Return `retry.Permanent(err)` for errors that retrying can't fix** (a 400, a message that won't parse). Those messages are parked for a person instead of retried forever.
-- **Put the log on a persistent volume**, and wrap it with `dlq.Secure` if the messages are sensitive. See [Durable store](#durable-store-dlqopenwal).
-- **Give the breaker a health check** so recovery doesn't depend on a timer. See [Recovery](#recovery-ask-the-dependency-dont-guess).
+### What happens when payments goes down
 
-For several calls per message (reserve stock, charge, ship), write a `pipeline` with one step per call. A retry then resumes at the step that failed and does not repeat the earlier ones. There's a complete wired-up service in [`kafka/example_service_test.go`](kafka/example_service_test.go).
+Follow one stretch of traffic through the service above:
+
+1. Orders keep arriving. The `reserve` step works, but the `charge` step gets 503s. Each order that fails is saved to the log with a note: *reserve done, charge next*. Its Kafka offset is then committed, because the order is now safe on disk.
+2. After enough failures, the payments breaker opens. The consumer pauses the topic. New orders stay in Kafka, which holds them for free. The service never calls payments while its breaker is open.
+3. Every few seconds the library calls `PaymentsURL/health`. Nothing else touches payments.
+4. Payments answers healthy twice in a row. The breaker lets one real call through as a trial. It succeeds, so the breaker closes.
+5. The consumer resumes, and the redriver replays the saved orders at a controlled rate, starting at `charge`. Stock is not reserved a second time. Orders for the same customer stay in the order they were placed.
+6. If the service restarts at any point, the log is read back from disk and nothing is lost.
+
+Delivery is at-least-once. After a crash a step can run twice, which is why `post` sends an idempotency key: the inventory and payments services can recognise a repeat.
+
+### An order that can never succeed
+
+Say payments refuses a card. Retrying can't help, so `post` returns `retry.Permanent`. The order is **parked**: kept in the log for a person, never retried and never deleted automatically.
+
+A parked order also holds back later orders with the same Kafka key (here, the same customer) until someone deals with it. That keeps each customer's orders in sequence. Other customers are not affected.
+
+An operator lists what is parked, fixes the cause, and resumes the order:
+
+```go
+// parkedOrder is an order waiting for a person, and how far it got.
+type parkedOrder struct {
+	RecordID string
+	Reason   string
+	Done     []string // steps that finished
+	Next     string   // the step it stopped at
+}
+
+// listParked returns the orders that need a person. They are never retried and never
+// deleted on their own, so this list is the operator's to-do list.
+func listParked(ctx context.Context, store dlq.Store, orders *pipeline.Pipeline) ([]parkedOrder, error) {
+	records, err := store.Parked(ctx, dlq.ParkedQuery{Limit: 100})
+	if err != nil {
+		return nil, fmt.Errorf("listing parked orders: %w", err)
+	}
+	var parked []parkedOrder
+	for _, rec := range records {
+		progress, err := orders.Describe(rec.Checkpoint)
+		if err != nil {
+			return nil, fmt.Errorf("reading the checkpoint of %s: %w", rec.ID, err)
+		}
+		parked = append(parked, parkedOrder{RecordID: rec.ID, Reason: rec.LastError, Done: progress.Completed, Next: progress.Next})
+	}
+	return parked, nil
+}
+
+// resumeParked puts a parked order back in the queue at the given step, once whatever
+// stopped it has been fixed. Steps before that one are not repeated.
+func resumeParked(ctx context.Context, store dlq.Store, orders *pipeline.Pipeline, recordID, fromStep string) error {
+	return orders.Redrive(ctx, store, recordID, fromStep)
+}
+```
+
+Resume at `charge` and the order carries on from there. The stock reservation is not repeated. You can also discard a parked order (`store.Discard`).
 
 ## How it works
 
@@ -349,7 +580,7 @@ A transport guards only the endpoints you register, each with its own `Policy`. 
 ```go
 rt, err := goguard.New(goguard.Config{
     OnStateChange: func(circuit string, from, to goguard.State) {
-        metrics.RecordTransition(circuit, from.String(), to.String())
+        slog.Warn("circuit changed", "circuit", circuit, "from", from.String(), "to", to.String())
     },
 },
     goguard.WithEndpoint("payments", goguard.Host("payments.internal"), goguard.Policy{
@@ -362,7 +593,9 @@ rt, err := goguard.New(goguard.Config{
     }),
     goguard.WithEndpoint("search", goguard.HostPath("api.internal", "/search/"), goguard.Policy{MaxInflight: 50}),
 )
-if err != nil { /* invalid configuration */ }
+if err != nil {
+    return fmt.Errorf("invalid guard configuration: %w", err)
+}
 defer rt.Close()
 
 client := &http.Client{Transport: rt}
@@ -399,15 +632,17 @@ client := &http.Client{Transport: rt}
 ### Any call: the `breaker` package
 
 ```go
-b := breaker.New(breaker.Config{Name: "inventory-db", FailureThreshold: 0.5, MinSamples: 20})
+b := breaker.New(breaker.Config{Name: "orders-db", FailureThreshold: 0.5, MinSamples: 20})
 
-err := b.Do(ctx, func(ctx context.Context) error { return db.PingContext(ctx) })
+err := b.Do(ctx, func(ctx context.Context) error { return db.PingContext(ctx) }) // db is your *sql.DB
 switch {
 case errors.Is(err, breaker.ErrOpen):     // the dependency is down: fail fast
 case errors.Is(err, breaker.ErrBulkhead): // too many calls in flight
 }
 
-rows, err := breaker.Call(ctx, b, func(ctx context.Context) (*sql.Rows, error) { return db.QueryContext(ctx, q) })
+rows, err := breaker.Call(ctx, b, func(ctx context.Context) (*sql.Rows, error) {
+    return db.QueryContext(ctx, "SELECT id, status FROM orders")
+})
 ```
 
 For work whose outcome you only know later, `Acquire` returns a `Permit`. Finish it with `Success`, `Failure` or `Abandon`, exactly once.
@@ -415,12 +650,13 @@ For work whose outcome you only know later, `Acquire` returns a `Permit`. Finish
 ### Retrying: the `retry` package
 
 ```go
+// reserveStock is your call to the inventory service; inventory is its breaker.
 err := retry.Do(ctx, retry.Policy{
     MaxRetries: 3,
     Backoff:    retry.Jitter(retry.Exponential(50*time.Millisecond, time.Second), 1),
     Budget:     retry.NewBudget(0.1, 10), // retries may add about 10% load, and drain during an outage
 }, func(ctx context.Context) error {
-    return b.Do(ctx, call)
+    return inventory.Do(ctx, reserveStock)
 })
 ```
 
@@ -436,9 +672,13 @@ goguard.WithEndpoint("payments", goguard.Host("payments.internal"), goguard.Poli
     Health:     &health.Config{Interval: 5 * time.Second, SuccessThreshold: 2},
 })
 
-// or, for any call:
-b := breaker.New(breaker.Config{Name: "inventory", Health: &health.Config{Check: pingInventory}})
-defer b.Close() // stops the prober
+// or, for any call, with a check you write (a Check is a func(ctx context.Context) error):
+check, err := health.HTTP("http://inventory.internal/health") // healthy on a 2xx answer
+if err != nil {
+    return err
+}
+inventory := breaker.New(breaker.Config{Name: "inventory", Health: &health.Config{Check: check}})
+defer inventory.Close() // stops the prober
 ```
 
 `Health` needs a `Check` (or, for HTTP, a `HealthPath`); without one it is ignored. How probing and the canary work is described under [The circuit breaker](#the-circuit-breaker). Details about the probes themselves:
@@ -469,11 +709,13 @@ A `dlq.Record` is a piece of work that couldn't be finished (a Kafka message, sa
 #### Durable store: `dlq.OpenWAL`
 
 ```go
-store, err := dlq.OpenWAL("/var/lib/myapp/dlq", dlq.WALOptions{
+wal, err := dlq.OpenWAL("/var/lib/orders/dlq", dlq.WALOptions{
     MaxBytes: 2 << 30, // payloads live on disk: this is your disk budget
 })
-if err != nil { /* see below */ }
-defer store.Close()
+if err != nil {
+    return fmt.Errorf("opening the dead-letter log: %w", err) // the sections below explain the errors
+}
+defer wal.Close()
 ```
 
 A segmented, checksummed write-ahead log: every change is one CRC-32C-framed entry, and the queue is rebuilt from the log on open.
@@ -503,12 +745,17 @@ A segmented, checksummed write-ahead log: every change is one CRC-32C-framed ent
 #### Encrypting and signing: the `secure` package
 
 ```go
-enc, _ := secure.NewAESGCM(secure.Key{ID: "2025-06", Material: key32}, // seals new data
-    secure.Key{ID: "2024-11", Material: oldKey32})                     // still opens old data
+// key32 and oldKey32 are 32-byte secrets from your secret store; pepper is another.
+enc, err := secure.NewAESGCM(secure.Key{ID: "2025-06", Material: key32}, // seals new data
+    secure.Key{ID: "2024-11", Material: oldKey32})                       // still opens old data
+if err != nil {
+    return err
+}
 
-store, _ := dlq.Secure(dlq.NewMemoryStore(dlq.MemoryOptions{}), dlq.SecureOptions{
+// wal is what dlq.OpenWAL returned. Wrap any store the same way.
+store, err := dlq.Secure(wal, dlq.SecureOptions{
     Encryptor:      enc,
-    OrderKeyPepper: pepper, // keeps message keys out of the store while ordering still works
+    OrderKeyPepper: pepper, // keeps the Kafka key (the customer) out of the log while ordering still works
 })
 ```
 
@@ -526,21 +773,24 @@ The redactor recognises common credential shapes. It is a safety net for diagnos
 ### Redriving stored work: `dlq.Redriver`
 
 ```go
-r, _ := dlq.NewRedriver(dlq.RedriveConfig{
-    Store:    store,
-    Handler:  func(ctx context.Context, item *dlq.Item) error { return reprocess(ctx, item.Record) },
-    Breakers: map[string]*breaker.Breaker{"payments": paymentsBreaker},
-    Rate:     200, RampUp: 30 * time.Second, // don't flood a dependency that just came back
+redriver, err := dlq.NewRedriver(dlq.RedriveConfig{
+    Store:       store,
+    Handler:     orders.Handler(), // finishes each stored order, starting at the step that failed
+    Breakers:    map[string]*breaker.Breaker{"payments": payments},
+    Rate:        200, RampUp: 30 * time.Second, // don't flood a dependency that just came back
     MaxAttempts: 10,
 })
-go r.Run(ctx) // returns when ctx ends, after finishing or releasing what it holds
+if err != nil {
+    return err
+}
+go func() { _ = redriver.Run(ctx) }() // returns when ctx ends, after finishing or releasing what it holds
 ```
 
 What it does with each record:
 
 - Records are tagged with the dependency that blocked them (`BlockedOn`). While that dependency's circuit is open, its records aren't leased at all, so a long outage costs no attempts.
 - Replay is rate-limited. After a recovery the rate starts at 10% and climbs to `Rate` over `RampUp`. Add `r.Sink()` to your breakers' `Events` and the redriver reacts to a recovery immediately instead of at its next poll.
-- Your handler's return value decides the outcome:
+- With a pipeline, `orders.Handler()` is the handler. For any other kind of record, write your own `func(ctx context.Context, item *dlq.Item) error`. Its return value decides the outcome:
 
 | Handler returns | Result |
 |---|---|
@@ -560,19 +810,27 @@ What it does with each record:
 When one message triggers several calls, a failure in the third shouldn't restart the first two or lose the message.
 
 ```go
-p, _ := pipeline.New("orders", "v3", []pipeline.Step{
-    {Name: "reserve", Breaker: inventory, Run: reserveStock},
-    {Name: "charge",  Breaker: payments,  Run: chargeCard, Compensate: refund},
+// Each Run and Compensate is a func(ctx context.Context, x *pipeline.Exec) error, like post above.
+orders, err := pipeline.New("orders", "v1", []pipeline.Step{
+    {Name: "reserve", Breaker: inventory, Run: reserveStock, Compensate: releaseStock},
+    {Name: "charge",  Breaker: payments,  Run: chargeCard,   Compensate: refundCard},
     {Name: "ship",    Breaker: shipping,  Run: createShipment},
-    {Name: "notify",  Run: sendEmail},
 }, pipeline.Saga())
+if err != nil {
+    return err
+}
 
-// A message arrives (for example from Kafka):
-res, err := p.Execute(ctx, store, pipeline.Input{ID: dlq.KafkaID(topic, part, off), Key: k, Value: v})
+// The consumer does this for every message. Call Execute yourself only if you have
+// your own message loop; msg is a kafka.Message.
+result, err := orders.Execute(ctx, store, pipeline.Input{
+    ID:    dlq.KafkaID(msg.Topic, msg.Partition, msg.Offset),
+    Key:   msg.Key,
+    Value: msg.Value,
+})
 // Done, Deferred and Parked are safe to acknowledge. Failed is not: do not commit the offset.
 
 // Elsewhere, once:
-r, _ := dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: p.Handler(), Breakers: breakers})
+redriver, err := dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: orders.Handler(), Breakers: breakers})
 ```
 
 - Each step is checkpointed as it finishes, along with anything it saved with `x.Set`. If `charge` can't finish, the message and its progress are stored, tagged with `charge`'s dependency. When that recovers, the redriver resumes at `charge`. `reserve` doesn't run again, and `ship` can still read what `reserve` produced.
@@ -587,14 +845,20 @@ r, _ := dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: p.Handler(), Br
 Parked records wait for a person. You can list them, see where each stopped, and resume it:
 
 ```go
-list, _ := store.Parked(ctx, dlq.ParkedQuery{Limit: 50}) // what is stuck, and why (LastError)
-for _, rec := range list {
-    pr, _ := ordersPipeline.Describe(rec.Checkpoint) // steps done, the step it stopped at, phase; no message data
-    fmt.Println(rec.ID, rec.LastError, pr.Completed, pr.Next)
+parked, err := store.Parked(ctx, dlq.ParkedQuery{Limit: 50}) // what is stuck, and why (LastError)
+if err != nil {
+    return err
+}
+for _, rec := range parked {
+    progress, err := orders.Describe(rec.Checkpoint) // steps done, the step it stopped at; no message data
+    if err != nil {
+        continue // a checkpoint that doesn't fit the deployed pipeline needs a human look
+    }
+    fmt.Println(rec.ID, rec.LastError, progress.Completed, progress.Next)
 }
 
-// The cause is fixed. Resume at a chosen step; the steps before it are not repeated.
-err := ordersPipeline.Redrive(ctx, store, rec.ID, "charge")
+// The cause is fixed. Resume one order at a chosen step; the steps before it are not repeated.
+err = orders.Redrive(ctx, store, parked[0].ID, "charge")
 ```
 
 - `Redrive` is atomic. The checkpoint replacement and the requeue are one durable log entry (`Store.RequeueWith`), so a crash can't leave the record pending with its old checkpoint. It works through `dlq.Secure` (the new checkpoint is sealed like any other). It changes nothing and returns an error if the record isn't parked or the step isn't valid.
@@ -608,19 +872,37 @@ err := ordersPipeline.Redrive(ctx, store, rec.ID, "charge")
 Kafka support lives in its own Go module, `github.com/justinclev/GoGuardLib/kafka`, so HTTP-only users never pull in the Kafka client or cgo. The consumer logic (package `kafka`) is written against a small `Client` interface and imports no Kafka library; package `kafka/confluent` adapts [confluent-kafka-go](https://github.com/confluentinc/confluent-kafka-go) (which bundles librdkafka; it needs cgo).
 
 ```go
-client, _ := confluent.NewClient(ck.ConfigMap{
+client, err := confluent.NewClient(ck.ConfigMap{
     "bootstrap.servers": brokers, "group.id": "orders-service", "auto.offset.reset": "earliest",
     // security.protocol, sasl.*, ssl.*: yours to set; nothing here logs them
 }, []string{"orders"})
+if err != nil {
+    return err
+}
 defer client.Close()
 
-consumer, _ := kafka.NewConsumer(kafka.Config{
+// Optional: copy messages that get parked to a dead-letter topic ("orders.dlq").
+producer, err := confluent.NewProducer(ck.ConfigMap{"bootstrap.servers": brokers})
+if err != nil {
+    return err
+}
+defer producer.Close()
+mirror, err := kafka.NewDLQPublisher(kafka.PublisherConfig{Producer: producer})
+if err != nil {
+    return err
+}
+
+// store is the durable dlq.Store from above; orders is the pipeline.
+consumer, err := kafka.NewConsumer(kafka.Config{
     Client:   client,
-    Store:    walStore, // a durable dlq.Store
-    Bindings: []kafka.Binding{{Topic: "orders", Pipeline: ordersPipeline}},
-    Mirror:   dlqPublisher, // optional: copy parked messages to "orders.dlq"
+    Store:    store,
+    Bindings: []kafka.Binding{{Topic: "orders", Pipeline: orders}},
+    Mirror:   mirror,
 })
-err := consumer.Run(ctx) // returns nil when ctx ends; an error only if it can no longer be safe
+if err != nil {
+    return err
+}
+err = consumer.Run(ctx) // returns nil when ctx ends; an error only if it can no longer be safe
 ```
 
 Only the topics you bind are consumed and guarded. For every message the consumer builds a stable ID (`dlq.KafkaID(topic, partition, offset)`) and runs it through the topic's pipeline.
