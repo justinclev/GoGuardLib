@@ -456,7 +456,71 @@ func (w *WALStore) withParked(ctx context.Context, id string, typ byte, apply fu
 
 // Requeue implements Store.
 func (w *WALStore) Requeue(ctx context.Context, id string) error {
-	return w.withParked(ctx, id, entRequeue, func(it *memItem) { w.m.applyRequeue(it) })
+	return w.RequeueWith(ctx, id, RequeueOptions{})
+}
+
+// RequeueWith implements Store. The checkpoint replacement is part of the same log
+// entry as the requeue, so a crash can never leave the record pending with the old
+// checkpoint.
+func (w *WALStore) RequeueWith(ctx context.Context, id string, o RequeueOptions) error {
+	w.mu.Lock()
+	if err := w.begin(ctx); err != nil {
+		w.mu.Unlock()
+		return err
+	}
+	it, ok := w.m.items[id]
+	switch {
+	case !ok:
+		w.mu.Unlock()
+		return ErrNotFound
+	case it.rec.State != Parked:
+		w.mu.Unlock()
+		return ErrNotParked
+	}
+	if o.ReplaceCheckpoint {
+		if err := w.m.checkCheckpoint(it, o.Checkpoint); err != nil {
+			w.mu.Unlock()
+			return err
+		}
+	}
+	var e encoder
+	e.str(id)
+	if o.ReplaceCheckpoint { // optional trailing fields: entries written before them still decode
+		e.u8(1)
+		e.nullable(o.Checkpoint)
+	}
+	seq, err := w.logLocked(entRequeue, e.b)
+	if err != nil {
+		w.mu.Unlock()
+		return err
+	}
+	w.m.applyRequeue(it, o.ReplaceCheckpoint, o.Checkpoint)
+	w.maybeCompactLocked()
+	return w.finish(seq)
+}
+
+// Get implements Store.
+func (w *WALStore) Get(ctx context.Context, id string) (Record, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.begin(ctx); err != nil {
+		return Record{}, err
+	}
+	it, ok := w.m.items[id]
+	if !ok {
+		return Record{}, ErrNotFound
+	}
+	return it.rec.Clone(), nil
+}
+
+// Parked implements Store.
+func (w *WALStore) Parked(ctx context.Context, q ParkedQuery) ([]Record, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.begin(ctx); err != nil {
+		return nil, err
+	}
+	return w.m.parkedList(q.After, q.Limit), nil
 }
 
 // Discard implements Store.

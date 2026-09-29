@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/justinclev/GoGuardLib/breaker"
@@ -85,6 +86,7 @@ type Exec struct {
 	Attempt int
 
 	step  string
+	epoch int
 	state map[string][]byte
 }
 
@@ -106,11 +108,23 @@ func (x *Exec) Set(key string, value []byte) {
 // IdempotencyKey is stable for this message and this step across every attempt and
 // restart. Pass it to the downstream call (an Idempotency-Key header, a unique
 // request ID) so that running the step twice has the effect of running it once.
-func (x *Exec) IdempotencyKey() string { return IdempotencyKey(x.ID, x.step) }
+//
+// The key changes only when a record is deliberately rewound past steps that were
+// already compensated (see Rewind): work that was undone is new work, and must not
+// be mistaken for a repeat of the original.
+func (x *Exec) IdempotencyKey() string { return IdempotencyKeyEpoch(x.ID, x.step, x.epoch) }
 
-// IdempotencyKey derives the key for a message and step.
-func IdempotencyKey(recordID, step string) string {
-	sum := sha256.Sum256([]byte("goguard/pipeline/v1\x00" + recordID + "\x00" + step))
+// IdempotencyKey derives the key for a message and step in the first epoch.
+func IdempotencyKey(recordID, step string) string { return IdempotencyKeyEpoch(recordID, step, 0) }
+
+// IdempotencyKeyEpoch derives the key for a message, step and epoch. Epoch 0 gives
+// the same key as IdempotencyKey.
+func IdempotencyKeyEpoch(recordID, step string, epoch int) string {
+	in := "goguard/pipeline/v1\x00" + recordID + "\x00" + step
+	if epoch > 0 {
+		in += "\x00epoch=" + strconv.Itoa(epoch)
+	}
+	sum := sha256.Sum256([]byte(in))
 	return hex.EncodeToString(sum[:16])
 }
 
@@ -209,6 +223,7 @@ type checkpoint struct {
 	Compensated []string          `json:"compensated,omitempty"`
 	FailedStep  string            `json:"failed_step,omitempty"`
 	FailReason  string            `json:"fail_reason,omitempty"`
+	Epoch       int               `json:"epoch,omitempty"`
 	State       map[string][]byte `json:"state,omitempty"`
 }
 
@@ -403,7 +418,7 @@ func (p *Pipeline) Handler() dlq.RedriveHandler {
 		}
 		x := &Exec{
 			ID: item.Record.ID, Source: item.Record.Source, Key: item.Record.Key, Value: item.Record.Value,
-			Headers: item.Record.Headers, Attempt: item.Record.Attempts, state: cp.State,
+			Headers: item.Record.Headers, Attempt: item.Record.Attempts, epoch: cp.Epoch, state: cp.State,
 		}
 		r := &run{p: p, x: x, cp: cp, persist: item.Checkpoint}
 		return r.advance(ctx)
@@ -527,4 +542,134 @@ func StateKeys(raw []byte) ([]string, error) {
 	}
 	sort.Strings(keys)
 	return keys, nil
+}
+
+// ---- inspecting and rewinding parked records ----
+
+var (
+	// ErrUnknownStep means the step named is not in the pipeline.
+	ErrUnknownStep = errors.New("pipeline: no such step")
+	// ErrCannotSkipForward means the record has not completed the steps before the
+	// one asked for. Resuming there would silently skip work.
+	ErrCannotSkipForward = errors.New("pipeline: cannot resume at a step whose predecessors have not completed")
+	// ErrStepUndone means an earlier step was already compensated, so the record
+	// cannot resume after it: its effects are gone. Rewind to that step or before.
+	ErrStepUndone = errors.New("pipeline: an earlier step was already compensated")
+)
+
+// Progress describes how far a stored record got, for tools and operators. It
+// contains no message data: only step names and the keys of the saved state.
+type Progress struct {
+	Pipeline, Version string
+	Completed         []string
+	// Next is the step that runs next, or "" if every step is complete or the
+	// record is compensating.
+	Next string
+	// Phase is "forward" or "compensating".
+	Phase       string
+	Compensated []string
+	FailedStep  string
+	FailReason  string
+	StateKeys   []string
+	// Epoch counts the times the record was rewound past compensated steps.
+	Epoch int
+}
+
+// Describe reports the progress recorded in a stored checkpoint. It fails with
+// ErrPipelineMismatch if the checkpoint does not fit this pipeline.
+func (p *Pipeline) Describe(raw []byte) (Progress, error) {
+	cp, err := p.load(raw)
+	if err != nil {
+		return Progress{}, err
+	}
+	pr := Progress{
+		Pipeline: cp.Pipeline, Version: cp.Version, Phase: cp.Phase, Compensated: cp.Compensated,
+		FailedStep: cp.FailedStep, FailReason: cp.FailReason, Epoch: cp.Epoch,
+	}
+	for _, d := range cp.Completed {
+		pr.Completed = append(pr.Completed, d.Step)
+	}
+	if cp.Phase == phaseForward && len(cp.Completed) < len(p.steps) {
+		pr.Next = p.steps[len(cp.Completed)].Name
+	}
+	for k := range cp.State {
+		pr.StateKeys = append(pr.StateKeys, k)
+	}
+	sort.Strings(pr.StateKeys)
+	return pr, nil
+}
+
+// Rewind returns a copy of a stored checkpoint that resumes at toStep: the steps
+// from toStep onward are forgotten and will run again, the data earlier steps
+// saved is kept, and any failure or compensation state is cleared so the record
+// runs forward.
+//
+// It refuses to skip forward (ErrCannotSkipForward), because that would drop
+// work, and to resume after a step that was already compensated (ErrStepUndone),
+// because that step's effects no longer exist. Rewinding to a compensated step or
+// before it is allowed, and starts a new idempotency epoch: the undone work is
+// being done afresh, so its keys must differ from the original run's, or a
+// downstream service that deduplicates would treat it as already done.
+//
+// Steps that run again without having been compensated keep their keys; they were
+// really done, and a repeat of them must look like one.
+func (p *Pipeline) Rewind(raw []byte, toStep string) ([]byte, error) {
+	cp, err := p.load(raw)
+	if err != nil {
+		return nil, err
+	}
+	idx := -1
+	for i := range p.steps {
+		if p.steps[i].Name == toStep {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownStep, toStep)
+	}
+	if idx > len(cp.Completed) {
+		return nil, fmt.Errorf("%w: %q comes after %q, which has not completed", ErrCannotSkipForward, toStep, p.steps[len(cp.Completed)].Name)
+	}
+	undone := map[string]bool{}
+	for _, n := range cp.Compensated {
+		undone[n] = true
+	}
+	for i := 0; i < idx; i++ {
+		if undone[cp.Completed[i].Step] {
+			return nil, fmt.Errorf("%w: %q was undone, so resume at %q or earlier", ErrStepUndone, cp.Completed[i].Step, cp.Completed[i].Step)
+		}
+	}
+	if len(cp.Compensated) > 0 {
+		cp.Epoch++ // whatever was undone will be redone: it is new work, not a repeat
+	}
+	cp.Completed = cp.Completed[:idx]
+	cp.Compensated = nil
+	cp.Phase = phaseForward
+	cp.FailedStep, cp.FailReason = "", ""
+	return cp.encode(), nil
+}
+
+// Redrive sends a parked record back through the pipeline, resuming at fromStep
+// (or where it stopped, if fromStep is empty), after an operator has fixed the
+// cause. The checkpoint change and the requeue happen in one durable step. It
+// returns dlq.ErrNotFound or dlq.ErrNotParked if there is no such parked record.
+//
+// A record that was compensated cannot simply be requeued as it was: it would
+// finish compensating again and re-park. Give the step to resume at.
+func (p *Pipeline) Redrive(ctx context.Context, store dlq.Store, id, fromStep string) error {
+	rec, err := store.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if rec.State != dlq.Parked {
+		return dlq.ErrNotParked
+	}
+	if fromStep == "" {
+		return store.Requeue(ctx, id)
+	}
+	cp, err := p.Rewind(rec.Checkpoint, fromStep)
+	if err != nil {
+		return err
+	}
+	return store.RequeueWith(ctx, id, dlq.RequeueOptions{ReplaceCheckpoint: true, Checkpoint: cp})
 }

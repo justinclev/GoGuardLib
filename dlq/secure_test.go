@@ -228,3 +228,73 @@ func TestSecureRejectsInvalidRecordsBeforeSealing(t *testing.T) {
 		t.Fatal("expected ErrInvalidRecord")
 	}
 }
+
+func TestSecureSealsTheReplacementCheckpointAndDecryptsOnRead(t *testing.T) {
+	ctx := context.Background()
+	inner := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	s := secured(t, inner, dlq.SecureOptions{Encryptor: enc(t, newKey(t, "k"))})
+	must(t, s.Append(ctx, dlq.Record{ID: "r", State: dlq.Parked, Value: []byte("payload"), Checkpoint: []byte("old-progress")}))
+	must(t, s.RequeueWith(ctx, "r", dlq.RequeueOptions{ReplaceCheckpoint: true, Checkpoint: []byte("rewound-progress")}))
+
+	raw, _ := inner.Get(ctx, "r")
+	if bytes.Contains(raw.Checkpoint, []byte("rewound-progress")) || len(raw.Checkpoint) == 0 {
+		t.Fatal("the replacement checkpoint reached the inner store in clear")
+	}
+	got, err := s.Get(ctx, "r")
+	if err != nil || string(got.Checkpoint) != "rewound-progress" || string(got.Value) != "payload" || got.State != dlq.Pending {
+		t.Fatalf("Get = %+v, %v", got, err)
+	}
+	// And it still opens when the record is leased the ordinary way.
+	ls, _ := s.Lease(ctx, dlq.LeaseRequest{Max: 1, TTL: time.Minute})
+	if len(ls) != 1 || string(ls[0].Record.Checkpoint) != "rewound-progress" {
+		t.Fatalf("lease = %+v", ls)
+	}
+
+	// Clearing works through the wrapper too (nil stays nil, it is not sealed).
+	must(t, s.Append(ctx, dlq.Record{ID: "c", State: dlq.Parked, Checkpoint: []byte("x")}))
+	must(t, s.RequeueWith(ctx, "c", dlq.RequeueOptions{ReplaceCheckpoint: true}))
+	if c, _ := s.Get(ctx, "c"); len(c.Checkpoint) != 0 {
+		t.Fatalf("checkpoint = %q", c.Checkpoint)
+	}
+}
+
+func TestSecureParkedListsAndReportsWhatItCannotDecrypt(t *testing.T) {
+	ctx := context.Background()
+	inner := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	good := secured(t, inner, dlq.SecureOptions{Encryptor: enc(t, newKey(t, "current"))})
+	must(t, good.Append(ctx, dlq.Record{ID: "ok", State: dlq.Parked, Value: []byte("readable"), LastError: "why ok"}))
+
+	lostKey := secured(t, inner, dlq.SecureOptions{Encryptor: enc(t, newKey(t, "gone"))})
+	must(t, lostKey.Append(ctx, dlq.Record{ID: "lost", State: dlq.Parked, Value: []byte("unreadable"), Checkpoint: []byte("cp"), LastError: "why lost"}))
+
+	var reported []string
+	reader := secured(t, inner, dlq.SecureOptions{
+		Encryptor:       enc(t, newKey(t, "current")), // a different key with the same name as "good"'s cannot open "lost"
+		OnUndecryptable: func(id string, err error) { reported = append(reported, id) },
+	})
+	// "ok" was sealed by good's random key, not reader's: both are undecryptable to reader.
+	list, err := reader.Parked(ctx, dlq.ParkedQuery{})
+	if err != nil || len(list) != 2 {
+		t.Fatalf("Parked = %d records, %v; undecryptable records must still be listed", len(list), err)
+	}
+	for _, r := range list {
+		if r.Value != nil || r.Checkpoint != nil || r.LastError == "" {
+			t.Fatalf("%s: payload must be withheld and the reason kept: %+v", r.ID, r)
+		}
+	}
+	if len(reported) != 2 {
+		t.Fatalf("OnUndecryptable saw %v", reported)
+	}
+	if _, err := reader.Get(ctx, "lost"); err == nil || !strings.Contains(err.Error(), "cannot be decrypted") {
+		t.Fatalf("Get err = %v; ciphertext must never be returned as data", err)
+	}
+
+	// The writer can read its own.
+	got, err := good.Get(ctx, "ok")
+	if err != nil || string(got.Value) != "readable" {
+		t.Fatalf("Get = %+v, %v", got, err)
+	}
+	if list, _ := good.Parked(ctx, dlq.ParkedQuery{}); len(list) != 2 || string(list[0].Value) != "readable" {
+		t.Fatalf("writer's listing = %+v", list)
+	}
+}

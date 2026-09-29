@@ -176,6 +176,11 @@ func (s *MemoryStore) Park(ctx context.Context, id, token, reason string) error 
 
 // Requeue implements Store.
 func (s *MemoryStore) Requeue(ctx context.Context, id string) error {
+	return s.RequeueWith(ctx, id, RequeueOptions{})
+}
+
+// RequeueWith implements Store.
+func (s *MemoryStore) RequeueWith(ctx context.Context, id string, o RequeueOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.begin(ctx); err != nil {
@@ -185,8 +190,37 @@ func (s *MemoryStore) Requeue(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	s.m.applyRequeue(it)
+	if o.ReplaceCheckpoint {
+		if err := s.m.checkCheckpoint(it, o.Checkpoint); err != nil {
+			return err
+		}
+	}
+	s.m.applyRequeue(it, o.ReplaceCheckpoint, o.Checkpoint)
 	return nil
+}
+
+// Get implements Store.
+func (s *MemoryStore) Get(ctx context.Context, id string) (Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.begin(ctx); err != nil {
+		return Record{}, err
+	}
+	it, ok := s.m.items[id]
+	if !ok {
+		return Record{}, ErrNotFound
+	}
+	return it.rec.Clone(), nil
+}
+
+// Parked implements Store.
+func (s *MemoryStore) Parked(ctx context.Context, q ParkedQuery) ([]Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.begin(ctx); err != nil {
+		return nil, err
+	}
+	return s.m.parkedList(q.After, q.Limit), nil
 }
 
 // Discard implements Store.

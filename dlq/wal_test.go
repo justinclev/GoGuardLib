@@ -655,3 +655,60 @@ func TestWALOpenRejectsAFileAsDirectory(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 }
+
+// Replacing the checkpoint is part of the requeue's single log entry: after a
+// restart, or a crash, the record is either still parked with the old checkpoint
+// or pending with the new one, never pending with the old.
+func TestWALRequeueWithSurvivesRestartAndCrash(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := openWAL(t, dir, dlq.WALOptions{})
+	must(t, s.Append(ctx, dlq.Record{ID: "r", State: dlq.Parked, Checkpoint: []byte("old"), LastError: "why"}))
+	must(t, s.RequeueWith(ctx, "r", dlq.RequeueOptions{ReplaceCheckpoint: true, Checkpoint: []byte("new")}))
+
+	crashDir := t.TempDir()
+	copyDir(t, dir, crashDir) // what a crash right now would leave
+	must(t, s.Close())
+
+	for name, d := range map[string]string{"clean restart": dir, "crash": crashDir} {
+		s := openWAL(t, d, dlq.WALOptions{})
+		got, err := s.Get(ctx, "r")
+		must(t, err)
+		if got.State != dlq.Pending || string(got.Checkpoint) != "new" || got.LastError != "why" {
+			t.Fatalf("%s: record = %+v", name, got)
+		}
+		must(t, s.Close())
+	}
+
+	// Clearing the checkpoint also persists, and a plain Requeue leaves it alone.
+	s = openWAL(t, dir, dlq.WALOptions{})
+	must(t, s.Append(ctx, dlq.Record{ID: "c", State: dlq.Parked, Checkpoint: []byte("x")}))
+	must(t, s.Append(ctx, dlq.Record{ID: "k", State: dlq.Parked, Checkpoint: []byte("keep")}))
+	must(t, s.RequeueWith(ctx, "c", dlq.RequeueOptions{ReplaceCheckpoint: true}))
+	must(t, s.Requeue(ctx, "k"))
+	must(t, s.Close())
+	s = openWAL(t, dir, dlq.WALOptions{})
+	defer s.Close()
+	if c, _ := s.Get(ctx, "c"); len(c.Checkpoint) != 0 {
+		t.Fatalf("cleared checkpoint came back: %q", c.Checkpoint)
+	}
+	if k, _ := s.Get(ctx, "k"); string(k.Checkpoint) != "keep" {
+		t.Fatalf("checkpoint = %q", k.Checkpoint)
+	}
+}
+
+func TestWALParkedListingAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := openWAL(t, dir, dlq.WALOptions{})
+	for i := 0; i < 3; i++ {
+		must(t, s.Append(ctx, dlq.Record{ID: fmt.Sprintf("p%d", i), State: dlq.Parked, LastError: "why"}))
+	}
+	must(t, s.Close())
+	s = openWAL(t, dir, dlq.WALOptions{})
+	defer s.Close()
+	got, err := s.Parked(ctx, dlq.ParkedQuery{})
+	if err != nil || len(got) != 3 || got[0].ID != "p0" || got[2].LastError != "why" {
+		t.Fatalf("Parked = %+v, %v", got, err)
+	}
+}

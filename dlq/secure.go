@@ -199,6 +199,57 @@ func (s *secureStore) Park(ctx context.Context, id, token, reason string) error 
 }
 
 func (s *secureStore) Requeue(ctx context.Context, id string) error { return s.inner.Requeue(ctx, id) }
+
+func (s *secureStore) RequeueWith(ctx context.Context, id string, o RequeueOptions) error {
+	if o.ReplaceCheckpoint {
+		sealed, err := s.seal(id, "checkpoint", o.Checkpoint)
+		if err != nil {
+			return fmt.Errorf("dlq: sealing checkpoint: %w", err)
+		}
+		o.Checkpoint = sealed
+	}
+	return s.inner.RequeueWith(ctx, id, o)
+}
+
+// Get decrypts the record. A record that cannot be decrypted (its key is gone, or
+// it was tampered with) is reported as an error rather than returned as ciphertext.
+func (s *secureStore) Get(ctx context.Context, id string) (Record, error) {
+	rec, err := s.inner.Get(ctx, id)
+	if err != nil {
+		return Record{}, err
+	}
+	plain, err := s.openRecord(rec)
+	if err != nil {
+		return Record{}, fmt.Errorf("dlq: record %s cannot be decrypted (%s): %w", id, decryptKind(err), err)
+	}
+	return plain, nil
+}
+
+// Parked decrypts what it can. A record that cannot be decrypted is still listed,
+// with its payload fields empty, so an operator can see that it exists and why it
+// was parked; OnUndecryptable is told about it.
+func (s *secureStore) Parked(ctx context.Context, q ParkedQuery) ([]Record, error) {
+	recs, err := s.inner.Parked(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	for i, r := range recs {
+		plain, err := s.openRecord(r)
+		if err != nil {
+			r.Key, r.Value, r.Checkpoint = nil, nil, nil
+			for j := range r.Headers {
+				r.Headers[j].Value = nil
+			}
+			recs[i] = r
+			if s.o.OnUndecryptable != nil {
+				s.o.OnUndecryptable(r.ID, err)
+			}
+			continue
+		}
+		recs[i] = plain
+	}
+	return recs, nil
+}
 func (s *secureStore) Discard(ctx context.Context, id string) error { return s.inner.Discard(ctx, id) }
 func (s *secureStore) HasOrderKey(ctx context.Context, orderKey string) (bool, error) {
 	return s.inner.HasOrderKey(ctx, s.orderKey(orderKey)) // the stored key is the keyed hash

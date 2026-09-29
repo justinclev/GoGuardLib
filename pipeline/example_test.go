@@ -42,3 +42,25 @@ func Example() {
 
 func callInventory(context.Context, string) error        { return nil }
 func callPayments(context.Context, string, []byte) error { return nil }
+
+// An operator inspects a parked record, fixes the cause, and resumes it at a step.
+func ExamplePipeline_Redrive() {
+	var p *pipeline.Pipeline // your pipeline
+	store := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	ctx := context.Background()
+
+	parked, _ := store.Parked(ctx, dlq.ParkedQuery{Limit: 50})
+	for _, rec := range parked {
+		progress, err := p.Describe(rec.Checkpoint)
+		if err != nil {
+			continue // a checkpoint that does not fit the deployed pipeline needs a human look
+		}
+		_ = progress.Completed // steps already done
+		_ = progress.Next      // the step it stopped at
+		_ = rec.LastError      // why it was parked
+
+		// Resume at "charge": earlier steps are not repeated. ErrStepUndone and
+		// ErrCannotSkipForward explain when a chosen step is not possible.
+		_ = p.Redrive(ctx, store, rec.ID, "charge")
+	}
+}

@@ -154,6 +154,9 @@ func Run(t *testing.T, f Factory) {
 		{"OrderKeyIsHeadOfLine", orderKey},
 		{"ParkedHeadBlocksOrderedSuccessors", parkedHeadBlocks},
 		{"HasOrderKeyReflectsContents", hasOrderKey},
+		{"GetReturnsACopyInAnyState", getRecord},
+		{"ParkedListsOldestFirstInPages", parkedPages},
+		{"RequeueWithReplacesTheCheckpointAtomically", requeueWith},
 		{"SeqFollowsAppendOrder", seqOrder},
 		{"StatsReflectContents", statsContents},
 		{"ClosedStoreRefusesWork", closed},
@@ -659,4 +662,113 @@ func hasOrderKey(e *env) {
 	if has("a") {
 		e.t.Fatal("the key must be free once its last record is gone")
 	}
+}
+
+func getRecord(e *env) {
+	e.append(rec("r", func(r *dlq.Record) { r.Checkpoint = []byte("cp") }))
+	got, err := e.s.Get(e.ctx, "r")
+	if err != nil || got.State != dlq.Pending || string(got.Value) != "value-r" || string(got.Checkpoint) != "cp" || got.BlockedOn != "payments" {
+		e.t.Fatalf("Get = %+v, %v", got, err)
+	}
+	got.Value[0] = 'X' // the caller must not be able to change the store through it
+	got.Headers[0].Value[0] = 'X'
+	if again, _ := e.s.Get(e.ctx, "r"); string(again.Value) != "value-r" || string(again.Headers[0].Value) != "t-r" {
+		e.t.Fatal("Get returned memory shared with the store")
+	}
+
+	l := e.leaseOne()
+	if got, _ := e.s.Get(e.ctx, "r"); got.State != dlq.Leased || got.Attempts != 1 {
+		e.t.Fatalf("leased record: %+v", got)
+	}
+	wantErr(e.t, e.s.Park(e.ctx, "r", l.Token, "poison"), nil)
+	if got, _ := e.s.Get(e.ctx, "r"); got.State != dlq.Parked || got.LastError != "poison" {
+		e.t.Fatalf("parked record: %+v", got)
+	}
+	if _, err := e.s.Get(e.ctx, "missing"); !errors.Is(err, dlq.ErrNotFound) {
+		e.t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func parkedPages(e *env) {
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("p%d", i)
+		e.append(rec(id, func(r *dlq.Record) { r.State = dlq.Parked; r.LastError = "why " + id }))
+		if i == 1 {
+			e.append(rec("pending")) // not parked: never listed
+		}
+	}
+	list := func(after uint64, limit int) []dlq.Record {
+		out, err := e.s.Parked(e.ctx, dlq.ParkedQuery{After: after, Limit: limit})
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		return out
+	}
+	names := func(rs []dlq.Record) string {
+		var ns []string
+		for _, r := range rs {
+			ns = append(ns, r.ID)
+		}
+		return fmt.Sprint(ns)
+	}
+	page1 := list(0, 2)
+	if names(page1) != "[p0 p1]" {
+		e.t.Fatalf("first page = %s", names(page1))
+	}
+	page2 := list(page1[len(page1)-1].Seq, 2)
+	if names(page2) != "[p2 p3]" {
+		e.t.Fatalf("second page = %s", names(page2))
+	}
+	if all := list(0, 0); names(all) != "[p0 p1 p2 p3 p4]" || all[0].LastError != "why p0" || string(all[0].Value) != "value-p0" {
+		e.t.Fatalf("all = %s %+v", names(all), all[0])
+	}
+	if last := list(page2[len(page2)-1].Seq, 100); names(last) != "[p4]" {
+		e.t.Fatalf("last page = %s", names(last))
+	}
+	if none := list(1<<40, 10); len(none) != 0 {
+		e.t.Fatalf("past the end = %s", names(none))
+	}
+}
+
+func requeueWith(e *env) {
+	parked := func(id, cp string) {
+		e.append(rec(id, func(r *dlq.Record) { r.State = dlq.Parked; r.Checkpoint = []byte(cp) }))
+	}
+	leaseCheckpoint := func() (string, int) {
+		l := e.leaseOne()
+		cp, attempts := string(l.Record.Checkpoint), l.Record.Attempts
+		wantErr(e.t, e.s.Release(e.ctx, l.Record.ID, l.Token), nil)
+		return cp, attempts
+	}
+
+	parked("a", "old")
+	newCP := []byte("new")
+	wantErr(e.t, e.s.RequeueWith(e.ctx, "a", dlq.RequeueOptions{ReplaceCheckpoint: true, Checkpoint: newCP}), nil)
+	newCP[0] = 'X' // the store must have copied it
+	if cp, attempts := leaseCheckpoint(); cp != "new" || attempts != 1 {
+		e.t.Fatalf("checkpoint %q attempts %d, want the replacement and a fresh attempt count", cp, attempts)
+	}
+
+	// Finish "a", so that only the records below are in play.
+	l := e.leaseOne()
+	wantErr(e.t, e.s.Ack(e.ctx, "a", l.Token), nil)
+
+	// Without ReplaceCheckpoint the checkpoint is left alone.
+	parked("b", "keep")
+	wantErr(e.t, e.s.Requeue(e.ctx, "b"), nil)
+	if cp, _ := leaseCheckpoint(); cp != "keep" {
+		e.t.Fatalf("checkpoint = %q, want it kept", cp)
+	}
+	// "b" is pending now, not parked.
+	wantErr(e.t, e.s.RequeueWith(e.ctx, "b", dlq.RequeueOptions{ReplaceCheckpoint: true, Checkpoint: []byte("ignored")}), dlq.ErrNotParked)
+
+	// A nil replacement clears the checkpoint.
+	parked("c", "to-clear")
+	wantErr(e.t, e.s.RequeueWith(e.ctx, "c", dlq.RequeueOptions{ReplaceCheckpoint: true}), nil)
+	got, _ := e.s.Get(e.ctx, "c")
+	if len(got.Checkpoint) != 0 || got.State != dlq.Pending || got.Attempts != 0 {
+		e.t.Fatalf("record = %+v, want an empty checkpoint, pending, attempts reset", got)
+	}
+
+	wantErr(e.t, e.s.RequeueWith(e.ctx, "missing", dlq.RequeueOptions{ReplaceCheckpoint: true}), dlq.ErrNotFound)
 }

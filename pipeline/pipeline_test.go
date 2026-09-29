@@ -727,3 +727,18 @@ func TestBreakersListsEachGuardingBreakerOnce(t *testing.T) {
 		t.Fatal("an unguarded pipeline has no breakers")
 	}
 }
+
+// secureStore is an encrypting store over memory, for tests that must prove a
+// feature works with data sealed at rest.
+func secureStore(t testing.TB) dlq.Store {
+	t.Helper()
+	key := make([]byte, secure.KeySize)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	enc, err := secure.NewAESGCM(secure.Key{ID: "k", Material: key})
+	must(t, err)
+	s, err := dlq.Secure(dlq.NewMemoryStore(dlq.MemoryOptions{}), dlq.SecureOptions{Encryptor: enc})
+	must(t, err)
+	return s
+}

@@ -59,6 +59,25 @@ type NackOptions struct {
 	Refund bool
 }
 
+// RequeueOptions adjusts a record as it leaves the parked state.
+type RequeueOptions struct {
+	// ReplaceCheckpoint, when true, replaces the record's checkpoint with Checkpoint
+	// (nil clears it) in the same durable step as the requeue, so the record is
+	// never pending with the old checkpoint. This is how a multi-step record is
+	// sent back to an earlier step.
+	ReplaceCheckpoint bool
+	Checkpoint        []byte
+}
+
+// ParkedQuery pages through parked records, oldest first.
+type ParkedQuery struct {
+	// After returns only records whose Seq is greater than this. Pass the Seq of
+	// the last record of the previous page (0 for the first page).
+	After uint64
+	// Limit is the page size. Default 100, at most 1000.
+	Limit int
+}
+
 // StoreStats summarises a store. All fields are cheap to compute.
 type StoreStats struct {
 	Pending int
@@ -107,6 +126,19 @@ type Store interface {
 	// Requeue moves a parked record back to pending with its attempts reset, for
 	// after an operator has fixed the cause. It returns ErrNotParked otherwise.
 	Requeue(ctx context.Context, id string) error
+
+	// RequeueWith is Requeue that can also replace the record's checkpoint,
+	// atomically. It returns ErrNotFound or ErrNotParked when the record is missing
+	// or not parked.
+	RequeueWith(ctx context.Context, id string, opts RequeueOptions) error
+
+	// Get returns a copy of a record in any state, for inspection. A leased
+	// record's lease token is not exposed. It returns ErrNotFound if there is none.
+	Get(ctx context.Context, id string) (Record, error)
+
+	// Parked lists parked records oldest first, a page at a time, so an operator
+	// can see what needs attention and why (Record.LastError).
+	Parked(ctx context.Context, q ParkedQuery) ([]Record, error)
 
 	// Discard permanently deletes a parked record. It is the only way data leaves
 	// a store without being handled, so it is explicit and limited to parked

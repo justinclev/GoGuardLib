@@ -126,7 +126,7 @@ A `dlq.Record` captures work that could not be finished (a Kafka message, a requ
 - **Records are leased, not removed.** `Lease` hands out due records under a fencing token and counts the attempt. If the worker crashes, the lease expires and the record is offered again. A stale worker cannot ack, nack or overwrite a record someone else now holds (`ErrLeaseLost`).
 - **`Checkpoint`** saves progress on a leased record so a retry resumes where the last attempt stopped.
 - **`Release`** returns a record without counting the attempt (for when the dependency was still down); **`Nack`** counts it and delays the next try.
-- **`Park`** sets a record aside for a human. Parked records are never retried or deleted automatically; `Requeue` and `Discard` are explicit.
+- **`Park`** sets a record aside for a human. Parked records are never retried or deleted automatically. `Parked` lists them (paged, oldest first, with the reason), `Get` inspects any record, and `Requeue`, `RequeueWith` and `Discard` are the explicit ways out.
 - **`OrderKey`** gives per-key ordering: records sharing a key are handed out one at a time, in order.
 - Delivery is **at-least-once**. Handlers must tolerate seeing a record twice.
 
@@ -240,6 +240,27 @@ r, _ := dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: p.Handler(), Br
 - **A checkpoint that does not fit the deployed pipeline is never resumed.** Renaming, reordering or removing a step that a stored record already completed, or a checkpoint from another pipeline, parks the record with `ErrPipelineMismatch`. Adding steps at the end, or changing the version label, resumes fine.
 - Steps can have a `Timeout`, in-process `Retry`, and a `Breaker`; an open circuit defers the message without calling the dependency.
 
+### Operating on parked records
+
+Parked records are where an operator comes in, so they are visible and fixable:
+
+```go
+list, _ := store.Parked(ctx, dlq.ParkedQuery{Limit: 50}) // what is stuck, and why (LastError)
+for _, rec := range list {
+    pr, _ := ordersPipeline.Describe(rec.Checkpoint) // steps done, the step it stopped at, phase; no message data
+    fmt.Println(rec.ID, rec.LastError, pr.Completed, pr.Next)
+}
+
+// The cause is fixed. Resume at a chosen step; the steps before it are not repeated.
+err := ordersPipeline.Redrive(ctx, store, rec.ID, "charge")
+```
+
+- **`Redrive` is one atomic step.** The checkpoint replacement and the requeue are a single durable log entry (`Store.RequeueWith`), so a crash can never leave the record pending with the old checkpoint. It works through `dlq.Secure` (the new checkpoint is sealed like any other) and is rejected, changing nothing, if the record is not parked or the step is not valid.
+- **It will not skip work.** Resuming at a step whose predecessors have not completed is refused (`ErrCannotSkipForward`), and so is resuming after a step that was already compensated, since its effects no longer exist (`ErrStepUndone`). Rewind to that step or earlier instead.
+- **Redoing undone work gets fresh idempotency keys.** Steps re-run *without* having been compensated keep their keys, because to a downstream they are a genuine repeat. But if you rewind past steps a saga already undid, the pipeline starts a new *epoch* and their keys change, otherwise a service that deduplicates would treat the redo as already done. (Epoch 0 keys are exactly what earlier versions produced.)
+- A record that was compensated cannot just be requeued as it was: it would finish compensating and park again. Give `Redrive` the step to resume at.
+- Data the earlier steps saved with `x.Set` is kept through a rewind.
+
 ## Kafka consumers: the `kafka` module
 
 Kafka support lives in its own Go module, `github.com/justinclev/GoGuardLib/kafka`, so HTTP-only users never pull in the Kafka client or cgo. The consumer logic (package `kafka`) is written against a small `Client` interface and imports no Kafka library; package `kafka/confluent` adapts [confluent-kafka-go](https://github.com/confluentinc/confluent-kafka-go) (which bundles librdkafka; it needs cgo).
@@ -287,11 +308,11 @@ This release changes behaviour deliberately:
 - `Policy.HeartbeatInterval` and `HeartbeatFunc` are replaced by `Policy.Health` / `HealthPath` (see "Recovery"), and `breaker.RecordProbe` is gone: probes are driven by package `health`.
 - A circuit that closes starts with a clean sampling window, so failures from before an outage cannot reopen it on the first new error.
 - `Breaker.Close` now exists; call it if the breaker has a health check.
-- `dlq.Store` gained `HasOrderKey` (implement it in custom stores), and `NackOptions.Refund`, `LeaseRequest.Skip`.
+- `dlq.Store` gained `HasOrderKey`, `Get`, `Parked` and `RequeueWith` (implement them in custom stores), plus `NackOptions.Refund` and `LeaseRequest.Skip`.
 
 ## Roadmap
 
-Possible follow-ups: keeping payloads on disk instead of in memory for very large queues, resuming a parked record from a chosen step, and metrics adapters (Prometheus / OpenTelemetry) as separate modules.
+Possible follow-ups: keeping payloads on disk instead of in memory for very large queues, and metrics adapters (Prometheus / OpenTelemetry) as separate modules.
 
 ## License
 

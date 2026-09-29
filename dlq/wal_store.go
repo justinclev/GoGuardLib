@@ -621,7 +621,20 @@ func (w *WALStore) applyEntry(fr frame) error {
 			return err
 		}
 		w.m.replayCheckpoint(id, cp)
-	case entAck, entRelease, entRequeue, entDiscard:
+	case entRequeue:
+		id := d.str()
+		replace, cp := false, []byte(nil)
+		if len(d.b) > 0 {
+			replace = d.u8() == 1
+			if replace {
+				cp = d.nullable()
+			}
+		}
+		if err := d.done(); err != nil {
+			return err
+		}
+		w.m.replayRequeue(id, replace, cp)
+	case entAck, entRelease, entDiscard:
 		id := d.str()
 		if err := d.done(); err != nil {
 			return err
@@ -631,8 +644,6 @@ func (w *WALStore) applyEntry(fr frame) error {
 			w.m.replayAck(id)
 		case entRelease:
 			w.m.replayRelease(id)
-		case entRequeue:
-			w.m.replayRequeue(id)
 		case entDiscard:
 			w.m.replayDiscard(id)
 		}

@@ -241,10 +241,31 @@ func (m *machine) applyPark(it *memItem, at time.Time, reason string) {
 	m.resize(it)
 }
 
-func (m *machine) applyRequeue(it *memItem) {
+func (m *machine) applyRequeue(it *memItem, replace bool, checkpoint []byte) {
 	it.rec.State = Pending
 	it.rec.Attempts = 0
 	it.rec.NextAttempt = time.Time{}
+	if replace {
+		m.setCheckpoint(it, checkpoint)
+	}
+}
+
+// parkedList returns up to limit parked records with Seq greater than after.
+func (m *machine) parkedList(after uint64, limit int) []Record {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	var out []Record
+	for el := m.order.Front(); el != nil && len(out) < limit; el = el.Next() {
+		it := el.Value.(*memItem)
+		if it.rec.State == Parked && it.rec.Seq > after {
+			out = append(out, it.rec.Clone())
+		}
+	}
+	return out
 }
 
 func (m *machine) hasOrderKey(k string) bool { return k != "" && len(m.byKey[k]) > 0 }
@@ -310,9 +331,9 @@ func (m *machine) replayPark(id string, at time.Time, reason string) {
 	}
 }
 
-func (m *machine) replayRequeue(id string) {
+func (m *machine) replayRequeue(id string, replace bool, checkpoint []byte) {
 	if it, ok := m.items[id]; ok && it.rec.State == Parked {
-		m.applyRequeue(it)
+		m.applyRequeue(it, replace, checkpoint)
 	}
 }
 
