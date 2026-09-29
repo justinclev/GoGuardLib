@@ -95,6 +95,44 @@ err := retry.Do(ctx, retry.Policy{
 
 Return `retry.Permanent(err)` from the function to stop immediately. A breaker's `*OpenError` is never retried.
 
+## Dead-letter records: the `dlq` package
+
+A `dlq.Record` captures work that could not be finished (a Kafka message, a request) together with where it came from and what was blocking it. A `dlq.Store` keeps records safe until they can be retried. The contract every store honours:
+
+- **`Append` is durable and idempotent.** It returns only once the record would survive a crash, and appending the same `ID` again is a no-op. Use `dlq.KafkaID(topic, partition, offset)` so a message redelivered after a crash maps to the same record.
+- **A full store refuses (`ErrFull`); it never drops or evicts.** The caller must pause instead of losing data.
+- **Records are leased, not removed.** `Lease` hands out due records under a fencing token and counts the attempt. If the worker crashes, the lease expires and the record is offered again. A stale worker cannot ack, nack or overwrite a record someone else now holds (`ErrLeaseLost`).
+- **`Checkpoint`** saves progress on a leased record so a retry resumes where the last attempt stopped.
+- **`Release`** returns a record without counting the attempt (for when the dependency was still down); **`Nack`** counts it and delays the next try.
+- **`Park`** sets a record aside for a human. Parked records are never retried or deleted automatically; `Requeue` and `Discard` are explicit.
+- **`OrderKey`** gives per-key ordering: records sharing a key are handed out one at a time, in order.
+- Delivery is **at-least-once**. Handlers must tolerate seeing a record twice.
+
+`dlq.NewMemoryStore` is the reference implementation. It is **not durable** and suits tests and work you can afford to lose on restart; a durable write-ahead-log store and a Kafka store are next on the roadmap. Any store can be checked against the contract with `storetest.Run` from `dlq/storetest`.
+
+## Security: the `secure` package
+
+```go
+enc, _ := secure.NewAESGCM(secure.Key{ID: "2025-06", Material: key32}, // seals new data
+    secure.Key{ID: "2024-11", Material: oldKey32})                     // still opens old data
+
+store, _ := dlq.Secure(dlq.NewMemoryStore(dlq.MemoryOptions{}), dlq.SecureOptions{
+    Encryptor:      enc,
+    OrderKeyPepper: pepper, // keeps message keys out of the store while ordering still works
+})
+```
+
+`dlq.Secure` wraps any store:
+
+- `Key`, `Value`, header values and `Checkpoint` are sealed with **AES-256-GCM**, bound to the record ID and field so ciphertext cannot be moved between records. Sealed data names its key, so **keys rotate** without rewriting the queue. The `Encryptor` interface lets you delegate to a KMS or HSM.
+- `LastError`, `Nack` errors and `Park` reasons pass through a **`Redactor`** that removes bearer tokens, JWTs, `user:pass@` URLs, and `password=`/`token=`-style values, and truncates long text so a payload cannot leak through an error message.
+- A record that **cannot be decrypted** (a lost key, tampering) is parked and reported through `OnUndecryptable`. It is never returned as ciphertext, never dropped, and never left to crash-loop a worker.
+- What stays in clear so stores can index and operators can inspect: IDs, source, header names, timestamps, attempt counts and (without a pepper) `OrderKey`.
+
+`secure.NewHMAC` provides key-ID-aware HMAC-SHA256 signing for stores that keep data unencrypted.
+
+The redactor recognises common credential shapes. It is a safety net for diagnostics, not a guarantee; encrypt payloads rather than relying on it.
+
 ## Upgrading from the guard-everything transport
 
 This release changes behaviour deliberately:
@@ -110,7 +148,7 @@ This release changes behaviour deliberately:
 
 ## Roadmap
 
-Durable dead-letter queue with automatic redrive, health-check-driven recovery, multi-step pipelines that resume from the failed step, and a Kafka consumer adapter.
+Next: a durable write-ahead-log store, health-check-driven recovery with automatic redrive, multi-step pipelines that resume from the failed step, and a Kafka consumer adapter.
 
 ## License
 
