@@ -32,7 +32,14 @@
         </dl>
       </article>
     } @empty {
-      <p class="none">Waiting for the orchestrator…</p>
+      @if (outdatedOrchestrator()) {
+        <p class="none warn">
+          This page is newer than the orchestrator it is talking to, so it sends no topic data. The orchestrator image is
+          out of date: rebuild it with <code>docker compose up --build</code>.
+        </p>
+      } @else {
+        <p class="none">Waiting for the orchestrator…</p>
+      }
     }
   </div>
 

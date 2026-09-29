@@ -28,6 +28,9 @@
         {{ store.snapshot()?.droppedEvents }} events dropped
       </span>
     }
+    <span class="pill" title="The build of this page. If it does not change after you rebuild the demo, something is serving an old copy: see 'Updating' in demo/README.md.">
+      UI build {{ build }}
+    </span>
     <span class="pill" [class.bad]="!store.connected()">
       <i class="dot" [class.live]="store.connected()"></i>
       {{ store.connected() ? 'Live' : 'Reconnecting…' }}

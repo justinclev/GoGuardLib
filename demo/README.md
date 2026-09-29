@@ -115,6 +115,22 @@ The UI uses these; you can too.
 
 Your network re-signs HTTPS with a company root certificate. The Docker daemon trusts it (image pulls work) but the build containers do not, so `go mod download` and `npm ci` fail. Put the root certificate in `demo/certs/` as a `.crt` file and run `docker compose build --no-cache`; `demo/certs/README.md` explains how to export it. If the public registries are blocked instead, set `GOPROXY` and `NPM_CONFIG_REGISTRY` to your internal mirrors. Do not turn certificate checking off.
 
+## Updating: "I still see the old demo"
+
+`docker compose up` reuses images it already built. After pulling new code, rebuild:
+
+```bash
+docker compose up --build            # rebuild what changed
+docker compose build --no-cache && docker compose up --force-recreate   # if it still looks old
+```
+
+Two things tell you what is actually running:
+
+- The header shows **UI build** followed by a short code. It is the hash in the name of the script the browser loaded, so it changes with every UI build. If it does not change after a rebuild, the browser is showing a cached page (reload with Ctrl+Shift+R) or the UI container was not rebuilt.
+- If the page loads but the **Kafka topics** panel says the page is newer than the orchestrator, the UI was rebuilt but the orchestrator image was not. Rebuild it with the command above.
+
+The UI's nginx never caches `index.html`, and caches the hashed script and style files for a year, so a normal reload picks up a new build.
+
 ## Cleaning up
 
 ```bash

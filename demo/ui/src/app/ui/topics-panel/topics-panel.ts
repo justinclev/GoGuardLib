@@ -21,6 +21,12 @@ interface Chip {
 export class TopicsPanel {
   private readonly store = inject(DemoStore);
 
+  /** True when the orchestrator answers but does not know about topics: it is older than this page. */
+  readonly outdatedOrchestrator = computed(() => {
+    const s = this.store.snapshot();
+    return !!s && s.topics === undefined;
+  });
+
   readonly topics = computed(() =>
     (this.store.snapshot()?.topics ?? []).map((t) => {
       const chips: Chip[] = t.steps.map((s) => ({
