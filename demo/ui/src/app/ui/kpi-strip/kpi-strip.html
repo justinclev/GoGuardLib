@@ -1,0 +1,31 @@
+<section class="strip">
+  <article class="tile">
+    <span class="k">Throughput</span>
+    <strong>{{ throughput() }}<small> /s</small></strong>
+    <span class="d">requests completed, last 5 s</span>
+  </article>
+
+  <article class="tile" [class.good]="healthy()" [class.bad]="!healthy()">
+    <span class="k">Success rate</span>
+    <strong>{{ success() }}<small> %</small></strong>
+    <span class="d">last 30 s · breaker rejections and stored orders do not count as success</span>
+  </article>
+
+  <article class="tile amber">
+    <span class="k">Safely stored</span>
+    <strong>{{ stored() }}</strong>
+    <span class="d">orders waiting in the durable log · {{ redriven() }} redriven so far</span>
+  </article>
+
+  <article class="tile purple">
+    <span class="k">Fail-fast</span>
+    <strong>{{ fastFail() }}<small> ms</small></strong>
+    <span class="d">a rejected call, instead of a 1500 ms timeout</span>
+  </article>
+
+  <article class="tile teal">
+    <span class="k">Waiting avoided</span>
+    <strong>{{ avoided() }}<small> s</small></strong>
+    <span class="d">caller time not spent on a dead service</span>
+  </article>
+</section>

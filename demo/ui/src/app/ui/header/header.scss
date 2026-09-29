@@ -1,0 +1,86 @@
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.logo {
+  width: 46px;
+  height: 46px;
+  filter: drop-shadow(0 0 14px rgba(62, 230, 255, 0.55));
+}
+
+h1 {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+
+  span {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--green);
+    border: 1px solid rgba(62, 240, 176, 0.5);
+    border-radius: 999px;
+    padding: 3px 9px;
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+}
+
+p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.pills {
+  display: flex;
+  gap: 10px;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 13px;
+  font-weight: 600;
+
+  &.bad {
+    border-color: rgba(255, 77, 109, 0.6);
+    color: #ffc9d3;
+  }
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--red);
+
+  &.live {
+    background: var(--green);
+    box-shadow: 0 0 10px var(--green);
+    animation: beat 1.8s ease-in-out infinite;
+  }
+}
+
+@keyframes beat {
+  50% {
+    opacity: 0.45;
+  }
+}

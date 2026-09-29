@@ -1,0 +1,42 @@
+<section class="panel">
+  <header>
+    <h2>Where every message is</h2>
+    <span class="hint">nothing is dropped between these boxes</span>
+  </header>
+
+  <div class="cols">
+    <article class="col kafka">
+      <h3><i></i>Kafka consumer</h3>
+      <dl>
+        <div><dt>produced</dt><dd>{{ kafka()?.produced ?? 0 }}</dd></div>
+        <div><dt>waiting in topic</dt><dd>{{ kafka()?.backlog ?? 0 }}</dd></div>
+        <div><dt>in flight</dt><dd>{{ kafka()?.inFlight ?? 0 }}</dd></div>
+        <div><dt>completed</dt><dd class="g">{{ kafka()?.done ?? 0 }}</dd></div>
+        <div><dt>stored in DLQ</dt><dd class="a">{{ kafka()?.deferred ?? 0 }}</dd></div>
+        <div><dt>partitions paused</dt><dd [class.a]="(kafka()?.pausedPartitions ?? 0) > 0">{{ kafka()?.pausedPartitions ?? 0 }}</dd></div>
+      </dl>
+    </article>
+
+    <article class="col dlq">
+      <h3><i></i>Durable dead-letter log</h3>
+      <dl>
+        <div><dt>waiting</dt><dd class="a">{{ dlq()?.pending ?? 0 }}</dd></div>
+        <div><dt>being redriven</dt><dd class="t">{{ dlq()?.leased ?? 0 }}</dd></div>
+        <div><dt>redriven ok</dt><dd class="g">{{ dlq()?.redriven ?? 0 }}</dd></div>
+        <div><dt>oldest</dt><dd>{{ oldest() }}</dd></div>
+        <div><dt>parked for a human</dt><dd [class.r]="(dlq()?.parked ?? 0) > 0">{{ dlq()?.parked ?? 0 }}</dd></div>
+        <div><dt>held in order</dt><dd>{{ kafka()?.held ?? 0 }}</dd></div>
+      </dl>
+    </article>
+
+    <article class="col http">
+      <h3><i></i>HTTP requests</h3>
+      <dl>
+        <div><dt>sent</dt><dd>{{ http()?.sent ?? 0 }}</dd></div>
+        <div><dt>succeeded</dt><dd class="g">{{ http()?.ok ?? 0 }}</dd></div>
+        <div><dt>rejected instantly</dt><dd class="p">{{ http()?.rejected ?? 0 }}</dd></div>
+        <div><dt>call failed</dt><dd class="r">{{ http()?.failed ?? 0 }}</dd></div>
+      </dl>
+    </article>
+  </div>
+</section>

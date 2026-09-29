@@ -1,0 +1,26 @@
+<main class="page">
+  <app-header />
+  <app-control-bar [(speed)]="speed" />
+  <app-kpi-strip />
+
+  <section class="hero">
+    <app-flow-diagram [speed]="speed()" />
+    <app-story />
+  </section>
+
+  <h2 class="section">Circuit breakers</h2>
+  <app-breaker-panel />
+
+  <section class="pair">
+    <app-throughput-chart />
+    <app-pipeline-panel />
+  </section>
+
+  <app-request-feed />
+
+  <footer class="foot">
+    Everything above is driven by the real library: <code>breaker</code> and <code>health</code> for the gates,
+    <code>dlq</code> for the durable log and redriver, <code>pipeline</code> for resuming at the failed step and
+    <code>kafka</code> for the consumer.
+  </footer>
+</main>

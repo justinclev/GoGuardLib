@@ -1,0 +1,50 @@
+<section class="controls">
+  <div class="group">
+    <button type="button" class="play" [class.on]="running()" (click)="toggleTraffic()">
+      <span class="ico">{{ running() ? '❚❚' : '▶' }}</span>
+      {{ running() ? 'Stop traffic' : 'Start traffic' }}
+    </button>
+
+    <label class="slider http">
+      <span class="lbl"><i></i>HTTP <b>{{ http() }}</b> req/s</span>
+      <input type="range" min="0" max="60" step="1" [value]="http()" (input)="onHttp($event)" aria-label="HTTP requests per second" />
+    </label>
+    <label class="slider kafka">
+      <span class="lbl"><i></i>Kafka <b>{{ kafka() }}</b> msg/s</span>
+      <input type="range" min="0" max="60" step="1" [value]="kafka()" (input)="onKafka($event)" aria-label="Kafka messages per second" />
+    </label>
+
+    <div class="presets">
+      <button type="button" (click)="preset(4, 4)">Gentle</button>
+      <button type="button" (click)="preset(15, 15)">Busy</button>
+      <button type="button" (click)="preset(40, 40)">Storm</button>
+    </div>
+  </div>
+
+  <div class="group right">
+    <div class="seg" role="group" aria-label="Animation speed">
+      @for (s of speeds; track s) {
+        <button type="button" [class.on]="speed() === s" (click)="speed.set(s)">{{ s }}×</button>
+      }
+    </div>
+    <button type="button" class="ghost" [disabled]="!anyDown()" (click)="restoreAll()">Restore all</button>
+    <button type="button" class="guided" [class.on]="scenario.running()" (click)="toggleScenario()">
+      {{ scenario.running() ? 'Stop guided demo' : '✦ Guided demo' }}
+    </button>
+  </div>
+</section>
+
+@if (scenario.running()) {
+  <section class="guide" aria-live="polite">
+    <div class="steps">
+      @for (n of [1, 2, 3, 4, 5]; track n) {
+        <i [class.done]="n < scenario.stage()" [class.now]="n === scenario.stage()"></i>
+      }
+    </div>
+    <div class="text">
+      <strong>{{ scenario.stage() }}/{{ scenario.stages() }} · {{ scenario.title() }}</strong>
+      <span>{{ scenario.caption() }}</span>
+    </div>
+    <div class="bar"><div class="fill" [style.width.%]="scenario.progress() * 100"></div></div>
+  </section>
+}

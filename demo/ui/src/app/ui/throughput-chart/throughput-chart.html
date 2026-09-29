@@ -1,0 +1,28 @@
+<section class="panel">
+  <header>
+    <h2>Outcomes per second</h2>
+    <span class="hint">last 60 s · peak {{ peak() }}/s</span>
+  </header>
+
+  <svg [attr.viewBox]="'0 0 ' + CW + ' ' + CH" preserveAspectRatio="none" role="img" aria-label="Stacked bars of outcomes per second">
+    <g class="grid">
+      <line x1="0" [attr.x2]="CW" y1="1" y2="1" />
+      <line x1="0" [attr.x2]="CW" [attr.y1]="CH / 2" [attr.y2]="CH / 2" />
+      <line x1="0" [attr.x2]="CW" [attr.y1]="CH - 0.5" [attr.y2]="CH - 0.5" />
+    </g>
+    @for (b of bars(); track $index) {
+      <rect class="ok" [attr.x]="b.x" [attr.y]="b.ok.y" [attr.width]="b.w" [attr.height]="b.ok.h" rx="1.5" />
+      <rect class="deferred" [attr.x]="b.x" [attr.y]="b.deferred.y" [attr.width]="b.w" [attr.height]="b.deferred.h" rx="1.5" />
+      <rect class="rejected" [attr.x]="b.x" [attr.y]="b.rejected.y" [attr.width]="b.w" [attr.height]="b.rejected.h" rx="1.5" />
+      <rect class="failed" [attr.x]="b.x" [attr.y]="b.failed.y" [attr.width]="b.w" [attr.height]="b.failed.h" rx="1.5" />
+    }
+  </svg>
+
+  <footer>
+    <span><i class="ok"></i>succeeded</span>
+    <span><i class="deferred"></i>stored in DLQ</span>
+    <span><i class="rejected"></i>rejected instantly</span>
+    <span><i class="failed"></i>failed</span>
+    <span class="axis">60 s ago → now</span>
+  </footer>
+</section>

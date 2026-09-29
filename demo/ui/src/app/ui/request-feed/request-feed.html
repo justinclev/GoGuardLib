@@ -1,0 +1,65 @@
+<section class="panel">
+  <header>
+    <div>
+      <h2>Live requests</h2>
+      <span class="hint">each dot is one API call · click a row for the details</span>
+    </div>
+    <div class="filters" role="group" aria-label="Filter requests">
+      @for (f of filters; track f.key) {
+        <button type="button" [class.on]="filter() === f.key" (click)="filter.set(f.key)">{{ f.label }}</button>
+      }
+    </div>
+  </header>
+
+  <div class="head">
+    <span>time</span><span>id</span><span>via</span>
+    <span class="steps-h">
+      @for (s of steps; track s) {
+        <em>{{ label[s].slice(0, 3) }}</em>
+      }
+    </span>
+    <span>outcome</span><span class="r">took</span>
+  </div>
+
+  <div class="rows">
+    @for (r of rows(); track r.id) {
+      <div class="row" [class]="'row ' + r.status" [class.redriven]="r.redriven" [class.expanded]="open() === r.id" (click)="toggle(r.id)">
+        <span class="t">{{ r.startedAt | date: 'HH:mm:ss' }}</span>
+        <span class="id">{{ r.id }}</span>
+        <span><i class="flow" [class]="'flow ' + r.flow">{{ r.flow === 'http' ? 'HTTP' : 'Kafka' }}</i></span>
+        <span class="dots">
+          @for (s of steps; track s) {
+            <i [class]="'dot ' + r.steps[s].status" [attr.title]="tip(r, s)"></i>
+          }
+        </span>
+        <span><b class="badge" [class]="'badge ' + r.status">{{ outcome(r) }}</b></span>
+        <span class="r ms">{{ ms(r) }}</span>
+
+        @if (open() === r.id) {
+          <div class="detail" (click)="$event.stopPropagation()">
+            @for (s of steps; track s) {
+              <div class="d" [class]="'d ' + r.steps[s].status">
+                <b>{{ label[s] }}</b>
+                <span>{{ r.steps[s].status }}</span>
+                @if (r.steps[s].latencyMs !== undefined) {
+                  <span>{{ r.steps[s].latencyMs }} ms</span>
+                }
+                @if (r.steps[s].detail) {
+                  <span class="why">{{ r.steps[s].detail }}</span>
+                }
+              </div>
+            }
+            @if (r.inDlq) {
+              <p class="note">Stored in the durable dead-letter log with a checkpoint. It resumes at the blocked step, and the steps before it are not repeated.</p>
+            }
+            @if (r.redriven) {
+              <p class="note">This order was recovered by the redriver after a dependency came back.</p>
+            }
+          </div>
+        }
+      </div>
+    } @empty {
+      <p class="none">No requests yet. Start some traffic.</p>
+    }
+  </div>
+</section>

@@ -1,0 +1,178 @@
+<div class="stage" #stage>
+  <svg class="svg" [attr.viewBox]="viewBox" preserveAspectRatio="xMidYMid meet" role="img"
+       aria-label="Live diagram of requests flowing through four guarded services">
+    <defs>
+      <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#1b2450" stop-opacity="0.9" />
+        <stop offset="1" stop-color="#0f1533" stop-opacity="0.9" />
+      </linearGradient>
+      <linearGradient id="panelDown" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#3a1424" stop-opacity="0.95" />
+        <stop offset="1" stop-color="#1c0b18" stop-opacity="0.95" />
+      </linearGradient>
+      <linearGradient id="dlqGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#ffb84d" stop-opacity="0.55" />
+        <stop offset="1" stop-color="#ff7a3d" stop-opacity="0.35" />
+      </linearGradient>
+      <linearGradient id="topicGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#8f86ff" stop-opacity="0.65" />
+        <stop offset="1" stop-color="#5a4fe0" stop-opacity="0.35" />
+      </linearGradient>
+      <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+        <feGaussianBlur stdDeviation="5" result="b" />
+        <feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge>
+      </filter>
+      <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+
+    <!-- lane captions -->
+    <text class="lane-cap" x="40" y="46">HTTP · the caller waits</text>
+    <text class="lane-cap" x="40" y="586">KAFKA · nothing may be lost</text>
+    <text class="lane-cap right" [attr.x]="W - 40" y="46">GUARDED DEPENDENCIES</text>
+
+    <!-- edges -->
+    <g class="edges">
+      <path class="edge http" [attr.d]="'M ' + (nodes.http.x + 52) + ' ' + nodes.http.y + ' L ' + (nodes.gateway.x - 62) + ' ' + nodes.gateway.y" />
+      <path class="edge http" [attr.d]="gatewayToFirst" />
+      <path class="edge kafka" [attr.d]="'M ' + (nodes.producer.x + 52) + ' ' + nodes.producer.y + ' L ' + (nodes.topic.x - 66) + ' ' + nodes.topic.y" />
+      <path class="edge kafka" [attr.d]="'M ' + (nodes.topic.x + 66) + ' ' + nodes.topic.y + ' L ' + (nodes.consumer.x - 66) + ' ' + nodes.consumer.y" />
+      <path class="edge kafka" [attr.d]="consumerToFirst" />
+      @for (s of services(); track s.name) {
+        <path class="edge row" [attr.d]="'M ' + (s.gx + 26) + ' ' + rowY + ' L ' + (s.x - 50) + ' ' + rowY" />
+        @if (s.prevX !== null) {
+          <path class="edge row" [attr.d]="'M ' + s.prevX + ' ' + rowY + ' L ' + (s.gx - 26) + ' ' + rowY" />
+        }
+        <path class="edge dlq" [class.hot]="s.state === 'open'" [attr.d]="dlqEdges()[$index].d" marker-end="url(#arrow)" />
+      }
+    </g>
+
+    <!-- HTTP side -->
+    <g class="node" [attr.transform]="'translate(' + nodes.http.x + ' ' + nodes.http.y + ')'">
+      <rect class="box http" x="-52" y="-40" width="104" height="80" rx="18" />
+      <g class="icon" transform="translate(-14 -30) scale(1.15)">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M3 12h18 M12 3c3 3 3 15 0 18 M12 3c-3 3-3 15 0 18" />
+      </g>
+      <text class="title" y="18">HTTP clients</text>
+      <text class="sub" y="34">{{ store.snapshot()?.traffic?.httpRps ?? 0 }} req/s</text>
+    </g>
+    <g class="node" [attr.transform]="'translate(' + nodes.gateway.x + ' ' + nodes.gateway.y + ')'">
+      <rect class="box http" x="-62" y="-40" width="124" height="80" rx="18" />
+      <g class="icon" transform="translate(-14 -30) scale(1.15)">
+        <path d="M4 4h16v6H4z M4 14h16v6H4z M7 7h.01 M7 17h.01" />
+      </g>
+      <text class="title" y="18">API gateway</text>
+      <text class="sub" y="34">
+        {{ store.snapshot()?.http?.sent ?? 0 }} sent
+      </text>
+    </g>
+
+    <!-- Kafka side -->
+    <g class="node" [attr.transform]="'translate(' + nodes.producer.x + ' ' + nodes.producer.y + ')'">
+      <rect class="box kafka" x="-52" y="-40" width="104" height="80" rx="18" />
+      <g class="icon" transform="translate(-14 -30) scale(1.15)">
+        <rect x="3" y="4" width="18" height="6" rx="1.5" />
+        <rect x="3" y="14" width="18" height="6" rx="1.5" />
+        <path d="M7 7h.01 M7 17h.01" />
+      </g>
+      <text class="title" y="18">Producer</text>
+      <text class="sub" y="34">{{ store.snapshot()?.traffic?.kafkaRps ?? 0 }} msg/s</text>
+    </g>
+
+    <g class="node topic" [class.paused]="topicPaused()" [attr.transform]="'translate(' + nodes.topic.x + ' ' + nodes.topic.y + ')'">
+      <rect class="box kafka big" x="-66" y="-54" width="132" height="108" rx="20" />
+      <rect class="fill kafka" x="-60" [attr.y]="48 - topicFill() * 96" width="120" [attr.height]="topicFill() * 96" rx="14" />
+      <text class="title" y="-26">orders topic</text>
+      <g class="parts">
+        <rect x="-46" y="-14" width="26" height="8" rx="4" />
+        <rect x="-13" y="-14" width="26" height="8" rx="4" />
+        <rect x="20" y="-14" width="26" height="8" rx="4" />
+      </g>
+      <text class="big-num" y="24">{{ store.snapshot()?.kafka?.backlog ?? 0 }}</text>
+      <text class="sub" y="40">{{ topicPaused() ? 'paused · waiting safely' : 'waiting to be consumed' }}</text>
+    </g>
+
+    <g class="node" [attr.transform]="'translate(' + nodes.consumer.x + ' ' + nodes.consumer.y + ')'">
+      <rect class="box kafka" x="-66" y="-40" width="132" height="80" rx="18" />
+      <g class="icon" transform="translate(-14 -30) scale(1.15)">
+        <path d="M4 6h16 M4 12h16 M4 18h10 M17 16l3 2-3 2" />
+      </g>
+      <text class="title" y="18">Guarded consumer</text>
+      <text class="sub" y="34">{{ store.snapshot()?.kafka?.inFlight ?? 0 }} in flight</text>
+    </g>
+
+    <!-- breaker gates and services -->
+    @for (s of services(); track s.name) {
+      <g class="gate" [class.open]="s.state === 'open'" [class.half]="s.state === 'half-open'"
+         [attr.transform]="'translate(' + s.gx + ' ' + rowY + ')'">
+        <circle class="halo" r="34" />
+        <path class="shield" d="M0 -30 L24 -21 V-2 C24 15 12 28 0 34 C-12 28 -24 15 -24 -2 V-21 Z" />
+        <g class="lock" transform="translate(-9 -12) scale(0.75)">
+          @if (s.state === 'open') {
+            <path d="M6 11V8a6 6 0 0 1 12 0v3 M5 11h14v10H5z" />
+          } @else if (s.state === 'half-open') {
+            <path d="M6 11V8a6 6 0 0 1 11-3 M5 11h14v10H5z" />
+          } @else {
+            <path d="M8 11V8a4 4 0 0 1 8 0 M5 11h14v10H5z M12 15v2" />
+          }
+        </g>
+        <text class="gate-state" y="52">{{ s.state | uppercase }}</text>
+      </g>
+
+      <g class="node svc" [class.down]="s.down" [class.slow]="s.mode === 'slow'" [class.flaky]="s.mode === 'flaky'"
+         [attr.transform]="'translate(' + s.x + ' ' + rowY + ')'">
+        <rect class="box svc-box" x="-50" y="-52" width="100" height="104" rx="20" [attr.fill]="s.down ? 'url(#panelDown)' : 'url(#panel)'" />
+        <g class="icon svc-icon" transform="translate(-16 -40) scale(1.35)">
+          <path [attr.d]="s.icon" />
+        </g>
+        <text class="title" y="20">{{ s.label }}</text>
+        <text class="sub" y="38">{{ s.down ? 'OFFLINE' : s.mode === 'unknown' ? '…' : s.mode === 'up' ? s.served + ' served' : s.mode }}</text>
+        <circle class="led" cx="36" cy="-38" r="5" />
+        @if (s.down) {
+          <g class="cross"><path d="M-30 -30 L30 30 M30 -30 L-30 30" /></g>
+        }
+      </g>
+    }
+
+    <!-- dead-letter queue -->
+    <g class="node dlq" [attr.transform]="'translate(' + nodes.dlq.x + ' ' + nodes.dlq.y + ')'">
+      <rect class="box dlq-box" x="-118" y="-62" width="236" height="104" rx="22" />
+      <rect class="fill dlq" x="-112" [attr.y]="36 - dlqFill() * 92" width="224" [attr.height]="dlqFill() * 92" rx="16" />
+      <text class="title" y="-36">Durable dead-letter log</text>
+      <text class="big-num" y="6">{{ (store.snapshot()?.dlq?.pending ?? 0) + (store.snapshot()?.dlq?.leased ?? 0) }}</text>
+      <text class="sub" y="26">
+        stored on disk · {{ store.snapshot()?.dlq?.redriven ?? 0 }} redriven
+        @if ((store.snapshot()?.dlq?.parked ?? 0) > 0) { · {{ store.snapshot()?.dlq?.parked }} parked }
+      </text>
+    </g>
+    <text class="dlq-note" [attr.x]="nodes.dlq.x" [attr.y]="nodes.dlq.y + 64">the redriver replays from the failed step when the circuit closes</text>
+  </svg>
+
+  <canvas class="fx" #fx></canvas>
+
+  <!-- the buttons a presenter uses -->
+  <div class="toolbars">
+    @for (s of services(); track s.name) {
+      <div class="toolbar" [style.left.%]="s.left" [style.top.%]="s.toolbarTop">
+        <button type="button" class="kill" [class.restore]="s.down" (click)="toggleDown(s.name, s.mode)"
+                [attr.aria-label]="(s.down ? 'Restore ' : 'Take down ') + s.label">
+          {{ s.down ? 'Restore' : 'Take down' }}
+        </button>
+        <div class="mini">
+          <button type="button" [class.on]="s.mode === 'slow'" (click)="setMode(s.name, s.mode, 'slow')" title="Make it slower than the timeout">slow</button>
+          <button type="button" [class.on]="s.mode === 'flaky'" (click)="setMode(s.name, s.mode, 'flaky')" title="Make about half of its calls fail">flaky</button>
+        </div>
+      </div>
+    }
+  </div>
+
+  <div class="legend" aria-hidden="true">
+    <span><i class="dot ok"></i>succeeded</span>
+    <span><i class="dot rejected"></i>rejected by the breaker</span>
+    <span><i class="dot failed"></i>call failed</span>
+    <span><i class="dot deferred"></i>stored in the DLQ</span>
+    <span><i class="dot redriven"></i>redriven</span>
+  </div>
+</div>
