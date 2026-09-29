@@ -2,7 +2,9 @@
 #
 #   docker compose up --build
 #
-# then open http://localhost:4200
+# then open http://localhost:4280
+#
+# If a port is taken, choose others:  UI_PORT=5000 API_PORT=5001 docker compose up --build
 name: goguard-demo
 
 services:
@@ -58,7 +60,7 @@ services:
         condition: service_started
     restart: unless-stopped
     ports:
-      - "8080:8080" # the API, for curl and for poking around
+      - "${API_PORT:-8081}:8080" # the API, for curl and for poking around
 
   # The Angular UI, served by nginx, which forwards /api to the orchestrator.
   ui:
@@ -67,7 +69,7 @@ services:
     depends_on:
       - orchestrator
     ports:
-      - "4200:80"
+      - "${UI_PORT:-4280}:80"
 
 volumes:
   dlq-data:

@@ -7,7 +7,7 @@ cd demo
 docker compose up --build
 ```
 
-Then open **http://localhost:4200**. (The first build downloads Go and npm dependencies and takes a few minutes.)
+Then open **http://localhost:4280**. (If that port is taken, `UI_PORT=5000 API_PORT=5001 docker compose up --build` picks others.) The first build downloads Go and npm dependencies and takes a few minutes.
 
 ## What you are looking at
 
