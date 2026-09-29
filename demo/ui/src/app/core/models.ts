@@ -18,6 +18,8 @@ export interface StreamEvent {
   type: 'request' | 'step' | 'breaker' | 'probe' | 'dlq';
   id?: string;
   flow?: Flow;
+  /** For Kafka events: which topic the message is on. */
+  topic?: string;
   step?: string;
   status?: string;
   latencyMs?: number;
@@ -53,6 +55,19 @@ export interface BreakerSnapshot {
   lastChangedMs: number;
 }
 
+/** One Kafka topic. Topics run different pipelines, so each has its own steps and tallies. */
+export interface TopicSnapshot {
+  name: string;
+  steps: string[];
+  produced: number;
+  done: number;
+  /** Set aside in the dead-letter log, ever. */
+  stored: number;
+  parked: number;
+  /** True while any breaker in this topic's pipeline is open: the consumer stops reading it. */
+  paused: boolean;
+}
+
 export interface Snapshot {
   t: number;
   backend: 'kafka' | 'sim';
@@ -71,7 +86,9 @@ export interface Snapshot {
     inFlight: number;
     backlog: number;
   };
-  http: { sent: number; ok: number; failed: number; rejected: number };
+  /** `deferred` counts requests the guarded client saved for later; `deferOn` is the switch that allows it. */
+  http: { sent: number; ok: number; failed: number; rejected: number; deferred: number; deferOn: boolean };
+  topics: TopicSnapshot[];
   ledger: {
     produced: number;
     adopted: number;
@@ -87,7 +104,7 @@ export interface Snapshot {
   droppedEvents: number;
 }
 
-export type StepStatus = 'pending' | 'running' | 'ok' | 'failed' | 'rejected' | 'skipped';
+export type StepStatus = 'pending' | 'running' | 'ok' | 'failed' | 'rejected' | 'deferred' | 'skipped';
 
 export interface StepInfo {
   status: StepStatus;
@@ -102,6 +119,7 @@ export interface RequestRecord {
   seq: number;
   id: string;
   flow: Flow;
+  topic?: string;
   startedAt: number;
   endedAt?: number;
   status: RequestStatus;

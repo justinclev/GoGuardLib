@@ -26,10 +26,9 @@ import (
 
 	"github.com/justinclev/GoGuardLib/dlq"
 	"github.com/justinclev/GoGuardLib/kafka"
+	"github.com/justinclev/GoGuardLib/obs"
 	"github.com/justinclev/GoGuardLib/retry"
 )
-
-const topic = "orders"
 
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -75,8 +74,8 @@ func run() error {
 			b.Close()
 		}
 	}()
-	var err error
-	if a.pipe, err = a.buildPipeline(); err != nil {
+	a.deferOn.Store(true) // the guarded HTTP client saves what it cannot send, until the UI turns it off
+	if err := a.buildPipelines(); err != nil {
 		return err
 	}
 
@@ -91,28 +90,54 @@ func run() error {
 	}
 	defer func() { _ = wal.Close() }()
 	store := &eventStore{Store: wal, a: a}
+	if err := a.newGuard(store); err != nil {
+		return err
+	}
+	defer func() { _ = a.guard.Close() }()
 	if st, err := wal.Stats(ctx); err == nil {
 		a.ledger.seed(st.Pending + st.Leased) // orders a crashed run left in the log
 	}
 
-	client, producer, mode, closeKafka, err := kafkaBackend(ctx, env("KAFKA_BROKERS", ""), topic)
+	var bindings []kafka.Binding
+	var topicNames []string
+	for _, d := range topicDefs {
+		bindings = append(bindings, kafka.Binding{Topic: d.Name, Pipeline: a.pipes[d.Name]})
+		topicNames = append(topicNames, d.Name)
+	}
+	client, producer, mode, closeKafka, err := kafkaBackend(ctx, env("KAFKA_BROKERS", ""), topicNames)
 	if err != nil {
 		return err
 	}
 	defer closeKafka()
-	a.poison = func() { a.produceOrder(producer, topic, true) }
+	a.poison = func() { a.produceOrder(producer, orderTopic, true) }
 
 	consumer, err := kafka.NewConsumer(kafka.Config{
 		Client: client, Store: store,
-		Bindings: []kafka.Binding{{Topic: topic, Pipeline: a.pipe}},
+		Bindings: bindings,
 		Workers:  4, PollTimeout: 50 * time.Millisecond, CommitInterval: 500 * time.Millisecond,
 		ProcessTimeout: 10 * time.Second,
 	})
 	if err != nil {
 		return err
 	}
+	// One redriver finishes everything the store holds: Kafka messages by the pipeline of
+	// their own topic (RedriveFor), and the HTTP requests the guarded client saved.
+	rd, err := kafka.RedriveFor(bindings)
+	if err != nil {
+		return err
+	}
+	replay, err := a.replay()
+	if err != nil {
+		return err
+	}
+	handler := func(ctx context.Context, it *dlq.Item) error {
+		if it.Record.Source.Kind == "http" {
+			return replay(ctx, it)
+		}
+		return rd.Handler(ctx, it)
+	}
 	redriver, err := dlq.NewRedriver(dlq.RedriveConfig{
-		Store: store, Handler: a.pipe.Handler(), Breakers: a.breakers,
+		Store: store, Handler: handler, Breakers: rd.Breakers, BreakerSource: a.guard.Breakers,
 		Workers: 4, LeaseTTL: 20 * time.Second, PollInterval: 200 * time.Millisecond, MaxAttempts: 8,
 		Backoff: retry.Jitter(retry.Constant(time.Second), 0.3),
 		Rate:    40, Burst: 10, RampUp: 5 * time.Second, // don't flood a service that just came back
@@ -147,7 +172,7 @@ func run() error {
 		}
 	}
 	spawn(func() { generate(ctx, &a.httpRPS, fire(a.runHTTP)) })
-	spawn(func() { generate(ctx, &a.kafkaRPS, fire(func() { a.produce(producer, topic) })) })
+	spawn(func() { generate(ctx, &a.kafkaRPS, fire(func() { a.produceAuto(producer) })) })
 
 	sv := &serviceView{a: a}
 	spawn(func() { sv.poll(ctx) })
@@ -297,7 +322,25 @@ type Snapshot struct {
 		OK       uint64 `json:"ok"`
 		Failed   uint64 `json:"failed"`
 		Rejected uint64 `json:"rejected"`
+		// Deferred counts requests the guarded client saved for later instead of failing them;
+		// DeferOn is the switch that allows it.
+		Deferred uint64 `json:"deferred"`
+		DeferOn  bool   `json:"deferOn"`
 	} `json:"http"`
+	Topics []topicView `json:"topics"`
+}
+
+// topicView is one Kafka topic as the UI shows it.
+type topicView struct {
+	Name     string   `json:"name"`
+	Steps    []string `json:"steps"`
+	Produced uint64   `json:"produced"`
+	Done     uint64   `json:"done"`
+	Stored   uint64   `json:"stored"` // set aside in the dead-letter log, ever
+	Parked   uint64   `json:"parked"`
+	// Paused is true while any breaker in the topic's pipeline is open: the consumer stops
+	// reading the topic, and messages wait in Kafka.
+	Paused bool `json:"paused"`
 }
 
 type snapshotter struct {
@@ -347,6 +390,17 @@ func (s *snapshotter) take(ctx context.Context) Snapshot {
 		sn.Kafka.Backlog = 0
 	}
 	sn.HTTP.Sent, sn.HTTP.OK, sn.HTTP.Failed, sn.HTTP.Rejected = s.a.httpSent.Load(), s.a.httpOK.Load(), s.a.httpFailed.Load(), s.a.httpRejected.Load()
+	sn.HTTP.Deferred, sn.HTTP.DeferOn = s.a.httpDeferred.Load(), s.a.deferOn.Load()
+	for _, d := range topicDefs {
+		c := s.a.topics[d.Name]
+		tv := topicView{Name: d.Name, Steps: d.Steps, Produced: c.produced.Load(), Done: c.done.Load(), Stored: c.stored.Load(), Parked: c.parked.Load()}
+		for _, br := range s.a.pipes[d.Name].Breakers() {
+			if br.State() == obs.StateOpen {
+				tv.Paused = true
+			}
+		}
+		sn.Topics = append(sn.Topics, tv)
+	}
 	return sn
 }
 
@@ -460,6 +514,18 @@ func (a *app) routes(snap *snapshotter) http.Handler {
 			time.Sleep(150 * time.Millisecond)
 			os.Exit(137)
 		}()
+	})
+	// Turns the HTTP client's "save what cannot be sent" switch on or off while it runs.
+	mux.HandleFunc("POST /api/defer", func(w http.ResponseWriter, r *http.Request) {
+		var b struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<10)).Decode(&b); err != nil || b.Enabled == nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		a.deferOn.Store(*b.Enabled)
+		writeJSON(w, http.StatusOK, map[string]bool{"enabled": a.deferOn.Load()})
 	})
 	mux.HandleFunc("POST /api/poison", func(w http.ResponseWriter, r *http.Request) {
 		a.poison()

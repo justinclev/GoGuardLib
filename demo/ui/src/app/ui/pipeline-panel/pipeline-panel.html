@@ -36,6 +36,8 @@
         <div><dt>succeeded</dt><dd class="g">{{ http()?.ok ?? 0 }}</dd></div>
         <div><dt>rejected instantly</dt><dd class="p">{{ http()?.rejected ?? 0 }}</dd></div>
         <div><dt>call failed</dt><dd class="r">{{ http()?.failed ?? 0 }}</dd></div>
+        <div title="Notifications could not be reached, so the HTTP client saved the request in the dead-letter log instead of failing it. Sent when the service is back."><dt>saved for later</dt><dd class="a">{{ http()?.deferred ?? 0 }}</dd></div>
+        <div><dt>saving is</dt><dd [class.a]="http()?.deferOn">{{ http()?.deferOn ? 'on' : 'off' }}</dd></div>
       </dl>
     </article>
   </div>
@@ -43,7 +45,7 @@
   @if (ledger(); as l) {
     <div class="ledger" [class.bad]="l.stuck > 0 || !l.agrees">
       <div class="head">
-        <h3>Delivery ledger <small>every Kafka order followed from produce to done, from events only</small></h3>
+        <h3>Delivery ledger <small>every Kafka message, and every saved HTTP request, followed to done, from events only</small></h3>
         @if (l.stuck === 0 && l.agrees) {
           <span class="ok">✓ 0 unaccounted for · matches the on-disk log</span>
         } @else if (l.stuck > 0) {

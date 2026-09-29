@@ -63,12 +63,16 @@ func (l *ledger) set(id, state string, now time.Time) {
 // observe updates the ledger from one event. Orders it has not seen (produced before
 // a restart, for instance) are adopted as they reappear.
 func (l *ledger) observe(e Event) {
-	if e.Flow != "kafka" || e.ID == "" {
+	if e.ID == "" || (e.Flow != "kafka" && e.Flow != "http") {
 		return
 	}
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if e.Flow == "http" {
+		l.observeHTTP(e, now)
+		return
+	}
 	switch {
 	case e.Type == "request" && e.Status == "new":
 		l.produced++
@@ -91,6 +95,31 @@ func (l *ledger) observe(e Event) {
 		}
 		l.done++
 	case e.Type == "request" && e.Status == "parked":
+		delete(l.st, e.ID)
+		l.parked++
+	}
+}
+
+// observeHTTP follows the HTTP requests that were saved for later. An ordinary HTTP
+// request is answered in the same breath and never enters the ledger; a saved one is
+// work the store now owes, so it is counted like a Kafka message from the moment it is
+// saved until its replay finishes.
+func (l *ledger) observeHTTP(e Event, now time.Time) {
+	switch {
+	case e.Type == "dlq" && (e.Status == "stored" || e.Status == "requeued"):
+		if _, known := l.st[e.ID]; !known && e.Status == "stored" {
+			l.produced++
+		}
+		l.set(e.ID, stStored, now)
+	case e.Type == "dlq" && e.Status == "redrive":
+		if _, known := l.st[e.ID]; !known && l.recovered > 0 {
+			l.recovered--
+		}
+		l.set(e.ID, stRedriving, now)
+	case e.Type == "request" && e.Redriven && e.Status == "success":
+		delete(l.st, e.ID)
+		l.done++
+	case e.Type == "request" && e.Redriven && e.Status == "parked":
 		delete(l.st, e.ID)
 		l.parked++
 	}

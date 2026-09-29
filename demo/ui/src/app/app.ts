@@ -8,11 +8,12 @@ import { KpiStrip } from './ui/kpi-strip/kpi-strip';
 import { PipelinePanel } from './ui/pipeline-panel/pipeline-panel';
 import { RequestFeed } from './ui/request-feed/request-feed';
 import { Story } from './ui/story/story';
+import { TopicsPanel } from './ui/topics-panel/topics-panel';
 import { ThroughputChart } from './ui/throughput-chart/throughput-chart';
 
 @Component({
   selector: 'app-root',
-  imports: [Header, ControlBar, KpiStrip, FlowDiagram, Story, BreakerPanel, ThroughputChart, PipelinePanel, RequestFeed],
+  imports: [Header, ControlBar, KpiStrip, FlowDiagram, Story, BreakerPanel, ThroughputChart, PipelinePanel, RequestFeed, TopicsPanel],
   templateUrl: './app.html',
   styleUrl: './app.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,

@@ -9,7 +9,7 @@ import (
 
 // Event is one thing that happened, streamed to the UI as it happens.
 //
-//	type    "request"  status: new | success | failed | rejected | deferred
+//	type    "request"  status: new | success | failed | rejected | deferred | parked
 //	        "step"     status: started | ok | failed
 //	        "breaker"  service, from, to
 //	        "probe"    service, ok
@@ -18,7 +18,8 @@ type Event struct {
 	T         int64  `json:"t"`
 	Type      string `json:"type"`
 	ID        string `json:"id,omitempty"`
-	Flow      string `json:"flow,omitempty"` // "http" or "kafka"
+	Flow      string `json:"flow,omitempty"`  // "http" or "kafka"
+	Topic     string `json:"topic,omitempty"` // for Kafka events: which topic
 	Step      string `json:"step,omitempty"`
 	Status    string `json:"status,omitempty"`
 	LatencyMs int64  `json:"latencyMs,omitempty"`

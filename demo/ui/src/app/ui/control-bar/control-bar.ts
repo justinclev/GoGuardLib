@@ -20,6 +20,8 @@ export class ControlBar {
 
   readonly http = computed(() => Math.round(this.store.snapshot()?.traffic.httpRps ?? 0));
   readonly kafka = computed(() => Math.round(this.store.snapshot()?.traffic.kafkaRps ?? 0));
+  /** Whether the HTTP client saves notifications it cannot send (the library's Defer switch). */
+  readonly deferOn = computed(() => this.store.snapshot()?.http.deferOn ?? true);
   readonly running = computed(() => this.http() + this.kafka() > 0);
   readonly anyDown = computed(() => (this.store.snapshot()?.services ?? []).some((s) => s.mode !== 'up' && s.mode !== 'unknown'));
 
@@ -47,6 +49,10 @@ export class ControlBar {
 
   preset(http: number, kafka: number): void {
     void this.api.setTraffic({ httpRps: http, kafkaRps: kafka });
+  }
+
+  toggleDefer(): void {
+    void this.api.setDeferral(!this.deferOn());
   }
 
   restoreAll(): void {

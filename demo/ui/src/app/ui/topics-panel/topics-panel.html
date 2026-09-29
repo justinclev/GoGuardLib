@@ -1,0 +1,44 @@
+<section class="panel">
+  <header>
+    <h2>Kafka topics</h2>
+    <span class="hint">one consumer, one dead-letter log, a pipeline per topic</span>
+  </header>
+
+  <div class="cards">
+    @for (t of topics(); track t.name) {
+      <article class="card" [class.paused]="t.paused">
+        <div class="top">
+          <h3>{{ t.name }}</h3>
+          @if (t.paused) {
+            <span class="pill paused" [attr.title]="'A breaker in this topic\'s pipeline is open, so the consumer stopped reading it. Messages wait in Kafka.'">
+              paused · {{ t.blockedBy }}
+            </span>
+          } @else {
+            <span class="pill">reading</span>
+          }
+        </div>
+
+        <ol class="chain" aria-label="pipeline steps">
+          @for (c of t.chips; track c.name) {
+            <li [class]="'chip ' + c.state">{{ c.label }}</li>
+          }
+        </ol>
+
+        <dl>
+          <div><dt>produced</dt><dd>{{ t.produced }}</dd></div>
+          <div><dt>finished</dt><dd class="g">{{ t.done }}</dd></div>
+          <div><dt>set aside</dt><dd class="a">{{ t.stored }}</dd></div>
+          <div><dt>parked</dt><dd [class.r]="t.parked > 0">{{ t.parked }}</dd></div>
+        </dl>
+      </article>
+    } @empty {
+      <p class="none">Waiting for the orchestrator…</p>
+    }
+  </div>
+
+  <p class="fine">
+    Orders and refunds have different steps, so a stored message has to be finished by the pipeline of its own topic
+    (<code>kafka.RedriveFor</code>). They share the Payments and Notifications breakers: take either down and
+    <em>both</em> topics pause. Take Inventory or Shipping down and only <em>orders</em> pauses.
+  </p>
+</section>

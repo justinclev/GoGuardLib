@@ -19,6 +19,16 @@
       <button type="button" (click)="preset(15, 15)">Busy</button>
       <button type="button" (click)="preset(40, 40)">Storm</button>
     </div>
+
+    <label
+      class="switch"
+      [class.on]="deferOn()"
+      title="The HTTP flow's last call is a notification, which can wait. With this on, if Notifications cannot be reached the client saves the request in the dead-letter log, answers the caller, and sends it later. With it off, the request just fails."
+    >
+      <input type="checkbox" role="switch" [checked]="deferOn()" (change)="toggleDefer()" />
+      <span class="track"><i></i></span>
+      <span class="txt">Save HTTP notifications when they can't be sent <b>{{ deferOn() ? 'on' : 'off' }}</b></span>
+    </label>
   </div>
 
   <div class="group right">

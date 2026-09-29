@@ -133,6 +133,62 @@ button {
   }
 }
 
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--muted);
+
+  input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .track {
+    position: relative;
+    width: 38px;
+    height: 22px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.1);
+    transition:
+      background 0.2s,
+      border-color 0.2s;
+
+    i {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #fff;
+      transition: transform 0.2s;
+    }
+  }
+  &.on .track {
+    background: rgba(255, 184, 77, 0.35);
+    border-color: rgba(255, 184, 77, 0.7);
+
+    i {
+      transform: translateX(16px);
+    }
+  }
+  input:focus-visible + .track {
+    outline: 2px solid var(--cyan);
+    outline-offset: 2px;
+  }
+  .txt b {
+    color: var(--text);
+    margin-left: 4px;
+  }
+  &.on .txt b {
+    color: var(--amber);
+  }
+}
+
 .presets,
 .seg {
   display: inline-flex;

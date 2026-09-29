@@ -18,20 +18,22 @@ import (
 // kafkaBackend connects to the real broker when KAFKA_BROKERS is set, and falls
 // back to an in-memory topic otherwise so the demo also runs without Kafka. The
 // consumer under demonstration is the same either way.
-func kafkaBackend(ctx context.Context, brokers, topic string) (kafka.Client, kafka.Producer, string, func(), error) {
+func kafkaBackend(ctx context.Context, brokers string, topics []string) (kafka.Client, kafka.Producer, string, func(), error) {
 	if brokers == "" {
-		b := simkafka.New(topic, 3)
+		b := simkafka.New(topics, 3)
 		return b.Client(), b, "sim", func() {}, nil
 	}
-	if err := ensureTopic(ctx, brokers, topic, 3); err != nil {
-		return nil, nil, "", nil, err
+	for _, topic := range topics {
+		if err := ensureTopic(ctx, brokers, topic, 3); err != nil {
+			return nil, nil, "", nil, err
+		}
 	}
 	client, err := confluent.NewClient(ck.ConfigMap{
 		"bootstrap.servers":  brokers,
 		"group.id":           "goguard-demo",
 		"auto.offset.reset":  "earliest",
 		"session.timeout.ms": 10000,
-	}, []string{topic}, confluent.WithErrorHandler(func(err error) {
+	}, topics, confluent.WithErrorHandler(func(err error) {
 		fmt.Fprintln(os.Stderr, "kafka:", err)
 	}))
 	if err != nil {

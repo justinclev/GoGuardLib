@@ -165,6 +165,11 @@
     border-color: transparent;
     box-shadow: 0 0 9px rgba(197, 107, 255, 0.7);
   }
+  &.deferred {
+    background: var(--amber);
+    border-color: transparent;
+    box-shadow: 0 0 9px rgba(255, 184, 77, 0.7);
+  }
   &.skipped {
     opacity: 0.35;
   }
@@ -247,6 +252,9 @@
     }
     &.rejected {
       border-color: rgba(197, 107, 255, 0.5);
+    }
+    &.deferred {
+      border-color: rgba(255, 184, 77, 0.5);
     }
   }
   .note {

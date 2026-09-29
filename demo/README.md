@@ -11,16 +11,16 @@ Then open **http://localhost:4280**. (Ports are published on localhost only; `BI
 
 ## What you are looking at
 
-Every order passes through **Inventory → Payments → Shipping → Notifications**, whether it arrives as an HTTP request or as a Kafka message. In front of each service sits a **circuit breaker** (the shield). All of that is the real library; the demo code only wires it up.
+Every order passes through **Inventory → Payments → Shipping → Notifications**, whether it arrives as an HTTP request or as a message on the Kafka `orders` topic. A second topic, `refunds`, runs a shorter pipeline (**Payments → Notifications**). In front of each service sits a **circuit breaker** (the shield). All of that is the real library; the demo code only wires it up.
 
 | On screen | What it is |
 |---|---|
 | Cyan dots | HTTP requests. The caller waits for the answer. |
-| Violet dots | Kafka messages (the `orders` topic, three partitions, a guarded consumer with four workers). |
+| Violet dots | Kafka messages (the `orders` and `refunds` topics, three partitions each, one guarded consumer with four workers). |
 | Green burst | The order finished. |
 | Purple bounce at a shield | The breaker is open, so the call was **skipped in about a millisecond** instead of waiting on a dead service. |
 | Red burst at a service | The call failed (refused, timed out, error). |
-| Amber dot flowing into the log | A Kafka message that could not finish, **stored on disk with a checkpoint** of the steps already done. |
+| Amber dot flowing into the log | A Kafka message that could not finish, **stored on disk with a checkpoint** of the steps already done. Also an HTTP notification the client **saved for later** (see below). |
 | Teal dot leaving the log | The **redriver** replaying it, from the failed step, once the circuit closes. |
 
 The commentary panel explains each moment in plain language, the breaker cards show failure rates, the chart shows outcomes per second, and the live request table shows every step of every request (click a row for details).
@@ -45,6 +45,20 @@ Note: while orders are waiting in the log, new Kafka orders for the *same custom
 
 **Bad order** (☠) sends one order the Payments service will always refuse (an invalid card). Retrying can never help, so the pipeline **parks** it for a person: the *parked for a human* counter goes up, it is never retried and never deleted, and the other orders carry on. It is sent under its own Kafka key on purpose: a parked order holds back later orders with the *same* key until someone deals with it, which is the ordering guarantee working as designed.
 
+### Two topics
+
+The **Kafka topics** panel shows `orders` and `refunds` side by side: each has its own steps, tallies and a *reading* or *paused* state. A topic pauses when a breaker in **its own** pipeline is open. Both use the Payments and Notifications breakers, so taking either down pauses both topics; taking Inventory or Shipping down pauses only `orders`. One redriver finishes everything the log holds, and `kafka.RedriveFor` sends each stored message to the pipeline of its own topic (one handler built from a single pipeline would park the other topic's messages as mismatched). About one message in four is a refund.
+
+### Saving HTTP requests for later (the switch)
+
+The HTTP flow's last call, the **notification**, is one that can wait, so it goes through a guarded client (`goguard.New`) with `Policy.Defer`. The toggle **Save HTTP notifications when they can't be sent** flips `Defer.Enabled` while the demo runs, without rebuilding the client or losing its circuit:
+
+1. Take **Notifications** down with the switch **on**. Once its circuit opens, the HTTP client no longer fails the request: it saves it in the same dead-letter log (without its `Authorization` header), answers the caller at once, and the request shows as *in DLQ* with an amber dot. The *saved for later* counter climbs.
+2. Turn the switch **off**. New requests are now **rejected instantly** (purple), as before. Requests already saved stay safe.
+3. **Restore** Notifications. The same redriver replays the saved requests, adds the credential back, and sends each with its idempotency key. They finish as *recovered*, and the ledger still balances.
+
+Only the notification call is deferrable on purpose. A call whose answer the caller needs cannot be saved for later.
+
 Other things worth trying: **slow** (calls exceed the timeout), **flaky** (about half fail, so the breaker hovers), taking down **two** services, the **Storm** preset, and slow motion (0.5×).
 
 ## Is the data real?
@@ -62,10 +76,10 @@ Every number comes from the running system. The service counters come from the f
 
 - `backend/cmd/services` simulates Inventory, Payments, Shipping and Notifications. Each has `/work` and `/health`. Taking one down closes its listener.
 - `backend/cmd/orchestrator` generates traffic and runs the flows with GoGuardLib: `breaker` (with `health` checks), `pipeline` (steps that resume where they stopped), `dlq` (the durable log and the redriver) and `kafka` (the guarded consumer). It streams events and snapshots to the UI over server-sent events.
-- `backend/internal/simkafka` is an in-memory topic used only when `KAFKA_BROKERS` is unset (handy without Docker). The consumer is still the real one.
+- `backend/internal/simkafka` is an in-memory broker with the two topics, used only when `KAFKA_BROKERS` is unset (handy without Docker). The consumer is still the real one.
 - `ui` is an Angular app. The diagram is SVG with a canvas overlay for the particles.
 
-The HTTP flow calls each service through `breaker.Do`. In an application you would normally use the drop-in `goguard.New(...)` `http.RoundTripper` instead, which adds retries, a bulkhead and per-endpoint policies with no code changes to your handlers.
+The first three HTTP steps call their services through `breaker.Do`. The notification step uses the drop-in `goguard.New(...)` `http.RoundTripper`, which is what you would normally use in an application: it adds retries, a bulkhead, per-endpoint policies and, here, `Policy.Defer`, with no code changes to your handlers.
 
 ## Running without Docker
 
@@ -92,6 +106,7 @@ The UI uses these; you can too.
 | `GET /api/state` | The latest snapshot. |
 | `POST /api/traffic` | `{"httpRps": 10, "kafkaRps": 10}` |
 | `POST /api/services/{inventory,payments,shipping,notifications}/mode` | `{"mode": "up" \| "down" \| "slow" \| "flaky"}` |
+| `POST /api/defer` | `{"enabled": true \| false}`: turn saving HTTP notifications on or off. |
 | `POST /api/poison` | Produce one order that ends up parked (see **Bad order**). |
 | `POST /api/crash` | Hard-kill the orchestrator; Docker restarts it and it recovers from the log. |
 | `POST /api/reset` | Bring every service back up. |

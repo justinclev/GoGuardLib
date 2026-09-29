@@ -51,6 +51,8 @@ export class DemoStore {
   private closed: Bucket[] = [];
   private throttle = new Map<string, number>();
   private setAside = new Map<string, number>();
+  private savedHttp = 0;
+  private replayedHttp = 0;
   private redriving = new Map<string, number>();
   private prev: Snapshot | null = null;
   private failedSteps = new Set<string>();
@@ -178,6 +180,7 @@ export class DemoStore {
         seq: ++this.seq,
         id: ev.id,
         flow: ev.flow,
+        topic: ev.topic,
         startedAt: ev.t,
         status: 'active',
         redriven: false,
@@ -214,6 +217,10 @@ export class DemoStore {
       this.finish(r, 'success', ev.t);
     } else if (ev.status === 'failed' || ev.status === 'rejected') {
       this.finish(r, ev.status, ev.t, ev.step, ev.detail);
+    } else if (ev.status === 'deferred') {
+      // An HTTP request whose notification was saved for later: the caller got its answer.
+      r.inDlq = true;
+      this.finish(r, 'deferred', ev.t, ev.step, ev.detail);
     } else if (ev.status === 'parked') {
       r.inDlq = false;
       r.status = 'parked';
@@ -251,6 +258,11 @@ export class DemoStore {
         this.ema('avgRejectMs', 'rejectSamples', ev.latencyMs ?? 0);
         this.rejectedCalls.update((v) => v + 1);
         break;
+      case 'deferred':
+        info.status = 'deferred';
+        info.latencyMs = ev.latencyMs;
+        info.detail = ev.detail;
+        break;
     }
   }
 
@@ -258,6 +270,18 @@ export class DemoStore {
     const r = this.record(ev);
     if (!r) return;
     const step = isStep(ev.step) ? ev.step : undefined;
+    if (ev.flow === 'http') {
+      // A saved HTTP request is not an order set aside mid-way: the request itself has already
+      // been answered (see onRequest), so only track it for the story.
+      if (ev.status === 'stored') {
+        r.inDlq = true;
+        this.savedHttp++;
+      } else if (ev.status === 'redrive') {
+        r.redriven = true;
+        this.replayedHttp++;
+      }
+      return;
+    }
     switch (ev.status) {
       case 'stored': {
         r.inDlq = true;
@@ -383,6 +407,21 @@ export class DemoStore {
     } else if (cur.kafka.pausedPartitions === 0 && prev.kafka.pausedPartitions > 0) {
       this.say('▶️', 'good', 'Kafka consumer resumed', `The circuit is no longer open, so consumption continues where it stopped. Nothing was skipped.`);
     }
+    if (cur.http.deferOn !== prev.http.deferOn) {
+      this.say(
+        cur.http.deferOn ? '💾' : '🚫',
+        'accent',
+        cur.http.deferOn ? 'HTTP deferral switched ON' : 'HTTP deferral switched OFF',
+        cur.http.deferOn
+          ? `When Notifications cannot be reached, the HTTP client now saves the request to the dead-letter log and answers the caller at once.`
+          : `When Notifications cannot be reached, the HTTP client fails the request instead, as it did before. Requests already saved are still sent when the service is back.`,
+      );
+    }
+    const pausedNow = (cur.topics ?? []).filter((t) => t.paused).map((t) => t.name);
+    const pausedBefore = (prev.topics ?? []).filter((t) => t.paused).map((t) => t.name);
+    if (pausedNow.length > 0 && pausedNow.join() !== pausedBefore.join() && pausedBefore.length > 0) {
+      this.say('🧵', 'info', `Now paused: ${pausedNow.join(' and ')}`, `Each topic pauses when a breaker in its own pipeline is open. Orders and refunds share the Payments and Notifications breakers, so an outage there pauses both; an Inventory or Shipping outage pauses only orders.`);
+    }
     if (cur.dlq.parked > prev.dlq.parked) {
       this.say('🧯', 'bad', 'Message parked for a human', `A message that can never succeed (for example an invalid card) was set aside for an operator instead of being retried. It is never deleted automatically, and the orders around it carry on.`);
     }
@@ -430,6 +469,26 @@ export class DemoStore {
         'good',
         `Redriving ${n} order${n === 1 ? '' : 's'}`,
         `Resuming at ${[...new Set(where)].join(', ') || 'the failed step'}: the steps that already succeeded are not repeated, and each call carries its idempotency key.`,
+      );
+    }
+    if (this.savedHttp > 0) {
+      const n = this.savedHttp;
+      this.savedHttp = 0;
+      this.say(
+        '📨',
+        'warn',
+        `${n} HTTP notification${n === 1 ? '' : 's'} saved for later`,
+        `The HTTP client could not send ${n === 1 ? 'it' : 'them'} (the circuit is open), so instead of failing the request it saved ${n === 1 ? 'it' : 'them'} in the same durable log, without the Authorization header. The caller was answered at once. They go out when Notifications is healthy.`,
+      );
+    }
+    if (this.replayedHttp > 0) {
+      const n = this.replayedHttp;
+      this.replayedHttp = 0;
+      this.say(
+        '📤',
+        'good',
+        `Sending ${n} saved HTTP notification${n === 1 ? '' : 's'}`,
+        `The same redriver that resumes Kafka orders now replays saved HTTP requests, adding the credential back and sending each with its idempotency key so a repeat cannot do the work twice.`,
       );
     }
     const s = this.snapshot();

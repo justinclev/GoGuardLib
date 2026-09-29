@@ -171,6 +171,9 @@ export class FlowEngine {
     if (!p) return;
     if (ev.status === 'success') {
       p.queue.push({ k: 'color', color: COLORS.ok }, { k: 'pulse' }, { k: 'burst', color: COLORS.ok, n: 10 }, { k: 'fade', dur: 420 });
+    } else if (ev.flow === 'http' && ev.status === 'deferred') {
+      // Saved for later: the dead-letter event already sent it to the log, where it waits
+      // until the redriver sends it. Nothing to add here.
     } else if (ev.flow === 'http') {
       // failed or rejected: the step event already drew the impact
       p.queue.push({ k: 'hold', dur: 260 }, { k: 'fade', dur: 420 });

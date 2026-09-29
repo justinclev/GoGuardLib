@@ -31,6 +31,11 @@ export class ApiService {
     return this.post('/api/poison');
   }
 
+  /** Turns on or off saving the HTTP client's notifications when they cannot be sent. Takes effect at once. */
+  setDeferral(enabled: boolean): Promise<void> {
+    return this.post('/api/defer', { enabled });
+  }
+
   restoreAll(): Promise<void> {
     return this.post('/api/reset');
   }

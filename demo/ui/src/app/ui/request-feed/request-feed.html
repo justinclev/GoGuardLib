@@ -26,7 +26,7 @@
       <div class="row" [class]="'row ' + r.status" [class.redriven]="r.redriven" [class.expanded]="open() === r.id" (click)="toggle(r.id)">
         <span class="t">{{ r.startedAt | date: 'HH:mm:ss' }}</span>
         <span class="id">{{ r.id }}</span>
-        <span><i class="flow" [class]="'flow ' + r.flow">{{ r.flow === 'http' ? 'HTTP' : 'Kafka' }}</i></span>
+        <span><i class="flow" [class]="'flow ' + r.flow">{{ r.flow === 'http' ? 'HTTP' : (r.topic ?? 'Kafka') }}</i></span>
         <span class="dots">
           @for (s of steps; track s) {
             <i [class]="'dot ' + r.steps[s].status" [attr.title]="tip(r, s)"></i>
@@ -49,7 +49,9 @@
                 }
               </div>
             }
-            @if (r.inDlq) {
+            @if (r.inDlq && r.flow === 'http') {
+              <p class="note">The notification could not be sent, so the HTTP client saved it in the durable dead-letter log (without its Authorization header) and answered the caller. It is sent when the service is healthy.</p>
+            } @else if (r.inDlq) {
               <p class="note">Stored in the durable dead-letter log with a checkpoint. It resumes at the blocked step, and the steps before it are not repeated.</p>
             }
             @if (r.redriven) {
