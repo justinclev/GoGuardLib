@@ -59,3 +59,30 @@ func TestRollingWindow_Rotate_Full(t *testing.T) {
 		t.Errorf("expected 0 success after full rotation, got %d", w.totalSuccess)
 	}
 }
+
+func TestBreakerStateString(t *testing.T) {
+	for s, want := range map[BreakerState]string{StateClosed: "closed", StateOpen: "open", StateHalfOpen: "half-open", 42: "unknown"} {
+		if s.String() != want {
+			t.Errorf("%d -> %q, want %q", int(s), s.String(), want)
+		}
+	}
+}
+
+// When every request fails there are no successes; retries must still count
+// against the budget or a full outage would trigger unlimited retries.
+func TestRetryRateCountsFailuresAsTraffic(t *testing.T) {
+	w := NewRollingWindow(time.Second, 100*time.Millisecond)
+	now := time.Now().UnixNano()
+	if w.RetryRateBps() != 0 {
+		t.Fatal("empty window must report 0")
+	}
+	for i := 0; i < 8; i++ {
+		w.Failure(now)
+	}
+	for i := 0; i < 2; i++ {
+		w.RecordRetry(now)
+	}
+	if got := w.RetryRateBps(); got != 2000 { // 2 retries / 10 total
+		t.Fatalf("RetryRateBps = %d, want 2000", got)
+	}
+}

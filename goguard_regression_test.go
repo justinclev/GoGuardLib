@@ -1,13 +1,17 @@
 package goguard
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/justinclev/GoGuardLib/obs"
 )
 
 type trackedBody struct {
@@ -30,47 +34,20 @@ func TestRetriedResponseBodyIsClosed(t *testing.T) {
 			}
 			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("ok"))}, nil
 		}},
-		MaxRetries: 1,
-	})
+	}, WithEndpoint("svc", Host("retry.test"), Policy{MinSamples: 100}, WithRetries(1)))
 	defer rt.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, "http://retry.test/", nil)
-	resp, err := rt.RoundTrip(req)
+	resp, err := get(t, rt, "http://retry.test/")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resp.Body.Close()
-
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200 after retry", resp.StatusCode)
 	}
 	if atomic.LoadInt32(&first.closed) != 1 {
 		t.Fatal("body of the retried 503 response was leaked")
 	}
-}
-
-// RequestTimeout must not cancel the request before the caller has read the
-// response body.
-func TestBodyReadableAfterRoundTripWithTimeout(t *testing.T) {
-	rt := NewResilientTransport(Config{
-		RequestTimeout: time.Minute,
-		Transport: &mockTransport{roundTrip: func(req *http.Request) (*http.Response, error) {
-			body := &ctxBody{req: req, data: strings.NewReader("payload")}
-			return &http.Response{StatusCode: 200, Body: body}, nil
-		}},
-	})
-	defer rt.Close()
-
-	req, _ := http.NewRequest(http.MethodGet, "http://body.test/", nil)
-	resp, err := rt.RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := io.ReadAll(resp.Body)
-	if err != nil || string(got) != "payload" {
-		t.Fatalf("read = %q, %v; want payload", got, err)
-	}
-	resp.Body.Close()
 }
 
 type ctxBody struct {
@@ -86,74 +63,93 @@ func (b *ctxBody) Read(p []byte) (int, error) {
 }
 func (b *ctxBody) Close() error { return nil }
 
-// A latency-outlier failure on a 2xx used to skip MarkFailure and leak its
-// in-flight slot, eventually starving the bulkhead.
-func TestOutlierFailureReleasesSlot(t *testing.T) {
+// RequestTimeout must not cancel the request before the caller has read the body.
+func TestBodyReadableAfterRoundTripWithTimeout(t *testing.T) {
 	rt := NewResilientTransport(Config{
-		MaxLatency:       5 * time.Millisecond,
-		MaxInflight:      1,
-		FailureThreshold: 1.0,
-		MinSamples:       1000, // never trips; only slot accounting is under test
+		Transport: &mockTransport{roundTrip: func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: &ctxBody{req: req, data: strings.NewReader("payload")}}, nil
+		}},
+	}, WithEndpoint("svc", Host("body.test"), Policy{}, WithTimeout(time.Minute)))
+	defer rt.Close()
+
+	resp, err := get(t, rt, "http://body.test/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil || string(got) != "payload" {
+		t.Fatalf("read = %q, %v; want payload", got, err)
+	}
+	resp.Body.Close()
+}
+
+// A latency failure on a 2xx used to skip MarkFailure and leak its in-flight
+// slot, eventually starving the bulkhead.
+func TestMaxLatencyFailureReleasesSlot(t *testing.T) {
+	rt := NewResilientTransport(Config{
 		Transport: &mockTransport{roundTrip: func(*http.Request) (*http.Response, error) {
 			time.Sleep(20 * time.Millisecond)
-			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+			return okResp(), nil
 		}},
-	})
+	}, WithEndpoint("svc", Host("slow.test"), Policy{MaxLatency: 5 * time.Millisecond, MinSamples: 1000}, WithBulkhead(1, 0)))
 	defer rt.Close()
 
 	for i := 0; i < 3; i++ {
-		req, _ := http.NewRequest(http.MethodGet, "http://slow.test/", nil)
-		resp, err := rt.RoundTrip(req)
+		resp, err := get(t, rt, "http://slow.test/")
 		if err != nil {
 			t.Fatalf("request %d rejected: %v", i, err)
 		}
 		resp.Body.Close()
 	}
+	if got := rt.Stats().Breakers[0]; got.Failure != 3 || got.Inflight != 0 {
+		t.Fatalf("stats = %+v, want 3 failures and no leaked slot", got)
+	}
 }
 
 func TestCloseIsIdempotentAndBlocksNewRequests(t *testing.T) {
-	rt := NewResilientTransport(Config{MaxIdleTime: 10 * time.Millisecond, Transport: &mockTransport{
-		roundTrip: func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
-		},
-	}})
+	rt := NewResilientTransport(Config{
+		MaxIdleTime: 10 * time.Millisecond,
+		Transport:   &mockTransport{roundTrip: func(*http.Request) (*http.Response, error) { return okResp(), nil }},
+	})
 	if err := rt.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := rt.Close(); err != nil {
 		t.Fatal(err)
 	}
-	req, _ := http.NewRequest(http.MethodGet, "http://closed.test/", nil)
-	if _, err := rt.RoundTrip(req); err == nil {
+	if _, err := get(t, rt, "http://closed.test/"); err == nil {
 		t.Fatal("RoundTrip succeeded after Close")
 	}
 }
 
+func heartbeatPolicy(probe func(string) error) Policy {
+	return Policy{
+		FailureThreshold: 0.5, MinSamples: 1, SleepWindow: time.Hour,
+		HeartbeatInterval: 5 * time.Millisecond, HeartbeatFunc: probe,
+	}
+}
+
+func downTransport() http.RoundTripper {
+	return &mockTransport{roundTrip: func(*http.Request) (*http.Response, error) { return nil, errors.New("down") }}
+}
+
 // The heartbeat used to start only when OnStateChange was configured.
-func TestHeartbeatRunsWithoutOnStateChange(t *testing.T) {
+func TestHeartbeatRunsWithoutAnyHook(t *testing.T) {
 	var probes int32
-	rt := NewResilientTransport(Config{
-		FailureThreshold:  0.5,
-		SleepWindow:       time.Hour,
-		HeartbeatInterval: 5 * time.Millisecond,
-		HeartbeatFunc: func(string) error {
+	rt := NewResilientTransport(Config{Transport: downTransport()},
+		WithEndpoint("svc", Host("hb.test"), heartbeatPolicy(func(string) error {
 			atomic.AddInt32(&probes, 1)
 			return errors.New("still down")
-		},
-		Transport: &mockTransport{roundTrip: func(*http.Request) (*http.Response, error) {
-			return nil, errors.New("down")
-		}},
-	})
+		})))
 
-	req, _ := http.NewRequest(http.MethodGet, "http://hb.test/", nil)
-	_, _ = rt.RoundTrip(req) // trips the breaker
+	_, _ = get(t, rt, "http://hb.test/") // trips the circuit
 
 	deadline := time.Now().Add(2 * time.Second)
 	for atomic.LoadInt32(&probes) == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if atomic.LoadInt32(&probes) == 0 {
-		t.Fatal("heartbeat never probed an open breaker")
+		t.Fatal("heartbeat never probed an open circuit")
 	}
 
 	rt.Close() // must wait for the heartbeat goroutine
@@ -161,6 +157,40 @@ func TestHeartbeatRunsWithoutOnStateChange(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	if atomic.LoadInt32(&probes) != n {
 		t.Fatal("heartbeat kept probing after Close returned")
+	}
+	if got := rt.Stats().Breakers[0].Inflight; got != 0 {
+		t.Fatalf("probes drifted the in-flight count to %d", got)
+	}
+}
+
+func TestHeartbeatDefaultProbeHitsHost(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			atomic.AddInt32(&hits, 1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	rt := NewResilientTransport(Config{}, WithEndpoint("svc", Host(hostOf(srv)), Policy{
+		FailureThreshold: 0.1, MinSamples: 1, SleepWindow: time.Hour, HeartbeatInterval: 20 * time.Millisecond,
+	}))
+	defer rt.Close()
+
+	e := rt.getEntry(rt.endpoints[0], hostOf(srv))
+	p, err := e.breaker.Acquire(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Failure() // opens the circuit and starts the heartbeat
+
+	deadline := time.Now().Add(3 * time.Second)
+	for atomic.LoadInt32(&hits) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&hits) == 0 {
+		t.Fatal("default heartbeat never sent a HEAD request")
 	}
 }
 
@@ -170,5 +200,29 @@ func TestStateStringAndAliases(t *testing.T) {
 		if s.String() != want {
 			t.Errorf("State(%d).String() = %q, want %q", int(s), s.String(), want)
 		}
+	}
+}
+
+type sinkFunc func()
+
+func (f sinkFunc) Emit(obs.Event) { f() }
+
+func TestWithEventsAndNoHeartbeatAfterClose(t *testing.T) {
+	var got int32
+	rt := NewResilientTransport(Config{Transport: downTransport()},
+		WithEvents(sinkFunc(func() { atomic.AddInt32(&got, 1) })),
+		WithEndpoint("svc", Host("ev.test"), heartbeatPolicy(func(string) error { return errors.New("down") })))
+
+	_, _ = get(t, rt, "http://ev.test/") // trips the circuit
+	if atomic.LoadInt32(&got) == 0 {
+		t.Fatal("WithEvents sink received no StateChanged event")
+	}
+	rt.Close()
+
+	// After Close no worker may be started, and the transport refuses requests.
+	e := &entry{ep: rt.endpoints[0]}
+	rt.startHeartbeat(e)
+	if atomic.LoadInt32(&e.hbRunning) != 0 {
+		t.Fatal("heartbeat started after Close")
 	}
 }

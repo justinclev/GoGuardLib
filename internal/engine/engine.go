@@ -146,13 +146,18 @@ func (w *RollingWindow) FailureRateBps(now int64) int64 {
 	return (failure * 10000) / total
 }
 
+// RetryRateBps returns retries as a share of all traffic (finished requests
+// plus retries) in basis points. Failures count as traffic: when every request
+// is failing, retries must still be limited.
 func (w *RollingWindow) RetryRateBps() int64 {
 	success := atomic.LoadInt64(&w.totalSuccess)
+	failure := atomic.LoadInt64(&w.totalFailure)
 	retries := atomic.LoadInt64(&w.totalRetries)
-	if success <= 0 {
+	total := success + failure + retries
+	if total <= 0 {
 		return 0
 	}
-	return (retries * 10000) / (success + retries)
+	return (retries * 10000) / total
 }
 
 func (w *RollingWindow) AvgLatencyUs() int64 {

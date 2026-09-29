@@ -65,3 +65,51 @@ func TestProbeResultsDoNotTouchInflight(t *testing.T) {
 		t.Fatalf("inflight = %d after probes, want 0", got)
 	}
 }
+
+func TestAllowExReportsWhyRejected(t *testing.T) {
+	var seed uint64 = 1
+	ctx := context.Background()
+
+	b := NewBreaker(0.5, time.Hour, time.Second, 100*time.Millisecond, 1, 0, false, 0)
+	if v := b.AllowEx(ctx, 0, &seed, false); v != Admitted {
+		t.Fatalf("first request: %v", v)
+	}
+	if v := b.AllowEx(ctx, 0, &seed, false); v != RejectedBulkhead {
+		t.Fatalf("second request: got %v, want RejectedBulkhead", v)
+	}
+	if v := b.AllowEx(ctx, 0, &seed, true); v != Admitted {
+		t.Fatalf("VIP request must bypass the bulkhead, got %v", v)
+	}
+
+	b.SetOverride(1)
+	if v := b.AllowEx(ctx, 0, &seed, false); v != RejectedOpen {
+		t.Fatalf("forced open: got %v", v)
+	}
+	if b.Inflight() != 2 {
+		t.Fatalf("Inflight = %d, want 2", b.Inflight())
+	}
+}
+
+// An abandoned half-open probe must free the probe slot; otherwise the breaker
+// would stay half-open forever.
+func TestAbandonedProbeFreesProbeSlot(t *testing.T) {
+	var seed uint64 = 1
+	ctx := context.Background()
+	b := NewBreaker(0.5, 10*time.Millisecond, time.Second, 100*time.Millisecond, 0, 0, false, 0)
+	b.MarkFailure() // open
+	time.Sleep(60 * time.Millisecond)
+
+	if !b.Allow(ctx, 0, &seed, false) {
+		t.Fatal("probe not admitted after sleep window")
+	}
+	if b.Allow(ctx, 0, &seed, false) {
+		t.Fatal("second probe admitted while one is in flight")
+	}
+	b.Abandon()
+	if !b.Allow(ctx, 0, &seed, false) {
+		t.Fatal("probe slot not released by Abandon")
+	}
+	if b.FailureRateBps() != 10000 {
+		t.Fatalf("FailureRateBps = %d, want 10000", b.FailureRateBps())
+	}
+}

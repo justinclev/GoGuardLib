@@ -134,24 +134,57 @@ func (b *Breaker) circuitAllows(shardSeed *uint64) bool {
 	}
 }
 
-func (b *Breaker) Allow(ctx context.Context, waitTimeout time.Duration, shardSeed *uint64, isVIP bool) bool {
+// Verdict is the outcome of an admission decision.
+type Verdict int
+
+const (
+	Admitted Verdict = iota
+	RejectedOpen
+	RejectedBulkhead
+)
+
+// AllowEx decides whether a request is admitted and says why not when it is
+// rejected. An admitted request holds an in-flight slot until MarkSuccess,
+// MarkFailure or Abandon.
+func (b *Breaker) AllowEx(ctx context.Context, waitTimeout time.Duration, shardSeed *uint64, isVIP bool) Verdict {
 	switch atomic.LoadInt32(&b.override) {
 	case 1:
-		return false
+		return RejectedOpen
 	case 2:
 		atomic.AddInt32(&b.inflight, 1)
-		return true
+		return Admitted
 	}
 
 	if !b.acquire(ctx, waitTimeout, isVIP) {
-		return false
+		return RejectedBulkhead
 	}
 	if !b.circuitAllows(shardSeed) {
 		atomic.AddInt32(&b.inflight, -1)
-		return false
+		return RejectedOpen
 	}
-	return true
+	return Admitted
 }
+
+func (b *Breaker) Allow(ctx context.Context, waitTimeout time.Duration, shardSeed *uint64, isVIP bool) bool {
+	return b.AllowEx(ctx, waitTimeout, shardSeed, isVIP) == Admitted
+}
+
+// Abandon releases an admitted request's slot without recording an outcome,
+// for requests cancelled by the caller rather than failed by the dependency.
+// A half-open probe that is abandoned frees the probe slot so another request
+// can take over.
+func (b *Breaker) Abandon() {
+	atomic.AddInt32(&b.inflight, -1)
+	if b.state.Get() == engine.StateHalfOpen {
+		atomic.StoreInt32(&b.probing, 0)
+	}
+}
+
+// Inflight returns the number of admitted requests that have not finished.
+func (b *Breaker) Inflight() int32 { return atomic.LoadInt32(&b.inflight) }
+
+// FailureRateBps returns the failure rate over the sampling window in basis points.
+func (b *Breaker) FailureRateBps() int64 { return b.metrics.FailureRateBps(time.Now().UnixNano()) }
 
 func (b *Breaker) CanRetry() bool {
 	if b.retryBudgetBps <= 0 {
