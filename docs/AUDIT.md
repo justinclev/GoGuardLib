@@ -31,10 +31,10 @@ A review of every non-test source file (about 7,000 lines across the core module
 | 19 | Confluent adapter hides broker errors and message-level errors | Reliability / usability | Medium | Fixed |
 | 20 | No dependency vulnerability scanning or update automation | Security | Medium | Added (unverified locally) |
 | 21 | Lease, Get and Parked read payloads from disk under the store lock | Scalability | Medium | Fixed (two-phase lease) |
-| 22 | Kafka consumer processes one message at a time | Scalability | Medium | Open (design) |
-| 23 | Records are protected by CRC only; `Secure` does not authenticate metadata | Security | Medium | Open (documented) |
-| 24 | No free-disk-space guard; compaction needs up to 2x live data | Reliability | Medium | Open (documented) |
-| 25 | Dead-letter mirror and `OnPark` send payloads in clear | Security | Info | By design, documented |
+| 22 | Kafka consumer processes one message at a time | Scalability | Medium | Fixed (`Config.Workers`) |
+| 23 | Records are protected by CRC only; `Secure` does not authenticate metadata | Security | Medium | Fixed (optional signing) |
+| 24 | No free-disk-space guard; compaction needs up to 2x live data | Reliability | Medium | Fixed (`MinFreeBytes`) |
+| 25 | Dead-letter mirror sends payloads in clear | Security | Info | Fixed (opt-in sealing) |
 
 ## Findings that were fixed
 
@@ -164,23 +164,41 @@ Added a `vuln` CI job (`go mod verify` plus `govulncheck` on both modules), a `m
 
 **Verified by.** With every lease read stalled for 20 ms, the worst `Append` took 0.27 ms (`TestAppendLatencyIsIndependentOfSlowReads`); other operations and a second lease proceed while a read is in flight; twelve concurrent leasers over 300 records never share one; a checkpoint, ack or park by an old worker mid-read is never handed out stale; a compaction mid-read returns intact payloads and parks nothing; reservations are released on cancellation, close and unreadable payloads; the file cache survives concurrent eviction, drops and close under `-race`. Five mutations each fail a test: skipping the version check, the reservation, the locked retry, the release on error, and holding the lock across the read. Single-threaded lease cost is unchanged within noise (about 9 µs for a lease and release on disk).
 
-## Findings that remain, and why
+### 22. Sequential consumer (Medium, scalability)
 
-### 22. Sequential consumer (Medium, open by design)
+**Was.** One `Consumer` processed one message at a time, so throughput per consumer was `1 / message latency`.
 
-One `Consumer` processes one message at a time, so throughput per consumer is `1 / message latency`. Scale by running more consumers in the group (each owns its partitions). A per-partition worker pool would have to preserve per-key ordering, commit only contiguous safe offsets, and stay correct across rebalances; that is a feature with its own design and test matrix, not an audit fix.
+**Now.** `Config.Workers` (default 1, which behaves exactly as before) processes messages with a pool while keeping the guarantees. All Kafka client calls stay on the polling goroutine; workers only run the pipeline. Commits stay contiguous: each partition tracks the lowest unfinished offset and an offset is committed only when everything before it is safe, so a slow message holds back the commit but not the other messages. Messages with the same key in a partition run one at a time in offset order on whichever worker is free (a per-key queue, so unrelated keys never wait behind a slow one), and a message that fails discards the later messages queued behind it. A failed message is retried after the running work drains: the partition is seeked to its first unfinished offset, and the messages after it that already finished are remembered and skipped when redelivered, so they do not run twice. `MaxInFlight` bounds what is fetched but unfinished; beyond it the partitions are paused (with hysteresis). A revoked partition commits only its contiguous finished prefix and discards results from the old assignment; shutdown cancels the workers, applies what finished, and commits the contiguous prefix.
 
-### 23. Integrity of stored records (Medium, open)
+**Verified by.** The existing 27-test consumer suite passes unchanged with the one-worker path, which now shares the new state machine. New tests: real concurrency and speed-up with four workers; per-key order across workers with random delays; commits never pass a running message (and jump when it finishes); a failed message retried without re-running finished ones; a later same-key message never overtaking a failed one; revocation with work in flight loses nothing; shutdown with work in flight commits only the finished prefix and leaks no goroutines; `MaxInFlight` pauses fetching; and a randomised test with failing steps and a flapping store over several partitions and keys that checks no message is lost and no key is reordered. Six mutations (commit past an unfinished message, keep queued messages after a failure, re-run finished messages, no per-key serialisation, no throttle) each fail a test; one guard (refusing new messages while a partition drains) is redundant with the dispatch check and is kept as defence in depth. Repeated `-race` runs (8x) are clean.
 
-The WAL protects against torn and rotted writes with CRC-32C, not against deliberate modification, and `dlq.Secure` authenticates each sealed payload field (bound to record ID and field) but not the metadata beside them (state, `BlockedOn`, `OrderKey`, timestamps). Someone able to write the WAL directory can alter that metadata; they could also delete the directory, so the directory permissions (`0700`, enforced at open) are the control. If tamper evidence matters, the HMAC signer in `secure` could sign whole frames; that changes the on-disk format and is a deliberate decision, not a patch.
+### 23. Integrity of stored records (Medium, security)
 
-### 24. Disk space (Medium, open)
+**Was.** The WAL protected against torn and rotted writes with CRC-32C, which anyone with write access can recompute, and `dlq.Secure` authenticated payload fields but not the metadata beside them.
 
-`MaxBytes` bounds live data, not free space. Compaction writes a full snapshot beside the old files, so disk use can briefly reach about twice the live data plus the log. A full disk fails the write safely (the write is rolled back, the store keeps serving reads, the consumer backs off) and fails compaction cleanly (temporary file removed), but there is no early warning. Alert on free space and size the volume at 2x `MaxBytes` plus segment headroom. `WALStats().LastCompactionErr` surfaces a compaction that cannot finish.
+**Now.** `WALOptions.Signer` (a `secure.NewHMAC` signer, keys with IDs for rotation) signs every log entry and snapshot record over a domain string, segment-or-snapshot, LSN, type and body. Open refuses a log whose entries do not verify (`ErrTampered`, also `ErrCorrupt`) and never repairs it, even in the last segment where an invalid CRC would be repaired; a payload changed on disk after open is never handed out (it is parked as unreadable). A deleted entry breaks LSN contiguity and a snapshot's footer carries the record count. Files carry a signed flag in their header, so an existing log moves to signing without a rewrite: `AcceptUnsignedLegacy` reads the old files, new entries go to a fresh signed segment, the next compaction writes a signed snapshot, and `Recovery().UnsignedFiles` says when it is safe to turn the flag off. Signing cannot show that the newest entries were cut off the end of the log (documented). Cost: about 36 bytes per entry with a short key ID and one HMAC per entry.
 
-### 25. Payloads leaving the store (Info)
+**Verified by.** The conformance suite passes with a signer (default, tiny segments with compaction, in-memory payloads); forged entries (a flipped body byte in the first, middle and last entry, a changed type, a stripped signature, one entry copied over another, a forged snapshot record) are all refused with no quarantine file created; a forged payload after open is never handed out; the wrong key, an unknown key ID and a missing signer are refused; key rotation keeps old entries readable; migration keeps every record and ends with no unsigned files. Mutations (verification skipped, LSN or type left out of the signature, payload reads unverified, appending into a legacy segment) each fail a test.
 
-`Redriver.OnPark` and the Kafka dead-letter mirror pass the message payload to code and topics you choose. That is the purpose, is opt-in and is documented; encrypt with `dlq.Secure` before mirroring if the topic is less trusted than the store.
+### 24. Disk space (Medium, reliability)
+
+**Was.** `MaxBytes` bounded live data, not free space; compaction writes a snapshot as large as the live data beside the old files.
+
+**Now.** `WALOptions.MinFreeBytes` (default 64 MiB, negative disables) keeps that much free on the log's volume. Below it `Append` and `Checkpoint` return an error matching both `ErrFull` and `ErrDiskLow`, so consumers pause instead of driving the disk to zero; acks, parks and requeues, which free space, are never refused. The volume is measured at most every 200 ms and bytes written since are subtracted, so a fast writer cannot outrun a stale reading. Compaction, in both storage modes, waits until the snapshot fits (the refusal is reported in `WALStats().LastCompactionErr`). `WALStats` reports `DiskFreeBytes` and `DiskLow`. A failed measurement does not block work.
+
+**Verified by.** Growth is refused and nothing stored on refusal, finishing work still works, recovery once space returns, the written-bytes accounting, compaction refused and then run once there is room (both modes), and the disabled and failed-measurement cases. Mutations (no check in `Append`, no accounting of bytes written) fail tests.
+
+### 25. Payloads leaving the store (Info, security)
+
+**Was.** The dead-letter mirror copied the message key, value and headers to a Kafka topic in clear.
+
+**Now.** `kafka.PublisherConfig.Encryptor` seals the key, value and every header value with AAD binding them to the record and field, adds an `x-goguard-sealed` marker, and keeps header names and `x-goguard-*` metadata readable; `kafka.OpenDeadLetter` reverses it and refuses moved, tampered or unsealed messages. Without an encryptor the behaviour is unchanged and documented. `Redriver.OnPark` still hands the record to your code, which is your decision.
+
+**Verified by.** No secret appears in a sealed message; a round trip restores key, value and headers (including a nil header value); ciphertext moved to another record does not open; an unsealed message returns `ErrNotSealed`.
+
+## Findings that remain
+
+None open from this audit. `govulncheck` (finding 20) and the real-broker integration suite have not been run in this environment; both run in CI.
 
 ## What was checked and found sound
 
@@ -194,5 +212,5 @@ Recorded so the next reviewer does not repeat it.
 ## Suggested next steps
 
 1. Run `make kafka-integration` against a broker and the new `vuln` job once in CI.
-2. Decide on finding 23 (frame signing) if the threat model includes someone with write access to the volume.
-3. Add Prometheus / OpenTelemetry adapters as separate modules so `Stats()` and events are scraped without glue code.
+2. Add Prometheus / OpenTelemetry adapters as separate modules so `Stats()` and events are scraped without glue code.
+3. Run the consumer with `Workers > 1` against a real broker under load before relying on it in production; the simulated broker exercises the ordering and commit logic, not librdkafka's buffering.

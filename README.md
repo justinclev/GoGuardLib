@@ -305,7 +305,9 @@ Only the topics you bind are consumed and guarded. For every message the consume
 
 `confluent.NewClient` takes `confluent.WithErrorHandler(func(error))` for the errors librdkafka retries by itself (brokers unreachable, authentication failing): without it an unreachable cluster looks like an idle topic. A message that arrives carrying an error stops the consumer rather than being skipped.
 
-**Requirements and limits.** Processing is sequential per consumer (scale by running more consumers in the group), and one message's processing must stay under `max.poll.interval.ms` (`ProcessTimeout` bounds it). Set `auto.offset.reset` yourself; auto-commit and offset-storing are forced off. Run the integration tests against a broker with `KAFKA_BROKERS=host:9092 make kafka-integration`.
+**Concurrency.** By default a consumer handles one message at a time, in offset order. Set `Config.Workers` to process several at once: messages are handled by a pool (`MaxInFlight`, default 4 per worker, bounds what is fetched but unfinished; beyond it the partitions are paused) while commits stay contiguous, so an offset is committed only when it and everything before it in its partition is safe. Messages with the same key in a partition run one at a time in offset order, and a message that fails stops the later ones with its key from starting; different keys never wait for each other. A failed message is retried from its offset after a backoff, and the messages after it that already finished are remembered and not run again. If a partition is revoked while messages are running, only the contiguous finished prefix is committed and the new owner re-reads the rest (storing is idempotent and steps carry idempotency keys). Your pipeline steps run concurrently, so they must be safe for that.
+
+**Requirements and limits.** One message's processing must stay under `max.poll.interval.ms` (`ProcessTimeout` bounds it). Set `auto.offset.reset` yourself; auto-commit and offset-storing are forced off. Run the integration tests against a broker with `KAFKA_BROKERS=host:9092 make kafka-integration`.
 
 ## Upgrading from the guard-everything transport
 
