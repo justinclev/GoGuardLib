@@ -53,6 +53,10 @@ export class ControlBar {
     void this.api.restoreAll();
   }
 
+  badOrder(): void {
+    void this.api.sendBadOrder();
+  }
+
   crash(): void {
     void this.api.crash();
   }

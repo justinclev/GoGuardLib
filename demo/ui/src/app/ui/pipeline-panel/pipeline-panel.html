@@ -25,7 +25,7 @@
         <div><dt>redriven ok</dt><dd class="g">{{ dlq()?.redriven ?? 0 }}</dd></div>
         <div><dt>oldest</dt><dd>{{ oldest() }}</dd></div>
         <div><dt>parked for a human</dt><dd [class.r]="(dlq()?.parked ?? 0) > 0">{{ dlq()?.parked ?? 0 }}</dd></div>
-        <div><dt>held in order</dt><dd>{{ kafka()?.held ?? 0 }}</dd></div>
+        <div title="Orders for the same customer are kept in sequence: while an earlier one is set aside, later ones wait behind it, so nothing is processed out of order."><dt>held in order</dt><dd>{{ kafka()?.held ?? 0 }}</dd></div>
       </dl>
     </article>
 

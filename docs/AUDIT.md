@@ -239,6 +239,8 @@ After the fixes above, the code they added or changed (the queue index, the two-
 
 **T2-T5.** The demo suppresses duplicate stored events, requires an `X-Requested-With` header on every POST, binds to `127.0.0.1` unless `BIND` is set, adds security headers in nginx, and seeds the ledger from the WAL at startup. The demo shows measured numbers only: no figure is invented, averages come from observed samples, and the success rate is blank until there is data.
 
+**Demo scenario added.** A "bad order" is refused permanently by Payments and parked. The first version used a customer key shared with normal traffic, and the ordering guarantee (correctly) held back every later order for that customer behind the parked one, 24 orders behind 3 bad ones, which contradicted "the rest carries on". Bad orders now use their own key; the README states the same-key behaviour plainly. Checked natively: 51 produced, 48 done, 3 parked, none held, ledger agrees. slow, flaky and the guided demo were also driven in Chromium with no console errors.
+
 ## What was checked and found sound
 
 Recorded so the next reviewer does not repeat it.

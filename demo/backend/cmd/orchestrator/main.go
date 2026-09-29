@@ -100,6 +100,7 @@ func run() error {
 		return err
 	}
 	defer closeKafka()
+	a.poison = func() { a.produceOrder(producer, topic, true) }
 
 	consumer, err := kafka.NewConsumer(kafka.Config{
 		Client: client, Store: store,
@@ -459,6 +460,10 @@ func (a *app) routes(snap *snapshotter) http.Handler {
 			time.Sleep(150 * time.Millisecond)
 			os.Exit(137)
 		}()
+	})
+	mux.HandleFunc("POST /api/poison", func(w http.ResponseWriter, r *http.Request) {
+		a.poison()
+		w.WriteHeader(http.StatusAccepted)
 	})
 	mux.HandleFunc("POST /api/reset", func(w http.ResponseWriter, r *http.Request) {
 		a.forward(w, r, a.control+"/control/reset", nil)

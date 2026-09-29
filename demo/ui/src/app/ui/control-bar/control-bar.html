@@ -28,6 +28,9 @@
       }
     </div>
     <button type="button" class="ghost" [disabled]="!anyDown()" (click)="restoreAll()">Restore all</button>
+    <button type="button" class="ghost" (click)="badOrder()" title="Send one order the payments service will always refuse. It is set aside for a person: never retried, never deleted, and the other orders carry on.">
+      ☠ Bad order
+    </button>
     <button type="button" class="crash" (click)="crash()" title="Kill the consumer process without warning. The dead-letter log is on disk, so nothing stored is lost.">
       ⚡ Crash consumer
     </button>

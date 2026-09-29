@@ -26,6 +26,11 @@ export class ApiService {
     return this.post('/api/crash');
   }
 
+  /** Sends one order that the payments service will always refuse, so it ends up parked for a person. */
+  sendBadOrder(): Promise<void> {
+    return this.post('/api/poison');
+  }
+
   restoreAll(): Promise<void> {
     return this.post('/api/reset');
   }

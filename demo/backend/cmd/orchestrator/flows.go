@@ -18,6 +18,7 @@ import (
 	"github.com/justinclev/GoGuardLib/health"
 	"github.com/justinclev/GoGuardLib/obs"
 	"github.com/justinclev/GoGuardLib/pipeline"
+	"github.com/justinclev/GoGuardLib/retry"
 )
 
 // steps is the order every request goes through. Each is a separate API.
@@ -42,6 +43,7 @@ type app struct {
 	orders sync.Map // record ID -> order ID, so store events can name the order
 
 	pipe   *pipeline.Pipeline
+	poison func() // sends one order that can never succeed
 	ledger *ledger
 
 	// boot tags order IDs with this process start, so a restart never reuses an ID that is
@@ -139,23 +141,34 @@ type order struct {
 	Order    string  `json:"order"`
 	Customer string  `json:"customer"`
 	Amount   float64 `json:"amount"`
+	// Poison marks an order the payments service will always refuse (an invalid card,
+	// say). Retrying can never help, so the pipeline parks it for a person.
+	Poison bool `json:"poison,omitempty"`
 }
 
-func orderID(value []byte) string {
+func parseOrder(value []byte) order {
 	var o order
 	if json.Unmarshal(value, &o) != nil {
-		return "?"
+		return order{Order: "?"}
 	}
-	return o.Order
+	return o
 }
+
+func orderID(value []byte) string { return parseOrder(value).Order }
 
 // stepRun is one pipeline step. When the step's circuit is open the pipeline
 // never calls it; the store wrapper below reports that as a deferral.
 func (a *app) stepRun(name string, last bool) func(ctx context.Context, x *pipeline.Exec) error {
 	return func(ctx context.Context, x *pipeline.Exec) error {
-		id := orderID(x.Value)
+		o := parseOrder(x.Value)
+		id := o.Order
 		redriven := x.Attempt > 0
 		a.emit(Event{Type: "step", ID: id, Flow: "kafka", Step: name, Status: "started", Redriven: redriven})
+		if name == "payments" && o.Poison {
+			const why = "payment refused: invalid card (permanent)"
+			a.emit(Event{Type: "step", ID: id, Flow: "kafka", Step: name, Status: "failed", Detail: why, Redriven: redriven})
+			return retry.Permanent(errors.New(why))
+		}
 		start := time.Now()
 		err := a.call(ctx, name, id)
 		lat := time.Since(start).Milliseconds()
@@ -182,13 +195,23 @@ func (a *app) buildPipeline() (*pipeline.Pipeline, error) {
 	return pipeline.New("orders", "v1", ss)
 }
 
-func (a *app) produce(p interface {
+type producer interface {
 	Produce(ctx context.Context, topic string, key, value []byte, headers []dlq.Header) error
-}, topic string) {
+}
+
+func (a *app) produce(p producer, topic string) { a.produceOrder(p, topic, false) }
+
+func (a *app) produceOrder(p producer, topic string, poison bool) {
 	n := a.kafkaSeq.Add(1)
 	id := fmt.Sprintf("K-%s-%d", a.boot, n)
 	cust := fmt.Sprintf("c%d", n%6) // a few customers, so per-key ordering is visible
-	val, _ := json.Marshal(order{Order: id, Customer: cust, Amount: float64(10+n%90) + 0.99})
+	if poison {
+		// Its own key: a parked order holds back later orders with the same key, on
+		// purpose, until a person deals with it. Keeping the bad order off the
+		// customers' keys shows that nothing else is affected.
+		cust = fmt.Sprintf("bad-%d", n)
+	}
+	val, _ := json.Marshal(order{Order: id, Customer: cust, Amount: float64(10+n%90) + 0.99, Poison: poison})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := p.Produce(ctx, topic, []byte(cust), val, nil); err != nil {
@@ -215,6 +238,12 @@ func (s *eventStore) Append(ctx context.Context, r dlq.Record) error {
 	}
 	id := orderID(r.Value)
 	s.a.orders.Store(r.ID, id)
+	if r.State == dlq.Parked {
+		// Refused for good: it is kept for a person, never retried and never deleted.
+		s.a.emit(Event{Type: "dlq", ID: id, Flow: "kafka", Status: "parked", Step: r.BlockedOn, Detail: r.LastError})
+		s.a.emit(Event{Type: "request", ID: id, Flow: "kafka", Status: "parked", Detail: r.LastError})
+		return nil
+	}
 	status, step, detail := "rejected", r.BlockedOn, "circuit open: call skipped"
 	switch {
 	case r.BlockedOn == "":

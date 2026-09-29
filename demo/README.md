@@ -43,6 +43,8 @@ Note: while orders are waiting in the log, new Kafka orders for the *same custom
 
 **Crash the consumer** (⚡) hard-kills the orchestrator process with no warning. Docker restarts it, the dead-letter log is still on its volume, and the ledger shows the stored orders survived and are redriven.
 
+**Bad order** (☠) sends one order the Payments service will always refuse (an invalid card). Retrying can never help, so the pipeline **parks** it for a person: the *parked for a human* counter goes up, it is never retried and never deleted, and the other orders carry on. It is sent under its own Kafka key on purpose: a parked order holds back later orders with the *same* key until someone deals with it, which is the ordering guarantee working as designed.
+
 Other things worth trying: **slow** (calls exceed the timeout), **flaky** (about half fail, so the breaker hovers), taking down **two** services, the **Storm** preset, and slow motion (0.5×).
 
 ## Is the data real?
@@ -90,6 +92,8 @@ The UI uses these; you can too.
 | `GET /api/state` | The latest snapshot. |
 | `POST /api/traffic` | `{"httpRps": 10, "kafkaRps": 10}` |
 | `POST /api/services/{inventory,payments,shipping,notifications}/mode` | `{"mode": "up" \| "down" \| "slow" \| "flaky"}` |
+| `POST /api/poison` | Produce one order that ends up parked (see **Bad order**). |
+| `POST /api/crash` | Hard-kill the orchestrator; Docker restarts it and it recovers from the log. |
 | `POST /api/reset` | Bring every service back up. |
 
 ## Cleaning up

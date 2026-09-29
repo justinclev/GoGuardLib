@@ -384,7 +384,7 @@ export class DemoStore {
       this.say('▶️', 'good', 'Kafka consumer resumed', `The circuit is no longer open, so consumption continues where it stopped. Nothing was skipped.`);
     }
     if (cur.dlq.parked > prev.dlq.parked) {
-      this.say('🧯', 'bad', 'Message parked for a human', `A message failed too many times and was set aside for an operator. It is never deleted automatically.`);
+      this.say('🧯', 'bad', 'Message parked for a human', `A message that can never succeed (for example an invalid card) was set aside for an operator instead of being retried. It is never deleted automatically, and the orders around it carry on.`);
     }
   }
 
