@@ -70,6 +70,10 @@ type Policy struct {
 	// selects hosts you trust with that credential; GuardAll refuses it.
 	HealthHeader http.Header
 
+	// Defer, when set, saves requests that could not be sent so they can be sent
+	// later, instead of failing them. See Defer.
+	Defer *Defer
+
 	// DryRun tracks state and emits events but never rejects a request.
 	DryRun bool
 }
@@ -104,6 +108,9 @@ func (p *Policy) validate(name string) error {
 	}
 	if p.HealthPath != "" && !strings.HasPrefix(p.HealthPath, "/") {
 		return fmt.Errorf("goguard: endpoint %q HealthPath must start with \"/\"", name)
+	}
+	if p.Defer != nil && p.Defer.Store == nil {
+		return fmt.Errorf("goguard: endpoint %q sets Defer without a Store", name)
 	}
 	return nil
 }

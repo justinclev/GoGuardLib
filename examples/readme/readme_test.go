@@ -3,6 +3,7 @@
 package readme_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/justinclev/GoGuardLib"
 	"github.com/justinclev/GoGuardLib/breaker"
+	"github.com/justinclev/GoGuardLib/dlq"
 )
 
 // chargeCard stands in for a call to your payment service. Here it always fails.
@@ -94,4 +96,58 @@ func Example_protectHTTPCalls() {
 	_ = newClient
 	_ = getQuote
 	_ = newClientWithHealthCheck
+}
+
+// currentToken stands in for however your service gets its API token.
+func currentToken() string { return "token" }
+
+func newWebhookClient(store dlq.Store) (*goguard.ResilientTransport, *http.Client, error) {
+	guard, err := goguard.New(goguard.Config{},
+		goguard.WithEndpoint("partner", goguard.Host("hooks.partner.com"), goguard.Policy{
+			HealthPath: "/health",
+			Defer:      &goguard.Defer{Store: store}, // save what can't be sent right now
+		}),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return guard, &http.Client{Transport: guard}, nil
+}
+
+func sendWebhook(client *http.Client, eventID string, payload []byte) error {
+	req, err := http.NewRequest(http.MethodPost, "https://hooks.partner.com/events", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Idempotency-Key", eventID) // a request without one is never saved
+	req.Header.Set("Authorization", "Bearer "+currentToken())
+
+	resp, err := client.Do(req)
+	if errors.Is(err, goguard.ErrDeferred) {
+		return nil // saved: it will be sent when the partner is back
+	}
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
+func newWebhookRedriver(store dlq.Store, guard *goguard.ResilientTransport, client *http.Client) (*dlq.Redriver, error) {
+	replay, err := goguard.ReplayHandler(goguard.ReplayConfig{
+		Client: client,
+		Prepare: func(ctx context.Context, req *http.Request) error {
+			req.Header.Set("Authorization", "Bearer "+currentToken()) // credentials are never saved
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: replay, Breakers: guard.Breakers()})
+}
+
+func Example_saveRequestsForLater() {
+	_ = newWebhookClient
+	_ = sendWebhook
+	_ = newWebhookRedriver
 }

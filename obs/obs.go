@@ -32,6 +32,7 @@ const (
 	KindStore        Kind = "store"
 	KindOperator     Kind = "operator"
 	KindConsumer     Kind = "consumer"
+	KindHTTPDeferred Kind = "http_deferred"
 )
 
 // Event is a signal emitted by the library.
@@ -169,6 +170,19 @@ type ConsumerEvent struct {
 }
 
 func (ConsumerEvent) EventKind() Kind { return KindConsumer }
+
+// HTTPDeferred reports that a guarded HTTP endpoint tried to save a request for
+// later instead of failing it. Saved is false when the store refused it, in which
+// case the caller received the original error. It carries the record's ID, never
+// the URL, headers or body.
+type HTTPDeferred struct {
+	Endpoint string
+	RecordID string
+	Saved    bool
+	At       time.Time
+}
+
+func (HTTPDeferred) EventKind() Kind { return KindHTTPDeferred }
 
 // Sink receives events. Emit is called on hot paths, so implementations must
 // return quickly and must not block; use a Dispatcher to hand events to code

@@ -676,10 +676,14 @@ func (t *ResilientTransport) guarded(ep *endpoint, req *http.Request) (*http.Res
 	isVIP, _ := req.Context().Value(PriorityKey).(bool)
 	permit, err := br.Acquire(req.Context(), isVIP)
 	if err != nil {
-		closeRequestBody(req) // a RoundTripper must close the body even when it sends nothing
 		cerr := &CircuitError{Host: ent.name, State: br.State(), Err: ErrCircuitOpen}
 		if errors.Is(err, breaker.ErrBulkhead) {
 			cerr.Err, cerr.Retryable = breaker.ErrBulkhead, true
+		}
+		de := t.tryDefer(ent, pol, req, cerr) // before the body is closed: it may need reading
+		closeRequestBody(req)                 // a RoundTripper must close the body even when it sends nothing
+		if de != nil {
+			return nil, de
 		}
 		return nil, cerr
 	}
@@ -779,6 +783,14 @@ func (t *ResilientTransport) guarded(ep *endpoint, req *http.Request) (*http.Res
 			return nil, &CircuitError{Host: ent.name, State: br.State(), Err: out.err}
 		case out.failed:
 			permit.Failure()
+			cause := out.err
+			if cause == nil && out.resp != nil {
+				cause = fmt.Errorf("status %d", out.resp.StatusCode)
+			}
+			if de := t.tryDefer(ent, pol, req, cause); de != nil {
+				closeResponse(out.resp)
+				return nil, de
+			}
 			if out.err != nil {
 				return nil, &CircuitError{Host: ent.name, State: br.State(), Err: out.err, Retryable: isRetryable(req, out.err, out.resp)}
 			}

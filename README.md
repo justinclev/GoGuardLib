@@ -91,6 +91,74 @@ func getQuote(client *http.Client) error {
 
 `MaxRetries` repeats a failed call, but only for GET and HEAD requests. A POST is never repeated automatically, because you might charge a card twice.
 
+### Saving requests for later
+
+Some HTTP calls don't need an answer right now: sending a webhook, a notification, a background update. For those, you can have the library save a request it can't send, and send it once the service is back. The saved requests use the same store and redriver as Kafka.
+
+Choose where they wait when you build the store: `dlq.NewMemoryStore(...)` keeps them until the process exits, `dlq.OpenWAL(dir, ...)` keeps them on disk across restarts.
+
+```go
+func newWebhookClient(store dlq.Store) (*goguard.ResilientTransport, *http.Client, error) {
+	guard, err := goguard.New(goguard.Config{},
+		goguard.WithEndpoint("partner", goguard.Host("hooks.partner.com"), goguard.Policy{
+			HealthPath: "/health",
+			Defer:      &goguard.Defer{Store: store}, // save what can't be sent right now
+		}),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return guard, &http.Client{Transport: guard}, nil
+}
+```
+
+Send as usual. A request is only saved if it carries an idempotency key, so that sending it twice (once before the failure, once from the store) can't do the work twice:
+
+```go
+func sendWebhook(client *http.Client, eventID string, payload []byte) error {
+	req, err := http.NewRequest(http.MethodPost, "https://hooks.partner.com/events", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Idempotency-Key", eventID) // a request without one is never saved
+	req.Header.Set("Authorization", "Bearer "+currentToken())
+
+	resp, err := client.Do(req)
+	if errors.Is(err, goguard.ErrDeferred) {
+		return nil // saved: it will be sent when the partner is back
+	}
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+```
+
+`goguard.ErrDeferred` means "not sent, but saved". Run a redriver to send the saved requests when the service is healthy:
+
+```go
+func newWebhookRedriver(store dlq.Store, guard *goguard.ResilientTransport, client *http.Client) (*dlq.Redriver, error) {
+	replay, err := goguard.ReplayHandler(goguard.ReplayConfig{
+		Client: client,
+		Prepare: func(ctx context.Context, req *http.Request) error {
+			req.Header.Set("Authorization", "Bearer "+currentToken()) // credentials are never saved
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: replay, Breakers: guard.Breakers()})
+}
+```
+
+Things to know:
+
+- **Only use this for calls that can wait.** A caller that needs the response can't use it, because the answer would arrive long after the caller has gone.
+- **Passwords and tokens are never saved.** `Authorization`, cookies and API-key headers are dropped, so add them again in `Prepare`. The URL and body are saved, so put `dlq.Secure` around a disk store if they're sensitive.
+- **If a request can't be saved** (no idempotency key, a body that can't be read twice, a body over 1 MiB, or a full store), it fails exactly as it would without this feature. You are never told "saved" when it isn't.
+- After the service returns, saved requests are sent at the redriver's pace. A 4xx answer (a bad request) is set aside for a person instead of retried forever.
+
 ## Step 3: let the service tell you it's back
 
 By default the circuit closes again after a timer. It's better to ask the service. Add a health path and the library calls it while the circuit is open, then lets a real request through as a test before trusting it fully:

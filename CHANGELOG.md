@@ -7,6 +7,11 @@ for v1.0" so it can be adopted early.
 ## Unreleased
 
 ### Reliability
+- HTTP: `Policy.Defer` saves requests that cannot be sent (circuit open, or failed after
+  retries) to any `dlq.Store`, memory or disk, and `goguard.ReplayHandler` sends them
+  through the redriver when the service is healthy. Opt-in per endpoint; needs an
+  idempotency key; never stores credentials; `ErrDeferred` tells the caller.
+  `ResilientTransport.Breakers()` feeds the redriver.
 - `kafka.RedriveFor(bindings)`: one redrive handler and breaker map for a consumer with
   several topics. Before, a redriver built from one pipeline parked the other topics'
   records as mismatched, or ran records with no progress through the wrong pipeline.

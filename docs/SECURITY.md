@@ -38,6 +38,7 @@ and the confidentiality of data in the process's memory.
 | File and directory mode 0700/0600 and ownership | local tampering | always (override: `AllowInsecurePermissions`) | on |
 | Refuse network filesystems | corruption from broken locks | always (override: `AllowNetworkFilesystem`) | on |
 | Operator audit trail | unaccountable release or deletion | `dlq.Audited` + `dlq.WithActor` | off |
+| Saved HTTP requests: credential headers dropped, idempotency key required | credentials and duplicate side effects when `Policy.Defer` is on | `goguard.Policy{Defer: ...}` (opt-in per endpoint); the URL and body are stored, so wrap disk stores in `dlq.Secure` | off |
 | Key retirement | leaked or expired encryption keys | `dlq.Reseal` | manual |
 
 A production deployment should turn on: sealing, signing, a pepper, `RequireEncryption`,
