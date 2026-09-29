@@ -99,6 +99,27 @@ err = store.Append(ctx, dlq.Record{
 - Keep the key outside the volume and outside the image.
 - Replay with `dlq.Redriver` (see the README); it rate-limits and waits for the dependency's breaker to close.
 
+## 4b. Or let the consumer do it: `kafka.HandlerBinding`
+
+If you can move to `confluent-kafka-go` v2, you do not need to write your own commit and retry loop. `HandlerBinding` turns your existing `Process`-style function into a binding for `kafka.NewConsumer`:
+
+```go
+binding, err := kafka.HandlerBinding(kafka.HandlerConfig{
+    Topic:   "correspondence-events",
+    Breaker: rules,
+    Handle: func(ctx context.Context, m kafka.HandledMessage) error {
+        return process(ctx, m.Value) // idempotent; use m.ID to deduplicate downstream calls
+    },
+})
+consumer, err := kafka.NewConsumer(kafka.Config{Client: client, Store: store /* durable */, Bindings: []kafka.Binding{binding}})
+```
+
+You get contiguous offset commits, a durable store for messages that could not be handled, per-key ordering behind a deferred message, a paused topic while the breaker is open, and resume after a crash. `retry.Permanent(err)` parks a message for a person instead of retrying it.
+
+**Why there is no "simple consumer" that skips the store.** A loop that commits after each success and merely logs failures loses the failed message the moment a later one succeeds (its higher offset is committed), and one that drops a message when the circuit opens loses that too. Handling rebalances, contiguous commits and rewinding correctly is what `kafka.Consumer` exists for, so it is the only consumer offered. `Config.Store` is required with no default on purpose: an in-memory default would lose deferred messages on every restart. Use `dlq.OpenWAL` with `dlq.Secure`.
+
+**`confluent-kafka-go` v1.** Not supported: both major versions bundle librdkafka, the adapter cannot be tested without a broker, and the upgrade for the calls a poller uses is mostly the import path (`.../confluent-kafka-go/v2/kafka`). If a service truly cannot upgrade, use sections 1 to 4 (they need no Kafka client at all).
+
 ## 5. Watching it
 
 `Stats()` gives `State`, `Success`, `Failure`, `FailureRateBps` (basis points, 10000 = 100%), `Inflight`, `Rejected`, `RejectedBulkhead`, `Opens`, `LastTransition` and `AvgLatency`. `obs.StateChanged` and `obs.ProbeResult` events arrive on `Events`. **The library exports no Prometheus metrics**; map these to your metrics library yourself (an `obs.Sink` for transitions, a scrape callback for `Stats()`). Wrap a slow sink in `obs.NewDispatcher` because `Emit` must not block.
