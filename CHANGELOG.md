@@ -32,7 +32,9 @@ for v1.0" so it can be adopted early.
 - `StoreStats.OldestParked`, `BlockedKeys`, `ByDependency`; `obs.StoreEvent`,
   `obs.ConsumerEvent`, `obs.OperatorAction`.
 - `dlq.VerifyWAL`, `WALStore.Backup`, `dlq.OpenWALCopy` and the `dlqctl` command.
-- CI: read-only token, pinned govulncheck, CodeQL, tagged releases; SECURITY.md,
+- CI builds with the latest Go 1.25 patch (the scan flagged 18 standard-library
+  advisories fixed by 1.25.13; `toolchain go1.25.13` in both go.mod files), and
+  pins govulncheck v1.7.0 (v1.8.0 needs Go 1.26). Also: read-only token, CodeQL, tagged releases; SECURITY.md,
   CODEOWNERS, CONTRIBUTING.md, docs/OPERATIONS.md, docs/SECURITY.md.
 
 ### Planned defaults for v1.0

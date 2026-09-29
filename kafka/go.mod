@@ -2,6 +2,8 @@ module github.com/justinclev/GoGuardLib/kafka
 
 go 1.25.3
 
+toolchain go1.25.13
+
 require github.com/justinclev/GoGuardLib v0.0.0
 
 require github.com/confluentinc/confluent-kafka-go/v2 v2.11.1
