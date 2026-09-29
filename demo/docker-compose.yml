@@ -41,6 +41,8 @@ services:
       context: ..
       dockerfile: demo/backend/Dockerfile
       target: services
+      args:
+        GOPROXY: ${GOPROXY:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/usr/local/bin/services", "-healthcheck"]
@@ -54,6 +56,8 @@ services:
       context: ..
       dockerfile: demo/backend/Dockerfile
       target: orchestrator
+      args:
+        GOPROXY: ${GOPROXY:-}
     environment:
       SERVICES_HOST: services
       KAFKA_BROKERS: kafka:9092
@@ -82,6 +86,10 @@ services:
   ui:
     build:
       context: ./ui
+      additional_contexts:
+        certs: ./certs
+      args:
+        NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
     depends_on:
       orchestrator:
         condition: service_healthy

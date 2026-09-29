@@ -96,6 +96,10 @@ The UI uses these; you can too.
 | `POST /api/crash` | Hard-kill the orchestrator; Docker restarts it and it recovers from the log. |
 | `POST /api/reset` | Bring every service back up. |
 
+## Build fails with `x509: certificate signed by unknown authority`
+
+Your network re-signs HTTPS with a company root certificate. The Docker daemon trusts it (image pulls work) but the build containers do not, so `go mod download` and `npm ci` fail. Put the root certificate in `demo/certs/` as a `.crt` file and run `docker compose build --no-cache`; `demo/certs/README.md` explains how to export it. If the public registries are blocked instead, set `GOPROXY` and `NPM_CONFIG_REGISTRY` to your internal mirrors. Do not turn certificate checking off.
+
 ## Cleaning up
 
 ```bash

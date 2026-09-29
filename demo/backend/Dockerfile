@@ -6,16 +6,22 @@
 FROM golang:1.25-bookworm AS build
 WORKDIR /src
 
-# Resolve dependencies first, so source edits do not redownload them.
+# A network that re-signs HTTPS with a company root certificate: put that certificate
+# in demo/certs/ (see the README there). With none present this changes nothing.
+COPY demo/certs/ /usr/local/share/ca-certificates/extra/
+RUN update-ca-certificates
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY:-https://proxy.golang.org,direct}
+
+# Resolve dependencies first, so source edits do not redownload them. A network or
+# certificate problem fails here, with its real error.
 COPY go.mod ./go.mod
 COPY kafka/go.mod kafka/go.sum ./kafka/
-COPY demo/backend/go.mod ./demo/backend/
-RUN cd demo/backend && go mod download || true
+COPY demo/backend/go.mod demo/backend/go.sum ./demo/backend/
+RUN cd demo/backend && go mod download
 
 COPY . .
 WORKDIR /src/demo/backend
-# Writes go.sum on a fresh checkout and is a no-op otherwise.
-RUN go mod tidy
 # The orchestrator links librdkafka through confluent-kafka-go (cgo); the simulated
 # services are plain Go.
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /out/orchestrator ./cmd/orchestrator \
