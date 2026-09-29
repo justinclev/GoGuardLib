@@ -94,8 +94,8 @@ func short(err error) string {
 		return "connection dropped"
 	}
 	s := err.Error()
-	if len(s) > 80 {
-		s = s[:80]
+	if r := []rune(s); len(r) > 80 {
+		s = string(r[:80]) // by characters, so a multi-byte one is never cut in half
 	}
 	return s
 }
