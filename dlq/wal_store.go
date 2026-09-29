@@ -52,8 +52,9 @@ const (
 )
 
 const (
-	// DefaultWALMaxBytes bounds the memory (and disk) a store uses when
-	// WALOptions.MaxBytes is zero. The whole live queue is held in memory.
+	// DefaultWALMaxBytes bounds the live data a store holds when
+	// WALOptions.MaxBytes is zero. Payloads live on disk by default, so this is a
+	// disk limit; with PayloadsInMemory it is also the memory the queue can use.
 	DefaultWALMaxBytes    = 512 << 20
 	defaultSegmentBytes   = 64 << 20
 	defaultCompactMin     = 64 << 20
@@ -76,8 +77,9 @@ type walFile interface {
 type WALOptions struct {
 	// MaxRecords caps the number of records; Append beyond it returns ErrFull.
 	MaxRecords int
-	// MaxBytes caps the estimated bytes of live records (they are held in memory);
-	// Append and Checkpoint beyond it return ErrFull. Default DefaultWALMaxBytes.
+	// MaxBytes caps the estimated bytes of live records, payload included; Append
+	// and Checkpoint beyond it return ErrFull. Payloads are on disk by default, so
+	// this bounds disk; set MaxRecords to bound memory. Default DefaultWALMaxBytes.
 	MaxBytes int64
 	// MaxRecordBytes rejects any single record larger than this. Default 8 MiB.
 	MaxRecordBytes int
@@ -110,12 +112,23 @@ type WALOptions struct {
 	// files (for volumes mounted with fixed modes).
 	AllowInsecurePermissions bool
 
+	// PayloadsInMemory keeps every record's key, value, headers and checkpoint in
+	// memory, as earlier versions did: Lease is faster, but memory grows with the
+	// data. By default only a small index per record is kept in memory and payloads
+	// are read back from the log when needed, so MaxBytes bounds disk, and memory is
+	// bounded by MaxRecords (about 300 bytes per record).
+	PayloadsInMemory bool
+	// FileCacheSize is how many log files are kept open for reading payloads.
+	// Default 32.
+	FileCacheSize int
+
 	// Clock replaces time.Now, for tests.
 	Clock func() time.Time
 
 	// Test hooks.
 	maxEntryBytes int
 	openFile      func(name string, flag int, perm os.FileMode) (walFile, error)
+	compactHook   func(stage string) // "captured" and "copied", to interleave work with a compaction
 }
 
 func (o *WALOptions) applyDefaults() error {
@@ -179,6 +192,12 @@ type WALStats struct {
 	SnapshotLSN       uint64
 	LastCompactionErr error
 	Failed            error // non-nil once the store has failed closed
+	// PayloadsOnDisk is true unless the store was opened with PayloadsInMemory.
+	PayloadsOnDisk bool
+	// UnreadablePayloads counts records whose payload could not be read back from
+	// disk (corruption or a missing file). Such records are parked, not lost from
+	// the index, so an operator can see them.
+	UnreadablePayloads uint64
 }
 
 type segment struct {
@@ -203,6 +222,11 @@ type WALStore struct {
 	lock *dirLock
 
 	failure atomic.Pointer[error] // set once, fail closed
+
+	offload    bool // payloads live on disk
+	files      *fileCache
+	unreadable atomic.Uint64
+	compactMu  sync.Mutex // one compaction at a time; held for its whole run
 
 	mu          sync.Mutex // state, log position and files
 	m           *machine
@@ -301,6 +325,8 @@ func OpenWAL(dir string, opts WALOptions) (*WALStore, error) {
 		dir:       dir,
 		opts:      opts,
 		lock:      lk,
+		offload:   !opts.PayloadsInMemory,
+		files:     newFileCache(dir, opts.FileCacheSize),
 		stopCh:    make(chan struct{}),
 		compactCh: make(chan struct{}, 1),
 	}
@@ -333,6 +359,7 @@ func (w *WALStore) releaseFiles() {
 	if w.active != nil {
 		_ = w.active.Close()
 	}
+	w.files.closeAll()
 	w.lock.unlock()
 }
 
@@ -344,11 +371,13 @@ func (w *WALStore) WALStats() WALStats {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	st := WALStats{
-		Segments:          len(w.segments),
-		LogBytes:          w.logBytes,
-		NextLSN:           w.nextLSN,
-		SnapshotLSN:       w.snapLSN,
-		LastCompactionErr: w.compactErr,
+		Segments:           len(w.segments),
+		LogBytes:           w.logBytes,
+		NextLSN:            w.nextLSN,
+		SnapshotLSN:        w.snapLSN,
+		LastCompactionErr:  w.compactErr,
+		PayloadsOnDisk:     w.offload,
+		UnreadablePayloads: w.unreadable.Load(),
 	}
 	if f := w.failure.Load(); f != nil {
 		st.Failed = *f
@@ -510,7 +539,8 @@ func (w *WALStore) replaySegment(sg segment, expected uint64, isLast bool) (end 
 		case fr.lsn <= w.snapLSN:
 			// already covered by the snapshot
 		case fr.lsn == next:
-			if aerr := w.applyEntry(fr); aerr != nil {
+			ref := blobRef{kind: fr.typ, file: sg.start, off: off, n: int32(fr.size)}
+			if aerr := w.applyEntry(fr, ref); aerr != nil {
 				return 0, 0, corrupt(sg.path, off, "entry %d: %v", fr.lsn, aerr)
 			}
 			next++
@@ -588,7 +618,7 @@ func (w *WALStore) quarantine(path string, from, to int64) error {
 	return syncDir(w.dir)
 }
 
-func (w *WALStore) applyEntry(fr frame) error {
+func (w *WALStore) applyEntry(fr frame, ref blobRef) error {
 	d := decoder{b: fr.body}
 	switch fr.typ {
 	case entAppend:
@@ -599,7 +629,7 @@ func (w *WALStore) applyEntry(fr frame) error {
 		if rec.State == Leased {
 			return errBadEntry
 		}
-		w.m.insert(rec)
+		w.insertRecord(rec, ref)
 	case entLease:
 		n := d.uvarint()
 		if n > uint64(len(d.b)) {
@@ -620,7 +650,7 @@ func (w *WALStore) applyEntry(fr frame) error {
 		if err := d.done(); err != nil {
 			return err
 		}
-		w.m.replayCheckpoint(id, cp)
+		w.replayCheckpoint(id, cp, ref)
 	case entRequeue:
 		id := d.str()
 		replace, cp := false, []byte(nil)
@@ -633,7 +663,7 @@ func (w *WALStore) applyEntry(fr frame) error {
 		if err := d.done(); err != nil {
 			return err
 		}
-		w.m.replayRequeue(id, replace, cp)
+		w.replayRequeue(id, replace, cp, ref)
 	case entAck, entRelease, entDiscard:
 		id := d.str()
 		if err := d.done(); err != nil {
@@ -710,4 +740,43 @@ func validFrameAfter(path string, off, size int64, next uint64, maxEntry int) (b
 		}
 	}
 	return false, nil
+}
+
+// insertRecord stores a record whose frame is at ref: its payload goes to disk (and
+// only the reference is kept) unless the store keeps payloads in memory.
+func (w *WALStore) insertRecord(rec Record, ref blobRef) {
+	if w.offload {
+		w.m.insertOffloaded(rec, ref)
+		return
+	}
+	w.m.insert(rec)
+}
+
+// setCheckpointAt records a new checkpoint whose frame is at ref.
+func (w *WALStore) setCheckpointAt(it *memItem, cp []byte, ref blobRef) {
+	if !w.offload {
+		w.m.setCheckpoint(it, cp)
+		return
+	}
+	if cp == nil {
+		ref = blobRef{}
+	}
+	w.m.setCheckpointRef(it, len(cp), ref)
+}
+
+func (w *WALStore) replayCheckpoint(id string, cp []byte, ref blobRef) {
+	if it, ok := w.m.items[id]; ok {
+		w.setCheckpointAt(it, cp, ref)
+	}
+}
+
+func (w *WALStore) replayRequeue(id string, replace bool, cp []byte, ref blobRef) {
+	it, ok := w.m.items[id]
+	if !ok || it.rec.State != Parked {
+		return
+	}
+	w.m.applyRequeue(it, false, nil)
+	if replace {
+		w.setCheckpointAt(it, cp, ref)
+	}
 }

@@ -47,6 +47,7 @@ func (w *WALStore) loadSnapshot(path string, lsn uint64) error {
 		if ferr != nil {
 			return corrupt(path, off, "snapshot ends without a valid footer: %v", ferr)
 		}
+		frameStart := off
 		off += fr.size
 		switch fr.typ {
 		case snapRecord:
@@ -58,7 +59,7 @@ func (w *WALStore) loadSnapshot(path string, lsn uint64) error {
 			if _, dup := w.m.items[rec.ID]; dup {
 				return corrupt(path, off, "duplicate record in snapshot")
 			}
-			w.m.insert(rec)
+			w.insertRecord(rec, blobRef{kind: snapRecord, snap: true, file: lsn, off: frameStart, n: int32(fr.size)})
 			count++
 		case snapEnd:
 			d := decoder{b: fr.body}
@@ -80,14 +81,26 @@ func (w *WALStore) loadSnapshot(path string, lsn uint64) error {
 }
 
 // Compact snapshots the live queue and deletes the log segments it makes
-// redundant. It runs automatically as the log grows (see WALOptions), and
-// blocks other operations while it writes, in proportion to the live data.
+// redundant. It runs automatically as the log grows (see WALOptions). When
+// payloads are on disk the snapshot is copied without holding the store's lock,
+// so appends and leases continue while it runs; with PayloadsInMemory it blocks
+// other operations while it writes, in proportion to the live data.
 func (w *WALStore) Compact(ctx context.Context) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	return w.compactOnce(ctx)
+}
+
+// compactOnce runs one compaction; only one runs at a time.
+func (w *WALStore) compactOnce(ctx context.Context) error {
+	w.compactMu.Lock()
+	defer w.compactMu.Unlock()
+	if w.offload {
+		return w.compactOffload(ctx)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.closed {
 		return ErrClosed
 	}
@@ -107,16 +120,191 @@ func (w *WALStore) compactLoop() {
 			return
 		case <-w.compactCh:
 			w.mu.Lock()
-			if !w.closed && w.failure.Load() == nil && time.Now().After(w.compactHold) {
-				err := w.compactLocked()
-				w.compactErr = err
-				if err != nil {
-					w.compactHold = time.Now().Add(compactRetryAfter)
-				}
-			}
+			skip := w.closed || w.failure.Load() != nil || !time.Now().After(w.compactHold)
 			w.mu.Unlock()
+			if skip {
+				continue
+			}
+			if err := w.compactOnce(context.Background()); err != nil {
+				w.mu.Lock()
+				w.compactHold = time.Now().Add(compactRetryAfter)
+				w.mu.Unlock()
+			}
 		}
 	}
+}
+
+// snapEntry is what a compaction captures about one record while it holds the
+// lock: the record's metadata at LSN L and where its payload is.
+type snapEntry struct {
+	rec              Record // metadata only
+	bodyRef, ckptRef blobRef
+	bodyN, ckptN     int
+	newRef           blobRef // where the copy landed in the snapshot
+}
+
+// compactOffload is compaction for stores whose payloads live on disk. It has
+// three phases: capture the metadata and the list of old files under the lock,
+// copy payloads into the snapshot with the lock released, then swap under the
+// lock. Operations that happen during the copy are in the new segments, which
+// recovery replays on top of the snapshot; the swap only re-points references
+// that did not change in the meantime. The caller holds compactMu.
+func (w *WALStore) compactOffload(ctx context.Context) (err error) {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return ErrClosed
+	}
+	if f := w.failure.Load(); f != nil {
+		w.mu.Unlock()
+		return *f
+	}
+	if w.nextLSN-1 <= w.snapLSN {
+		w.mu.Unlock()
+		return nil
+	}
+	if w.activeSize > headerSize {
+		if err := w.rotateLocked(); err != nil {
+			w.mu.Unlock()
+			return err
+		}
+	}
+	last := w.nextLSN - 1
+	seq := w.m.seq
+	logAtCapture := w.logBytes
+	oldSegs := append([]segment(nil), w.segments[:len(w.segments)-1]...)
+	oldSnap := w.snapLSN
+	entries := make([]snapEntry, 0, len(w.m.items))
+	for el := w.m.order.Front(); el != nil; el = el.Next() {
+		it := el.Value.(*memItem)
+		e := snapEntry{rec: it.rec, bodyRef: it.bodyRef, ckptRef: it.ckptRef, bodyN: it.bodyN, ckptN: it.ckptN}
+		if e.rec.State == Leased {
+			e.rec.State = Pending // a lease belongs to a worker that will not survive a restart
+		}
+		entries = append(entries, e)
+	}
+	w.mu.Unlock()
+
+	defer func() {
+		w.mu.Lock()
+		w.compactErr = err
+		w.mu.Unlock()
+	}()
+	if h := w.opts.compactHook; h != nil {
+		h("captured")
+	}
+
+	final := filepath.Join(w.dir, snapshotName(last))
+	tmp := final + ".tmp"
+	if err := w.writeSnapshotOffload(ctx, tmp, last, seq, entries); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := syncDir(w.dir); err != nil {
+		return w.failAndWake(fmt.Errorf("syncing directory after snapshot: %w", err))
+	}
+	if h := w.opts.compactHook; h != nil {
+		h("copied")
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if f := w.failure.Load(); f != nil {
+		return *f
+	}
+	// Re-point whatever still refers to what was captured. A reference that has
+	// changed since (a newer checkpoint, say) lives in a newer segment and stays.
+	for i := range entries {
+		e := &entries[i]
+		it, ok := w.m.items[e.rec.ID]
+		if !ok {
+			continue
+		}
+		if it.bodyRef == e.bodyRef {
+			it.bodyRef = e.newRef
+		}
+		if e.ckptRef.valid() && it.ckptRef == e.ckptRef {
+			it.ckptRef = e.newRef
+		}
+	}
+	for _, sg := range oldSegs {
+		w.files.drop(fileKey{id: sg.start})
+		_ = os.Remove(sg.path)
+	}
+	if oldSnap != 0 {
+		w.files.drop(fileKey{snap: true, id: oldSnap})
+		_ = os.Remove(filepath.Join(w.dir, snapshotName(oldSnap)))
+	}
+	_ = syncDir(w.dir)
+	w.segments = append([]segment(nil), w.segments[len(oldSegs):]...)
+	w.snapLSN = last
+	w.logBytes -= logAtCapture
+	if w.logBytes < 0 {
+		w.logBytes = 0
+	}
+	return nil
+}
+
+// writeSnapshotOffload writes the snapshot, reading each record's payload from
+// the old files, and records where each frame landed. A payload that cannot be
+// read fails the compaction: dropping it would destroy the only evidence a backup
+// restore could use.
+func (w *WALStore) writeSnapshotOffload(ctx context.Context, path string, last, seq uint64, entries []snapEntry) error {
+	f, err := w.opts.openFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	bw := bufio.NewWriterSize(fileWriter{f}, 1<<20)
+	fail := func(err error) error {
+		_ = f.Close()
+		return err
+	}
+	if _, err := bw.Write(encodeHeader(snapMagic, last)); err != nil {
+		return fail(err)
+	}
+	off := int64(headerSize)
+	var frameBuf []byte
+	for i := range entries {
+		select {
+		case <-w.stopCh:
+			return fail(ErrClosed)
+		case <-ctx.Done():
+			return fail(ctx.Err())
+		default:
+		}
+		e := &entries[i]
+		tmp := memItem{rec: e.rec, bodyRef: e.bodyRef, ckptRef: e.ckptRef}
+		rec, err := w.hydrate(&tmp)
+		if err != nil {
+			return fail(fmt.Errorf("compaction cannot copy record %s: %w", e.rec.ID, err))
+		}
+		var enc encoder
+		encodeRecord(&enc, &rec)
+		frameBuf = appendFrame(frameBuf[:0], 0, snapRecord, enc.b)
+		if _, err := bw.Write(frameBuf); err != nil {
+			return fail(err)
+		}
+		e.newRef = blobRef{kind: snapRecord, snap: true, file: last, off: off, n: int32(len(frameBuf))}
+		off += int64(len(frameBuf))
+	}
+	var enc encoder
+	enc.uvarint(uint64(len(entries)))
+	enc.uvarint(seq)
+	frameBuf = appendFrame(frameBuf[:0], 0, snapEnd, enc.b)
+	if _, err := bw.Write(frameBuf); err != nil {
+		return fail(err)
+	}
+	if err := bw.Flush(); err != nil {
+		return fail(err)
+	}
+	if err := f.Sync(); err != nil {
+		return fail(err)
+	}
+	return f.Close()
 }
 
 func (w *WALStore) compactLocked() error {

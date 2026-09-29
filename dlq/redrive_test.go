@@ -650,7 +650,7 @@ func TestRedriverOnTheWALAndRefundSurvivesRestart(t *testing.T) {
 	must(t, s.Close())
 
 	s = openWAL(t, dir, dlq.WALOptions{})
-	defer s.Close()
+	t.Cleanup(func() { _ = s.Close() }) // registered before start, so it runs after the redriver stops
 	var attempts atomic.Int32
 	var dep atomic.Value
 	r := newRedriver(t, dlq.RedriveConfig{

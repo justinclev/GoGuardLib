@@ -39,6 +39,11 @@ func TestWALStoreConformance(t *testing.T) {
 	storetest.Run(t, walFactory(dlq.WALOptions{}))
 }
 
+func TestWALStoreConformancePayloadsInMemory(t *testing.T) {
+	storetest.Run(t, walFactory(dlq.WALOptions{PayloadsInMemory: true}))
+	storetest.Run(t, walFactory(dlq.WALOptions{PayloadsInMemory: true, SegmentBytes: 512, CompactMinBytes: 1, CompactRatio: 0.01}))
+}
+
 func TestWALStoreConformanceWithTinySegmentsAndCompaction(t *testing.T) {
 	// Constant rotation and compaction underneath must not change behaviour.
 	storetest.Run(t, walFactory(dlq.WALOptions{SegmentBytes: 512, CompactMinBytes: 1, CompactRatio: 0.01}))

@@ -18,7 +18,13 @@ type memItem struct {
 	token      string
 	leaseUntil time.Time
 	el         *list.Element
-	size       int
+	size       int // logical size, counting payload wherever it lives
+
+	// When a store keeps payloads on disk, rec.Key, rec.Value, rec.Headers and
+	// rec.Checkpoint are empty and these say where to find them and how many bytes
+	// they stand for. In-memory stores leave all four zero.
+	bodyRef, ckptRef blobRef
+	bodyN, ckptN     int
 }
 
 func (it *memItem) unlease() {
@@ -169,8 +175,9 @@ func (m *machine) held(id, token string) (*memItem, error) {
 }
 
 func (m *machine) resize(it *memItem) {
-	m.bytes += int64(it.rec.Size() - it.size)
-	it.size = it.rec.Size()
+	n := it.rec.Size() + it.bodyN + it.ckptN
+	m.bytes += int64(n - it.size)
+	it.size = n
 }
 
 func (m *machine) remove(it *memItem) {
@@ -195,7 +202,7 @@ func (m *machine) remove(it *memItem) {
 
 // checkCheckpoint reports whether cp fits in the limits.
 func (m *machine) checkCheckpoint(it *memItem, cp []byte) error {
-	grow := len(cp) - len(it.rec.Checkpoint)
+	grow := len(cp) - len(it.rec.Checkpoint) - it.ckptN
 	if m.lim.maxBytes > 0 && grow > 0 && m.bytes+int64(grow) > m.lim.maxBytes {
 		return ErrFull
 	}
@@ -207,7 +214,51 @@ func (m *machine) checkCheckpoint(it *memItem, cp []byte) error {
 
 func (m *machine) setCheckpoint(it *memItem, cp []byte) {
 	it.rec.Checkpoint = cloneBytes(cp)
+	it.ckptRef, it.ckptN = blobRef{}, 0
 	m.resize(it)
+}
+
+// setCheckpointRef records that the checkpoint (n bytes) now lives on disk at ref.
+// A nil checkpoint (ref zero) is simply absent.
+func (m *machine) setCheckpointRef(it *memItem, n int, ref blobRef) {
+	it.rec.Checkpoint = nil
+	it.ckptRef, it.ckptN = ref, n
+	m.resize(it)
+}
+
+// bodySize is the bytes of the parts of a record that go to disk with its body.
+func bodySize(r *Record) int {
+	n := len(r.Key) + len(r.Value)
+	for _, h := range r.Headers {
+		n += len(h.Key) + len(h.Value)
+	}
+	return n
+}
+
+// insertOffloaded stores a record whose payload lives on disk. rec still carries
+// its payload here; it is dropped, and only the references and sizes are kept.
+// body points at the frame holding the record; a non-nil checkpoint lives in that
+// same frame.
+func (m *machine) insertOffloaded(rec Record, body blobRef) {
+	if _, exists := m.items[rec.ID]; exists {
+		return
+	}
+	total := rec.Size()
+	it := &memItem{size: total, bodyRef: body, bodyN: bodySize(&rec), ckptN: len(rec.Checkpoint)}
+	if rec.Checkpoint != nil {
+		it.ckptRef = body
+	}
+	rec.Key, rec.Value, rec.Headers, rec.Checkpoint = nil, nil, nil, nil
+	it.rec = rec
+	it.el = m.order.PushBack(it)
+	m.items[rec.ID] = it
+	if rec.OrderKey != "" {
+		m.byKey[rec.OrderKey] = append(m.byKey[rec.OrderKey], it)
+	}
+	m.bytes += int64(total)
+	if rec.Seq > m.seq {
+		m.seq = rec.Seq
+	}
 }
 
 func (m *machine) applyNack(it *memItem, at, next time.Time, errText, blockedOn string, refund bool) {
@@ -250,20 +301,30 @@ func (m *machine) applyRequeue(it *memItem, replace bool, checkpoint []byte) {
 	}
 }
 
-// parkedList returns up to limit parked records with Seq greater than after.
-func (m *machine) parkedList(after uint64, limit int) []Record {
+// parkedItems returns up to limit parked items with Seq greater than after.
+func (m *machine) parkedItems(after uint64, limit int) []*memItem {
 	if limit <= 0 {
 		limit = 100
 	}
 	if limit > 1000 {
 		limit = 1000
 	}
-	var out []Record
+	var out []*memItem
 	for el := m.order.Front(); el != nil && len(out) < limit; el = el.Next() {
 		it := el.Value.(*memItem)
 		if it.rec.State == Parked && it.rec.Seq > after {
-			out = append(out, it.rec.Clone())
+			out = append(out, it)
 		}
+	}
+	return out
+}
+
+// parkedList returns copies of up to limit parked records with Seq greater than
+// after. It is for stores that keep payloads in memory.
+func (m *machine) parkedList(after uint64, limit int) []Record {
+	var out []Record
+	for _, it := range m.parkedItems(after, limit) {
+		out = append(out, it.rec.Clone())
 	}
 	return out
 }
@@ -301,12 +362,6 @@ func (m *machine) replayLease(id string) {
 	}
 }
 
-func (m *machine) replayCheckpoint(id string, cp []byte) {
-	if it, ok := m.items[id]; ok {
-		m.setCheckpoint(it, cp)
-	}
-}
-
 func (m *machine) replayAck(id string) {
 	if it, ok := m.items[id]; ok {
 		m.remove(it)
@@ -328,12 +383,6 @@ func (m *machine) replayRelease(id string) {
 func (m *machine) replayPark(id string, at time.Time, reason string) {
 	if it, ok := m.items[id]; ok {
 		m.applyPark(it, at, reason)
-	}
-}
-
-func (m *machine) replayRequeue(id string, replace bool, checkpoint []byte) {
-	if it, ok := m.items[id]; ok && it.rec.State == Parked {
-		m.applyRequeue(it, replace, checkpoint)
 	}
 }
 

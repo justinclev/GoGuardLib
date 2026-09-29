@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/justinclev/GoGuardLib/dlq"
 )
@@ -67,3 +68,30 @@ func BenchmarkWALRecovery(b *testing.B) {
 		_ = s.Close()
 	}
 }
+
+// Leasing reads the payload back from disk unless PayloadsInMemory is set.
+func benchLease(b *testing.B, inMemory bool) {
+	s, err := dlq.OpenWAL(b.TempDir(), dlq.WALOptions{Sync: dlq.SyncNone, DisableAutoCompact: true, PayloadsInMemory: inMemory})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	ctx := context.Background()
+	val := make([]byte, 1024)
+	for i := 0; i < 1000; i++ {
+		_ = s.Append(ctx, dlq.Record{ID: fmt.Sprintf("r%d", i), Value: val})
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ls, err := s.Lease(ctx, dlq.LeaseRequest{Max: 1, TTL: time.Hour})
+		if err != nil || len(ls) != 1 {
+			b.Fatalf("lease: %v %d", err, len(ls))
+		}
+		if err := s.Release(ctx, ls[0].Record.ID, ls[0].Token); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkWALLeasePayloadsOnDisk(b *testing.B)   { benchLease(b, false) }
+func BenchmarkWALLeasePayloadsInMemory(b *testing.B) { benchLease(b, true) }

@@ -114,18 +114,19 @@ func (w *WALStore) rotateLocked() error {
 // ---- appending to the log ----
 
 // logLocked writes one entry and returns its position in the group-commit
-// sequence. The caller applies the change to memory only after this succeeds, so
+// sequence and where the frame landed on disk. The caller applies the change to memory only after this succeeds, so
 // memory never runs ahead of what the log accepted.
-func (w *WALStore) logLocked(typ byte, body []byte) (uint64, error) {
+func (w *WALStore) logLocked(typ byte, body []byte) (uint64, blobRef, error) {
 	if len(body) > w.opts.maxEntryBytes {
-		return 0, fmt.Errorf("%w: entry is %d bytes, limit is %d", ErrInvalidRecord, len(body), w.opts.maxEntryBytes)
+		return 0, blobRef{}, fmt.Errorf("%w: entry is %d bytes, limit is %d", ErrInvalidRecord, len(body), w.opts.maxEntryBytes)
 	}
 	frameBytes := appendFrame(nil, w.nextLSN, typ, body)
 	if w.activeSize > headerSize && w.activeSize+int64(len(frameBytes)) > w.opts.SegmentBytes {
 		if err := w.rotateLocked(); err != nil {
-			return 0, err
+			return 0, blobRef{}, err
 		}
 	}
+	ref := blobRef{kind: typ, file: w.segments[len(w.segments)-1].start, off: w.activeSize, n: int32(len(frameBytes))}
 	n, err := w.active.Write(frameBytes)
 	if err != nil || n != len(frameBytes) {
 		if err == nil {
@@ -135,9 +136,9 @@ func (w *WALStore) logLocked(typ byte, body []byte) (uint64, error) {
 		// the file may hold half a frame in front of later data, which recovery
 		// could not tell from corruption, so stop here.
 		if terr := w.active.Truncate(w.activeSize); terr != nil {
-			return 0, w.failAndWake(fmt.Errorf("write failed (%w) and rollback failed (%w)", err, terr))
+			return 0, blobRef{}, w.failAndWake(fmt.Errorf("write failed (%w) and rollback failed (%w)", err, terr))
 		}
-		return 0, fmt.Errorf("dlq: writing log entry: %w", err)
+		return 0, blobRef{}, fmt.Errorf("dlq: writing log entry: %w", err)
 	}
 	w.activeSize += int64(n)
 	w.logBytes += int64(n)
@@ -148,7 +149,7 @@ func (w *WALStore) logLocked(typ byte, body []byte) (uint64, error) {
 	seq := w.written
 	w.syncWake.Signal()
 	w.syncMu.Unlock()
-	return seq, nil
+	return seq, ref, nil
 }
 
 // currentSeq is the position of everything written so far.
@@ -287,12 +288,12 @@ func (w *WALStore) Append(ctx context.Context, r Record) error {
 	}
 	var e encoder
 	encodeRecord(&e, &rec)
-	seq, err := w.logLocked(entAppend, e.b)
+	seq, ref, err := w.logLocked(entAppend, e.b)
 	if err != nil {
 		w.mu.Unlock()
 		return err
 	}
-	w.m.insert(rec)
+	w.insertRecord(rec, ref)
 	w.maybeCompactLocked()
 	return w.finish(seq)
 }
@@ -313,24 +314,76 @@ func (w *WALStore) Lease(ctx context.Context, req LeaseRequest) ([]Lease, error)
 		w.mu.Unlock()
 		return nil, nil
 	}
-	var e encoder
-	e.uvarint(uint64(len(items)))
+	// Read payloads before logging anything. A record whose payload cannot be read
+	// is parked instead of leased: handing out a truncated message would be worse
+	// than holding it for an operator.
+	hydrated := make([]Record, 0, len(items))
+	good := items[:0:0]
+	var bad []*memItem
 	for _, it := range items {
+		rec, err := w.hydrate(it)
+		if err != nil {
+			bad = append(bad, it)
+			continue
+		}
+		good = append(good, it)
+		hydrated = append(hydrated, rec)
+	}
+	var lastSeq uint64
+	for _, it := range bad {
+		seq, err := w.parkUnreadableLocked(it, now)
+		if err != nil {
+			w.mu.Unlock()
+			return nil, err
+		}
+		lastSeq = seq
+	}
+	if len(good) == 0 {
+		w.maybeCompactLocked()
+		return nil, w.finish(lastSeq)
+	}
+	var e encoder
+	e.uvarint(uint64(len(good)))
+	for _, it := range good {
 		e.str(it.rec.ID)
 	}
 	// The attempt count is logged before the record leaves the store, so a worker
 	// that crashes on a poison pill cannot reset its own counter.
-	seq, err := w.logLocked(entLease, e.b)
+	seq, _, err := w.logLocked(entLease, e.b)
 	if err != nil {
 		w.mu.Unlock()
 		return nil, err
 	}
-	leases := w.m.grant(items, now, req.TTL)
+	leases := w.m.grant(good, now, req.TTL)
+	for i := range leases {
+		h := hydrated[i]
+		leases[i].Record.Key, leases[i].Record.Value = h.Key, h.Value
+		leases[i].Record.Headers, leases[i].Record.Checkpoint = h.Headers, h.Checkpoint
+	}
 	w.maybeCompactLocked()
 	if err := w.finish(seq); err != nil {
 		return nil, err
 	}
 	return leases, nil
+}
+
+// unreadableReason is the fixed text a record is parked with when its payload
+// cannot be read back. It carries no payload and no file names.
+const unreadableReason = "payload unreadable on disk (corrupt or missing): restore the log files from a backup"
+
+// parkUnreadableLocked logs and applies parking of a record whose payload is gone.
+func (w *WALStore) parkUnreadableLocked(it *memItem, now time.Time) (uint64, error) {
+	var e encoder
+	e.str(it.rec.ID)
+	e.time(now)
+	e.str(unreadableReason)
+	seq, _, err := w.logLocked(entPark, e.b)
+	if err != nil {
+		return 0, err
+	}
+	w.m.applyPark(it, now, unreadableReason)
+	w.unreadable.Add(1)
+	return seq, nil
 }
 
 // Checkpoint implements Store.
@@ -351,12 +404,12 @@ func (w *WALStore) Checkpoint(ctx context.Context, id, token string, checkpoint 
 	var e encoder
 	e.str(id)
 	e.nullable(checkpoint)
-	seq, err := w.logLocked(entCheckpoint, e.b)
+	seq, ref, err := w.logLocked(entCheckpoint, e.b)
 	if err != nil {
 		w.mu.Unlock()
 		return err
 	}
-	w.m.setCheckpoint(it, checkpoint)
+	w.setCheckpointAt(it, checkpoint, ref)
 	w.maybeCompactLocked()
 	return w.finish(seq)
 }
@@ -378,7 +431,7 @@ func (w *WALStore) withLease(ctx context.Context, id, token string, typ byte, bo
 	if body != nil {
 		body(&e)
 	}
-	seq, err := w.logLocked(typ, e.b)
+	seq, _, err := w.logLocked(typ, e.b)
 	if err != nil {
 		w.mu.Unlock()
 		return err
@@ -444,7 +497,7 @@ func (w *WALStore) withParked(ctx context.Context, id string, typ byte, apply fu
 	}
 	var e encoder
 	e.str(id)
-	seq, err := w.logLocked(typ, e.b)
+	seq, _, err := w.logLocked(typ, e.b)
 	if err != nil {
 		w.mu.Unlock()
 		return err
@@ -489,12 +542,15 @@ func (w *WALStore) RequeueWith(ctx context.Context, id string, o RequeueOptions)
 		e.u8(1)
 		e.nullable(o.Checkpoint)
 	}
-	seq, err := w.logLocked(entRequeue, e.b)
+	seq, ref, err := w.logLocked(entRequeue, e.b)
 	if err != nil {
 		w.mu.Unlock()
 		return err
 	}
-	w.m.applyRequeue(it, o.ReplaceCheckpoint, o.Checkpoint)
+	w.m.applyRequeue(it, false, nil)
+	if o.ReplaceCheckpoint {
+		w.setCheckpointAt(it, o.Checkpoint, ref)
+	}
 	w.maybeCompactLocked()
 	return w.finish(seq)
 }
@@ -510,7 +566,7 @@ func (w *WALStore) Get(ctx context.Context, id string) (Record, error) {
 	if !ok {
 		return Record{}, ErrNotFound
 	}
-	return it.rec.Clone(), nil
+	return w.hydrate(it)
 }
 
 // Parked implements Store.
@@ -520,7 +576,19 @@ func (w *WALStore) Parked(ctx context.Context, q ParkedQuery) ([]Record, error) 
 	if err := w.begin(ctx); err != nil {
 		return nil, err
 	}
-	return w.m.parkedList(q.After, q.Limit), nil
+	items := w.m.parkedItems(q.After, q.Limit)
+	out := make([]Record, 0, len(items))
+	for _, it := range items {
+		rec, err := w.hydrate(it)
+		if err != nil {
+			// Still list it, so an operator can see it and discard it, but without
+			// a payload we cannot vouch for.
+			rec = it.rec.Clone()
+			rec.Key, rec.Value, rec.Headers, rec.Checkpoint = nil, nil, nil, nil
+		}
+		out = append(out, rec)
+	}
+	return out, nil
 }
 
 // Discard implements Store.
@@ -560,6 +628,10 @@ func (w *WALStore) Close() error {
 	close(w.stopCh)
 	w.mu.Unlock()
 
+	// Let a compaction in progress finish or give up before the files go away.
+	w.compactMu.Lock()
+	defer w.compactMu.Unlock()
+
 	w.syncMu.Lock()
 	w.syncStop = true
 	w.syncWake.Broadcast()
@@ -582,6 +654,7 @@ func (w *WALStore) Close() error {
 	if cerr := w.active.Close(); cerr != nil && err == nil {
 		err = cerr
 	}
+	w.files.closeAll()
 	w.lock.unlock()
 	return err
 }
