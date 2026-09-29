@@ -11,6 +11,8 @@ The library has no dependencies outside the standard library and **never logs or
 Everything observable is delivered as a typed event to a sink you supply, or read on demand with `Stats()`.
 A lint rule (`forbidigo`) fails the build if logging or printing is added to non-test code.
 
+Adding this to an existing consumer: [`docs/INTEGRATION.md`](docs/INTEGRATION.md).
+
 A runnable, animated demo (real Kafka, four simulated APIs you can take down, and a live diagram) is in [`demo/`](demo/README.md): `cd demo && docker compose up --build`.
 
 ## Installation
