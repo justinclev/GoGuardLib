@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -57,6 +58,7 @@ func run() error {
 
 	host := env("SERVICES_HOST", "localhost")
 	a := &app{
+		boot:    strconv.FormatInt(time.Now().Unix()%46656, 36),
 		hub:     NewHub(),
 		ledger:  newLedger(),
 		host:    host,

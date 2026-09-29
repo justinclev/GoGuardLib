@@ -43,6 +43,10 @@ type app struct {
 
 	pipe   *pipeline.Pipeline
 	ledger *ledger
+
+	// boot tags order IDs with this process start, so a restart never reuses an ID that is
+	// already in the durable log (the sequence counters start again from zero).
+	boot string
 }
 
 func (a *app) emit(e Event) {
@@ -100,7 +104,7 @@ func short(err error) string {
 
 func (a *app) runHTTP() {
 	n := a.httpSeq.Add(1)
-	id := fmt.Sprintf("H-%d", n)
+	id := fmt.Sprintf("H-%s-%d", a.boot, n)
 	a.httpSent.Add(1)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -182,7 +186,7 @@ func (a *app) produce(p interface {
 	Produce(ctx context.Context, topic string, key, value []byte, headers []dlq.Header) error
 }, topic string) {
 	n := a.kafkaSeq.Add(1)
-	id := fmt.Sprintf("K-%d", n)
+	id := fmt.Sprintf("K-%s-%d", a.boot, n)
 	cust := fmt.Sprintf("c%d", n%6) // a few customers, so per-key ordering is visible
 	val, _ := json.Marshal(order{Order: id, Customer: cust, Amount: float64(10+n%90) + 0.99})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -204,9 +208,9 @@ type eventStore struct {
 func (s *eventStore) Append(ctx context.Context, r dlq.Record) error {
 	// Storing is idempotent: after a crash Kafka redelivers messages that are already
 	// in the log. Report a message the first time it is stored, not every time.
-	_, existed := s.Store.Get(ctx, r.ID)
+	_, getErr := s.Store.Get(ctx, r.ID)
 	err := s.Store.Append(ctx, r)
-	if err != nil || r.Source.Kind != "kafka" || existed == nil {
+	if err != nil || r.Source.Kind != "kafka" || getErr == nil {
 		return err
 	}
 	id := orderID(r.Value)
