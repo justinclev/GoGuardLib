@@ -38,3 +38,17 @@ func Example() {
 }
 
 func handle(dlq.Record) error { return nil }
+
+// A durable queue that survives crashes and power loss.
+func ExampleOpenWAL() {
+	store, err := dlq.OpenWAL("/var/lib/myapp/dlq", dlq.WALOptions{MaxBytes: 2 << 30})
+	if err != nil {
+		// ErrLocked: another process has it. ErrCorrupt: damage recovery will not
+		// guess about; see the error for the file and offset.
+		return
+	}
+	defer store.Close()
+
+	rep := store.Recovery() // what was found and repaired at startup
+	_ = rep.TruncatedBytes  // alert on this: a torn tail means the last process died mid-write
+}

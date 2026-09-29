@@ -108,7 +108,45 @@ A `dlq.Record` captures work that could not be finished (a Kafka message, a requ
 - **`OrderKey`** gives per-key ordering: records sharing a key are handed out one at a time, in order.
 - Delivery is **at-least-once**. Handlers must tolerate seeing a record twice.
 
-`dlq.NewMemoryStore` is the reference implementation. It is **not durable** and suits tests and work you can afford to lose on restart; a durable write-ahead-log store and a Kafka store are next on the roadmap. Any store can be checked against the contract with `storetest.Run` from `dlq/storetest`.
+### Choosing a store
+
+| | Survives a process crash | Survives power loss | Use it for |
+|---|---|---|---|
+| `dlq.NewMemoryStore` | no | no | tests, or work you can afford to lose on restart |
+| `dlq.OpenWAL` | yes | yes (with the default `SyncAlways`) | anything you must not lose |
+
+Any store can be checked against the contract with `storetest.Run` from `dlq/storetest`.
+
+### Durable store: `dlq.OpenWAL`
+
+```go
+store, err := dlq.OpenWAL("/var/lib/myapp/dlq", dlq.WALOptions{
+    MaxBytes: 2 << 30, // the live queue is held in memory: this is your RAM budget
+})
+if err != nil { /* see below */ }
+defer store.Close()
+```
+
+A segmented, checksummed write-ahead log: every change is one CRC-32C-framed entry, and the queue is rebuilt from the log on open.
+
+**What it guarantees**
+
+- **Acknowledged means on disk.** With `SyncAlways` (the default) an operation returns only after its entry is fsynced. Concurrent operations share one fsync (group commit): on a test machine, about 280 µs per append when called one at a time, about 18 µs (55,000 a second) with concurrent callers.
+- **It fails closed.** If a write or fsync fails, the store stops serving (`ErrStoreFailed`) and releases everyone waiting; it never retries a failed fsync, because after one the disk's state is unknown. A failed write is rolled back so half an entry never sits in front of later data. Close and reopen: recovery restores every acknowledged operation.
+- **Recovery repairs what a crash can cause and refuses everything else.** A torn final entry is cut back to the last complete one, and the cut bytes are first copied to a `.quarantine-*` file: nothing is destroyed. A damaged entry that is *followed by valid entries* is bit rot, not an interrupted write, so `OpenWAL` refuses (`ErrCorrupt`) rather than discard entries that may have been acknowledged; `ForceRepair` overrides that deliberately. Damage in earlier segments, a gap in the sequence, a missing segment or a bad snapshot always refuses and modifies nothing. `FailOnTruncation` refuses even the torn-tail repair.
+- **Poison pills are counted across crashes.** A lease is logged before the record leaves the store, so a record that kills its worker keeps its attempt count and can be parked. The lease itself dies with the process.
+- **One writer, owner-only.** The directory is locked against a second store (`ErrLocked`), created `0700` with `0600` files, and an existing directory or file that others can read or write is refused (`ErrInsecurePermissions`, override with `AllowInsecurePermissions`).
+- **Bounded disk.** The log is compacted into a snapshot and old segments are deleted as it grows (`CompactMinBytes`, `CompactRatio`, or call `Compact`).
+
+**Durability policy** (`WALOptions.Sync`): `SyncAlways` survives power loss. `SyncInterval` fsyncs every `SyncEvery` and survives a process crash but can lose that window on power loss. `SyncNone` fsyncs only on rotation and `Close`, for tests.
+
+**Limits to plan for**
+
+- **The whole live queue is held in memory**, capped by `MaxBytes` (default 512 MiB); beyond it `Append` returns `ErrFull`. Size it for the worst outage you want to ride out.
+- **Compaction blocks other operations** while it writes the snapshot, for a time proportional to the live data.
+- **Unix only.** Directory locking is not implemented elsewhere, so `OpenWAL` refuses to run without it.
+- Quarantine files are kept until you remove them. They hold whatever was in the damaged tail, in the clear unless the store is wrapped with `dlq.Secure`.
+- Wrap it with `dlq.Secure` to encrypt payloads at rest; the log itself only checksums.
 
 ## Security: the `secure` package
 
@@ -148,7 +186,7 @@ This release changes behaviour deliberately:
 
 ## Roadmap
 
-Next: a durable write-ahead-log store, health-check-driven recovery with automatic redrive, multi-step pipelines that resume from the failed step, and a Kafka consumer adapter.
+Next: health-check-driven recovery with automatic redrive, multi-step pipelines that resume from the failed step, and a Kafka consumer adapter.
 
 ## License
 

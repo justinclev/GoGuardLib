@@ -3,6 +3,7 @@ package dlq
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -18,6 +19,13 @@ type LeaseRequest struct {
 	// TTL is how long the worker may hold each record before it is offered again
 	// (greater than zero). Choose it longer than the slowest handler.
 	TTL time.Duration
+}
+
+func validateLease(req LeaseRequest) error {
+	if req.Max < 1 || req.TTL <= 0 {
+		return fmt.Errorf("%w: Max must be at least 1 and TTL positive", ErrInvalidRequest)
+	}
+	return nil
 }
 
 // Lease is a record held by a worker. Every follow-up call must present Token.
