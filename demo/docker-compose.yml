@@ -5,6 +5,8 @@
 # then open http://localhost:4280
 #
 # If a port is taken, choose others:  UI_PORT=5000 API_PORT=5001 docker compose up --build
+# Ports are published on localhost only. To show it on your network (anyone who can
+# reach it can take services down or crash the consumer):  BIND=0.0.0.0 docker compose up --build
 name: goguard-demo
 
 services:
@@ -74,7 +76,7 @@ services:
       retries: 30
       start_period: 10s
     ports:
-      - "${API_PORT:-8081}:8080" # the API, for curl and for poking around
+      - "${BIND:-127.0.0.1}:${API_PORT:-8081}:8080" # the API, for curl and for poking around
 
   # The Angular UI, served by nginx, which forwards /api to the orchestrator.
   ui:
@@ -84,7 +86,7 @@ services:
       orchestrator:
         condition: service_healthy
     ports:
-      - "${UI_PORT:-4280}:80"
+      - "${BIND:-127.0.0.1}:${UI_PORT:-4280}:80"
 
 volumes:
   dlq-data:

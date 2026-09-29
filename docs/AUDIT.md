@@ -218,6 +218,20 @@ After the fixes above, the code they added or changed (the queue index, the two-
 
 **Reviewed and found sound in the second pass:** the two-phase lease's every exit path (reservations are released on cancel, close, unreadable payloads and empty results); reads racing a compaction (the locked retry, and the refcounted cache never closing a handle under a reader); the signing format (domain, file kind, LSN, type and body are all bound, a torn tail is still repaired but a forged one never is, legacy files are read-only and the newest segment is always signed); the disk guard's accounting (bytes since the last measurement, refusal wraps `ErrFull`); the consumer's ownership of state (only the polling goroutine touches partitions, commits and queues; workers only run the pipeline), the per-key queues (released on completion, dropped behind a failure or a revocation, no marker left behind), and the pool's channel capacities (sends never block because everything in flight fits).
 
+## Third pass: demo audit and shutdown bounds
+
+| # | Finding | Severity | Status |
+|---|---|---|---|
+| T1 | A step that ignored its context could make `Run` hang forever on shutdown (redriver and Kafka consumer) | Medium | Fixed |
+| T2 | Demo: a stored-event was emitted again when an order already in the log was appended twice | Low | Fixed |
+| T3 | Demo: control API accepted cross-site POSTs from any page in the operator's browser | Medium | Fixed |
+| T4 | Demo: ports were published on all interfaces | Low | Fixed |
+| T5 | Demo: the delivery ledger disagreed with the WAL after a crash restart | Medium | Fixed |
+
+**T1.** Both `Run` loops waited on their workers without a limit. `RedriveConfig.ShutdownTimeout` (default 30s) and the consumer's `ShutdownTimeout` now bound the wait; the process can exit and the records stay leased or uncommitted, so they are redelivered. `TestRunReturnsEvenIfAHandlerIgnoresItsContext`, `TestShutdownIsBoundedWhenAStepIgnoresItsContext`.
+
+**T2-T5.** The demo suppresses duplicate stored events, requires an `X-Requested-With` header on every POST, binds to `127.0.0.1` unless `BIND` is set, adds security headers in nginx, and seeds the ledger from the WAL at startup. The demo shows measured numbers only: no figure is invented, averages come from observed samples, and the success rate is blank until there is data.
+
 ## What was checked and found sound
 
 Recorded so the next reviewer does not repeat it.

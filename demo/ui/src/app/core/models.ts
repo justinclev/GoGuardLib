@@ -74,6 +74,7 @@ export interface Snapshot {
   http: { sent: number; ok: number; failed: number; rejected: number };
   ledger: {
     produced: number;
+    adopted: number;
     done: number;
     parked: number;
     waiting: number;

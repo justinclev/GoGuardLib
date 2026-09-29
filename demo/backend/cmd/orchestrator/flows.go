@@ -202,8 +202,11 @@ type eventStore struct {
 }
 
 func (s *eventStore) Append(ctx context.Context, r dlq.Record) error {
+	// Storing is idempotent: after a crash Kafka redelivers messages that are already
+	// in the log. Report a message the first time it is stored, not every time.
+	_, existed := s.Store.Get(ctx, r.ID)
 	err := s.Store.Append(ctx, r)
-	if err != nil || r.Source.Kind != "kafka" {
+	if err != nil || r.Source.Kind != "kafka" || existed == nil {
 		return err
 	}
 	id := orderID(r.Value)

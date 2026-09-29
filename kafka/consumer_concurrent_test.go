@@ -535,3 +535,33 @@ func TestABackoffKeepsGrowingWhileOthersSucceed(t *testing.T) {
 		t.Fatalf("the backoff attempt number reached only %d: other messages finishing reset it, so a failing dependency is hit at the shortest interval for ever", maxN)
 	}
 }
+
+// A step that ignores its context must not hold up shutdown: Run returns after
+// ShutdownTimeout, commits only what finished, and the stuck message is redelivered.
+func TestShutdownIsBoundedWhenAStepIgnoresItsContext(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	var started atomic.Int32
+	r, c, _ := concRig(t, 2, func(ctx context.Context, key, value string) error {
+		if value == "stuck" {
+			started.Add(1)
+			<-release // never looks at ctx
+		}
+		return nil
+	}, func(cfg *kafka.Config) { cfg.ShutdownTimeout = 200 * time.Millisecond })
+	r.broker.produce(topic, 0, "k0", "ok")
+	r.broker.produce(topic, 0, "k1", "stuck")
+	r.broker.produce(topic, 0, "k2", "later")
+	r.assign(0)
+	stop := r.run(c)
+	eventually(t, "the stuck step to start", func() bool { return started.Load() == 1 })
+	eventually(t, "the others to finish", func() bool { return c.Stats().Done == 2 })
+	begin := time.Now()
+	_ = stop()
+	if d := time.Since(begin); d > 3*time.Second {
+		t.Fatalf("shutdown took %v with a stuck step", d)
+	}
+	if got := r.broker.committedOffset(topic, 0); got != 1 {
+		t.Fatalf("committed %d, want 1: the stuck message (offset 1) must be redelivered, not skipped", got)
+	}
+}

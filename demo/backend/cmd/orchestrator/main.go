@@ -461,7 +461,7 @@ func (a *app) routes(snap *snapshotter) http.Handler {
 	mux.HandleFunc("POST /api/reset", func(w http.ResponseWriter, r *http.Request) {
 		a.forward(w, r, a.control+"/control/reset", nil)
 	})
-	return cors(mux)
+	return requireDemoHeader(mux)
 }
 
 func (a *app) forward(w http.ResponseWriter, r *http.Request, url string, body []byte) {
@@ -484,13 +484,14 @@ func (a *app) forward(w http.ResponseWriter, r *http.Request, url string, body [
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func cors(next http.Handler) http.Handler {
+// requireDemoHeader refuses state-changing requests that do not carry the header the
+// UI sends. A web page on another origin cannot set it without a CORS preflight, and
+// this server answers none, so a stray page cannot take services down or crash the
+// process just because the demo is open in another tab.
+func requireDemoHeader(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "content-type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+		if r.Method == http.MethodPost && r.Header.Get("X-Requested-With") != "goguard-demo" {
+			http.Error(w, "missing X-Requested-With: goguard-demo", http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)

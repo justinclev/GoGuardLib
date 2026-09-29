@@ -785,3 +785,30 @@ func TestRedriverSurvivesTransientStoreErrors(t *testing.T) {
 		t.Fatalf("StoreErrors = %d, want the failures counted", r.Stats().StoreErrors)
 	}
 }
+
+// A handler that ignores its context must not hold up shutdown for ever: Run returns
+// once ShutdownTimeout has passed, and the record's lease simply expires.
+func TestRunReturnsEvenIfAHandlerIgnoresItsContext(t *testing.T) {
+	store := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	addBlocked(t, store, 1, "pay")
+	release := make(chan struct{})
+	defer close(release)
+	var started atomic.Bool
+	r := newRedriver(t, dlq.RedriveConfig{
+		Store: store, ShutdownTimeout: 150 * time.Millisecond,
+		Handler: func(ctx context.Context, it *dlq.Item) error { started.Store(true); <-release; return nil },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	eventually(t, "the handler to start", func() bool { return started.Load() })
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return: a stuck handler held up shutdown")
+	}
+}

@@ -7,7 +7,7 @@ export class ApiService {
   private async post(path: string, body?: unknown): Promise<void> {
     const res = await fetch(path, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'goguard-demo' },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`${path} failed with ${res.status}`);

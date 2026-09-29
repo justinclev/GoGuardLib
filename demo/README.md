@@ -7,7 +7,7 @@ cd demo
 docker compose up --build
 ```
 
-Then open **http://localhost:4280**. (If that port is taken, `UI_PORT=5000 API_PORT=5001 docker compose up --build` picks others.) The first build downloads Go and npm dependencies and takes a few minutes.
+Then open **http://localhost:4280**. (Ports are published on localhost only; `BIND=0.0.0.0 docker compose up --build` shares it on your network, where anyone who can reach it can take services down.) (If that port is taken, `UI_PORT=5000 API_PORT=5001 docker compose up --build` picks others.) The first build downloads Go and npm dependencies and takes a few minutes.
 
 ## What you are looking at
 
@@ -41,7 +41,13 @@ Press **✦ Guided demo** and let it run, or do it by hand:
 
 Note: while orders are waiting in the log, new Kafka orders for the *same customer* are stored behind them (amber, "held in order") so they cannot overtake an earlier order. That is per-key ordering doing its job, and the backlog drains as the redriver catches up.
 
+**Crash the consumer** (⚡) hard-kills the orchestrator process with no warning. Docker restarts it, the dead-letter log is still on its volume, and the ledger shows the stored orders survived and are redriven.
+
 Other things worth trying: **slow** (calls exceed the timeout), **flaky** (about half fail, so the breaker hovers), taking down **two** services, the **Storm** preset, and slow motion (0.5×).
+
+## Is the data real?
+
+Every number comes from the running system. The service counters come from the fake APIs, breaker figures from the library's `Stats()`, DLQ figures from the write-ahead log, and the animation from the same event stream. Nothing is scripted. Where a figure is an estimate it says so ("Failed-call time avoided" multiplies skipped calls by the measured time a failing call takes, and shows a dash until one has been measured). The **delivery ledger** follows every Kafka order from events alone and is cross-checked against what the write-ahead log itself reports; it turns amber if the two disagree or an order starts a step and never finishes. The dots are a sample (at most about 300 at once); the numbers are exact. If the event stream cannot keep up, the header says how many events were dropped.
 
 ## How it is built
 

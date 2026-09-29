@@ -65,6 +65,11 @@ type RedriveConfig struct {
 	// wakes the redriver. Default 500ms.
 	PollInterval time.Duration
 
+	// ShutdownTimeout bounds how long Run waits, once its context ends, for handlers
+	// that are still running. A handler that ignores its context is abandoned: its
+	// lease expires and the record is offered again. Default 30 seconds.
+	ShutdownTimeout time.Duration
+
 	// MaxAttempts is the poison-pill limit: a record whose handling has failed
 	// this many times, or whose lease has been taken this many times without
 	// finishing (a worker that keeps crashing), is parked. Default 10.
@@ -142,6 +147,9 @@ func NewRedriver(cfg RedriveConfig) (*Redriver, error) {
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 500 * time.Millisecond
 	}
+	if cfg.ShutdownTimeout <= 0 {
+		cfg.ShutdownTimeout = 30 * time.Second
+	}
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 10
 	}
@@ -207,7 +215,14 @@ func (r *Redriver) Run(ctx context.Context) error {
 	}
 	err := r.dispatch(ctx, work)
 	close(work)
-	wg.Wait()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	t := time.NewTimer(r.cfg.ShutdownTimeout)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C: // a handler is ignoring its context: leave it, its lease will expire
+	}
 	return err
 }
 

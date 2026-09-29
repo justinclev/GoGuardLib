@@ -72,7 +72,8 @@ type Config struct {
 	// ProcessTimeout bounds the processing of one message, which must stay well
 	// under the client's max.poll.interval.ms. Default 2 minutes.
 	ProcessTimeout time.Duration
-	// ShutdownTimeout bounds how long Run keeps trying to commit on the way out. A
+	// ShutdownTimeout bounds how long Run waits for running messages on the way out
+	// (with Workers above one) and then how long it keeps trying to commit. A
 	// commit is refused while a rebalance is in progress and succeeds once the
 	// consumer has polled again, so Run keeps polling and retrying until this
 	// passes. Default 5 seconds.
@@ -303,8 +304,10 @@ loop:
 	// messages are safe even though we are leaving.
 	c.stopping = true
 	cancelWorkers()
-	c.stopWorkers(&wg)
-	_ = c.drain(ctx, true)
+	stopped := c.stopWorkers(&wg)
+	// If a handler ignored its context and is still running, its message is simply not
+	// finished: its offset is not committed and it is delivered again.
+	_ = c.drain(ctx, stopped)
 	return errors.Join(fatal, c.finalCommit())
 }
 
@@ -655,11 +658,23 @@ func (c *Consumer) startWorkers(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-func (c *Consumer) stopWorkers(wg *sync.WaitGroup) {
+// stopWorkers waits for the pool to finish, for at most ShutdownTimeout. It reports
+// whether every worker stopped. A handler that ignores its context cannot hold up
+// shutdown (a rolling deploy waiting on one stuck message is worse than replaying it).
+func (c *Consumer) stopWorkers(wg *sync.WaitGroup) bool {
 	if c.work != nil {
 		close(c.work)
 	}
-	wg.Wait()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	t := time.NewTimer(c.cfg.ShutdownTimeout)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 // drain applies the results workers have produced. With wait, it waits for every
