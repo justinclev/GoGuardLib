@@ -11,6 +11,8 @@ The library has no dependencies outside the standard library and **never logs or
 Everything observable is delivered as a typed event to a sink you supply, or read on demand with `Stats()`.
 A lint rule (`forbidigo`) fails the build if logging or printing is added to non-test code.
 
+Contents: [How it works](#how-it-works) (circuit breaker, HTTP and Kafka lifecycles, connecting it) · [HTTP](#http-you-choose-what-is-protected) · [Kafka](#kafka-consumers-the-kafka-module) · [Demo](demo/README.md).
+
 Adding this to an existing consumer: [`docs/INTEGRATION.md`](docs/INTEGRATION.md).
 
 A runnable, animated demo (real Kafka, four simulated APIs you can take down, and a live diagram) is in [`demo/`](demo/README.md): `cd demo && docker compose up --build`.
@@ -20,6 +22,428 @@ A runnable, animated demo (real Kafka, four simulated APIs you can take down, an
 ```bash
 go get github.com/justinclev/GoGuardLib
 ```
+
+## How it works
+
+GoGuardLib has one core idea and two routes that use it.
+
+**The idea:** every dependency you call (a payments API, an inventory service) gets a **circuit breaker** that watches its recent results. When the dependency is clearly failing, calls are refused at once instead of piling up behind timeouts, and the dependency is left alone until it says it is healthy again.
+
+**The routes** differ in what happens to work that cannot be done right now:
+
+| | HTTP | Kafka |
+|---|---|---|
+| Entry point | An `http.RoundTripper` you give your `http.Client` | A consumer that runs each message through a pipeline of steps |
+| Goal | Fail fast and protect both sides | Never lose a message; resume where it stopped |
+| When a dependency is down | The call is refused; the caller decides what to do | The message and its progress are written to disk, and the topic pauses |
+| After recovery | Calls simply flow again | A redriver replays stored messages, gently, from the failed step |
+
+### The circuit breaker in depth
+
+```
+                     failure rate >= FailureThreshold
+                     and at least MinSamples calls seen
+       ┌────────┐ ────────────────────────────────────▶ ┌────────┐
+       │ CLOSED │                                       │  OPEN  │  every call refused
+       │ calls  │                                       │        │  (ErrOpen); the
+       │  flow  │                                       └───┬────┘  dependency is not touched
+       └────────┘                                           │
+          ▲                                                 │ the way out (one of):
+          │ the canary succeeds                             │  · health check passes
+          │ (window is reset)                               │    SuccessThreshold times in a row
+          │                                                 │  · no health check: SleepWindow
+          │                                                 │    (plus up to 10% jitter) passes
+          │                                                 ▼
+          │                                            ┌───────────┐
+          └─────────────────────────────────────────── │ HALF-OPEN │  exactly one call, the
+                                                       └─────┬─────┘  canary, is let through
+                        the canary fails ───────────────────┘
+                        (back to OPEN at once, whatever MinSamples says)
+```
+
+**What it measures.** Results go into a rolling window (`SamplingWindow`, default 10 s) made of buckets (`BucketDuration`, default a tenth of the window). Old buckets are dropped as time passes, so the failure rate reflects only the recent past. The rate is computed in basis points (10,000 = 100%) with integer arithmetic.
+
+**When it opens.** The check runs each time a failure is recorded. The circuit opens when the window holds at least `MinSamples` calls **and** the failure rate has reached `FailureThreshold`. For example, with `MinSamples: 20` and `FailureThreshold: 0.5`, ten failures in a window of twenty calls open it, but three failures out of three do not: too few calls to judge. `MinSamples` is what stops one early error from tripping a circuit.
+
+**What counts as a failure.** By default any error. Set `IsFailure` to say which errors mean the dependency is unhealthy. An error that the dependency *answered* (a 404, a validation error) should count as a success, because the service is working:
+
+- **HTTP:** the default is a transport error or a status of 500 or above. `MaxLatency` and `OutlierFactor` can also count slow responses as failures.
+- **Any call:** an error for which `IsFailure` returns false is recorded as a success. A call the caller cancelled itself is *abandoned*: it is not counted either way.
+- A panic inside the guarded call is recorded as a failure and then re-raised.
+
+**Admission while open.** No request reaches the dependency. In HTTP the caller gets a `*CircuitError` (matching `goguard.ErrCircuitOpen`); for any other call, an `*OpenError` matching `breaker.ErrOpen`. Neither is ever retried, since an open circuit is not a transient fault to hammer.
+
+**Recovery, with and without a health check.**
+
+- **Timer only (default):** after `SleepWindow` (plus up to 10% random jitter so many instances do not probe in step) the next real request moves the circuit to half-open and is the canary.
+- **Health-gated (recommended):** set `Health`. While the circuit is open a background prober calls your check every `Interval`, backing off (up to `MaxInterval`, with jitter) while it fails. Real requests are **not** spent probing a dependency that has not said it is back. After `SuccessThreshold` healthy probes in a row the circuit becomes half-open. A healthy dependency sees no probe traffic at all.
+- **The canary is still a real call.** A dependency can answer `/health` and still fail real work, so by default the circuit closes only after a real request succeeds. `TrustHealth: true` skips the canary; leave it off unless your health check is genuinely deep.
+- **A health check that lies cannot block traffic forever.** After `MaxOpen` (default 5 minutes) the timer-based canary resumes whatever the check says. Set it negative to disable this.
+- **Exactly one canary.** While half-open only one call is admitted; the rest are refused until it finishes. If a probe never reports back, another call may take over after a sleep window, so the circuit cannot be wedged half-open.
+- **A clean slate.** When the circuit closes, the window is reset, so failures from before the outage cannot reopen it on the first new error.
+
+**Limiting load.**
+
+- **Bulkhead** (`MaxInflight`): at most this many calls run at once. A call over the limit waits up to `WaitTimeout` (`BulkheadWaitTimeout` in an HTTP `Policy`) for a slot, or is refused with `breaker.ErrBulkhead` (matched by `errors.Is`). Requests marked as priority bypass the bulkhead but never the circuit.
+- **Retry budget** (`RetryBudget`, 0 to 1): retries may be at most this share of recent traffic. Failures count as traffic, so when everything is failing the retries are still limited and cannot amplify an outage.
+
+**Control and observation.**
+
+- `SetOverride` forces a breaker open or closed for operations; `DryRun` records everything and emits events but never refuses a call, which is the safe way to roll a breaker out.
+- `Stats()` gives state, window counts, failure rate, in-flight calls, rejections, opens and average latency. `Events` receives `StateChanged` and `ProbeResult` events (the HTTP guard also emits `Retried`). The library never logs; you decide what to do with them. Wrap slow consumers in `obs.NewDispatcher`, because `Emit` must not block.
+
+#### Choosing the numbers
+
+| Setting | Too low | Too high | Start with |
+|---|---|---|---|
+| `MinSamples` | One bad call trips it | It never opens on a quiet service | About 20 (10 default) |
+| `FailureThreshold` | Flapping on ordinary noise | Slow to protect | 0.5 |
+| `SamplingWindow` | Reacts to blips | Slow to notice an outage | 10 s |
+| `SleepWindow` (no health check) | Probes a dead service too often | Slow to resume | 30 s |
+| Health `Interval` | Probe load during an outage | Slow to resume | 5 s |
+| `SuccessThreshold` | One lucky probe reopens traffic | Slow to resume | 2 |
+
+Roll a new breaker out with `DryRun: true`, watch its events for a day, then turn refusal on.
+
+### Lifecycle of an HTTP request
+
+```
+  client.Do(req)
+        │
+        ▼
+  ┌──────────────────────────┐
+  │ resolve the endpoint     │  Skip(ctx)? Use(ctx, "name")? first matching Endpoint?
+  └────────────┬─────────────┘  GuardAll? otherwise:
+               │                 ──▶ pass straight through (no breaker, retry or state)
+               ▼
+  ┌──────────────────────────┐
+  │ find this endpoint's     │  one circuit per endpoint, or per host with PerHost
+  │ circuit                  │
+  └────────────┬─────────────┘
+               ▼
+  ┌──────────────────────────┐  circuit open ────▶ refuse: *CircuitError
+  │ ask the breaker to admit │  bulkhead full ───▶ refuse (marked retryable)
+  └────────────┬─────────────┘  (the request body is still closed)
+               │ admitted
+               ▼
+  ┌──────────────────────────┐
+  │ send, bounded by         │◀───────────────────────────────┐
+  │ RequestTimeout           │                                │
+  └────────────┬─────────────┘                                │
+               ▼                                              │
+  ┌──────────────────────────┐                                │
+  │ judge the result         │                                │
+  │ failure = error or 5xx,  │                                │
+  │ or too slow              │                                │
+  └───┬───────────┬──────────┘                                │
+      │ fine      │ failed                                    │
+      │           ▼                                           │
+      │   retry? all must hold: idempotent method,            │
+      │   timeout or 503/504, replayable body,                │
+      │   MaxRetries left, retry budget allows                │
+      │           │ yes ── wait (backoff, jitter) ────────────┘
+      │           │ no
+      ▼           ▼
+  report to the breaker: success (with latency) │ failure │ abandoned
+      │
+      ▼
+  the caller gets the response, or a *CircuitError
+  (nothing is stored: a refused request is not replayed)
+```
+
+Retries are deliberately narrow. Only GET, HEAD, OPTIONS and TRACE are retried, only after a timeout, 503 or 504, and only if the body can be replayed. A POST is never retried by the transport, because repeating it may charge a card twice. For those calls use the Kafka route, where steps carry an idempotency key.
+
+**Connecting it.** Build one guard per process and give it to your client. Everything you do not register passes through untouched:
+
+```go
+// newGuardedClient returns an http.Client whose calls to payments are protected.
+// Everything else the client sends passes straight through, untouched.
+func newGuardedClient(paymentsHost string, events obs.Sink) (*http.Client, func() error, error) {
+	guard, err := goguard.New(goguard.Config{},
+		goguard.WithEvents(events),
+		goguard.WithEndpoint("payments", onHost(paymentsHost), goguard.Policy{
+			FailureThreshold: 0.5,              // open at a 50% failure rate...
+			MinSamples:       3,                // ...once this many calls have been seen
+			SleepWindow:      30 * time.Second, // how long to stay open without a health check
+			RequestTimeout:   2 * time.Second,
+			MaxRetries:       2, // idempotent requests only (GET, HEAD, OPTIONS, TRACE)
+			RetryBackoff:     retry.Jitter(retry.Exponential(100*time.Millisecond, time.Second), 0.3),
+		}),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("configuring the guard: %w", err)
+	}
+	return &http.Client{Transport: guard}, guard.Close, nil
+}
+
+// onHost matches requests to one host and port.
+func onHost(host string) goguard.Matcher {
+	return func(r *http.Request) bool { return r.URL.Host == host }
+}
+```
+
+**Using it, and handling a refusal.** A 5xx still comes back as an ordinary response. Only a refusal is an error:
+
+```go
+_, err = client.Post(payments.URL+"/charge", "application/json", nil)
+
+var circuit *goguard.CircuitError
+switch {
+case errors.Is(err, goguard.ErrCircuitOpen) && errors.As(err, &circuit):
+	fmt.Printf("refused: %s circuit is %s\n", "payments", circuit.State)
+case err != nil:
+	fmt.Println("other error:", err)
+}
+```
+
+This example runs as a test (`examples/httpclient`), so it cannot drift from the API.
+
+### Lifecycle of a Kafka message
+
+```
+  Kafka topic
+      │  poll (auto-commit is OFF: the library decides when an offset is safe)
+      ▼
+  ┌───────────────────────────────┐
+  │ Consumer: queue per partition │  the same key runs one at a time, in order;
+  │ and key, pool of Workers      │  different keys run in parallel
+  └───────────────┬───────────────┘
+                  │  a message with this key is already waiting in the store?
+                  ├─────────── yes ──▶ store this one behind it (keeps order) ─────┐
+                  │ no                                                             │
+                  ▼                                                                │
+  ┌───────────────────────────────┐                                                │
+  │ Pipeline: step 1 ─▶ step 2 ─▶ │  each step: its breaker, a timeout, optional   │
+  │ … a checkpoint is saved after │  in-process retry, and an idempotency key      │
+  │ each step succeeds            │                                                │
+  └────┬───────────────┬──────────┘                                                │
+       │               │ a step fails                                              │
+   all steps ok        ▼                                                           │
+       │     ┌─────────────────────────────┐                                       │
+       │     │ what kind of failure?       │                                       │
+       │     └───┬───────────┬──────────┬──┘                                       │
+       │    transient or  permanent    the caller is                               │
+       │    circuit open  (retry.      stopping                                    │
+       │         │        Permanent)   (shutdown)                                  │
+       ▼         ▼           ▼            ▼                                        │
+     DONE    DEFERRED     PARKED      nothing stored,                              │
+       │         │           │        nothing blamed                               │
+       │         └─────┬─────┘                                                     │
+       │               ▼                                                           │
+       │   ┌──────────────────────────────┐                                        │
+       │   │ Store.Append (fsynced log)   │◀───────────────────────────────────────┘
+       │   │ record + checkpoint + the    │  idempotent by topic/partition/offset
+       │   │ dependency it waits on +     │
+       │   │ its order key                │
+       │   └───────────────┬──────────────┘
+       │                   │ on disk: only now is the message "safe"
+       ▼                   ▼
+  ┌───────────────────────────────┐   if the store write fails, the partition is
+  │ commit the offset, contiguous:│   pointed back at the message and paused for a
+  │ up to the highest offset for  │   backoff. Nothing is skipped.
+  │ which every earlier one is    │
+  │ safe                          │
+  └───────────────────────────────┘
+
+  Alongside all of this: if a circuit used by the topic's pipeline is OPEN, its
+  partitions are PAUSED. Messages wait in Kafka, the client keeps being polled so
+  the group does not think the consumer died, and consumption resumes when the
+  circuit leaves the open state.
+```
+
+**The three safe outcomes.** A message is safe to acknowledge only when it is *done*, *deferred* (stored durably with its progress) or *parked* (stored for a person). Anything else, including a store that cannot accept it, is never committed past.
+
+**Why the offset only moves when everything before it is safe.** With several workers, a later message may finish first. The library commits only up to the highest offset for which every earlier offset in the partition is safe, so a slow or failing message holds back the commit, not the other messages. A crash between commits redelivers messages that were already safe; that is harmless because storing is idempotent and steps carry idempotency keys.
+
+### Lifecycle of a stored message: recovery
+
+```
+    stored record: pending, blocked on "payments", checkpoint = reserve done
+         │
+         │  payments' circuit is OPEN ──▶ the redriver skips these records:
+         │                                a long outage costs no attempts
+         │
+         │  the circuit leaves OPEN (the health probes passed)
+         ▼
+  ┌────────────────────────────────────────┐
+  │ The redriver wakes and leases records  │  Rate and Burst cap the speed, and RampUp
+  │ at a limited rate. The lease is logged │  starts at 10% after a recovery, so a service
+  │ before the record leaves the store.    │  that just came back is not flooded
+  └───────────────────┬────────────────────┘
+                      ▼
+  ┌────────────────────────────────────────┐
+  │ pipeline.Handler reads the checkpoint  │  "reserve" is NOT run again;
+  │ and runs only the steps not yet done   │  "charge" onwards runs, with the same
+  └───────────────────┬────────────────────┘  idempotency keys as before
+                      ▼
+      ┌───────────────┼─────────────────┬────────────────────┬──────────────┐
+   success      circuit open or     permanent            other error      shutdown
+      │         blocked again       error                     │               │
+      ▼               ▼                ▼                      ▼               ▼
+  acknowledged:   back to the        PARKED          Nack with backoff;   released
+  removed from    queue, waiting     for a person    after MaxAttempts    untouched
+  the log         for the                            it is PARKED
+                  dependency
+```
+
+A record that has been leased too many times without ever finishing is parked as a probable crasher. Parked records are never retried and never deleted automatically; an operator inspects them (`Parked`, `Describe`), fixes the cause, and resumes them at a chosen step with `Redrive`, or discards them.
+
+**Connecting it.** A complete, compile-checked service is in [`kafka/example_service_test.go`](kafka/example_service_test.go). The important parts:
+
+One breaker per dependency, with a health check so recovery does not depend on a timer:
+
+```go
+func newBreaker(name, healthURL string, events obs.Sink) (*breaker.Breaker, error) {
+	check, err := health.HTTP(healthURL)
+	if err != nil {
+		return nil, fmt.Errorf("health check for %s: %w", name, err)
+	}
+	return breaker.New(breaker.Config{
+		Name:             name,
+		FailureThreshold: 0.5,
+		MinSamples:       20,
+		SleepWindow:      30 * time.Second,
+		// A 4xx says the request was wrong, not that the service is unhealthy.
+		IsFailure: func(err error) bool { return !retry.IsPermanent(err) },
+		Health:    &health.Config{Check: check, Interval: 5 * time.Second, SuccessThreshold: 2},
+		Events:    events,
+	}), nil
+}
+```
+
+A step calls one dependency. The idempotency key is the same for this message and step on every attempt, so a repeat does no harm, and the failure is classified so the library knows what to do with the message:
+
+```go
+func post(url string) func(context.Context, *pipeline.Exec) error {
+	return func(ctx context.Context, x *pipeline.Exec) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(x.Value))
+		if err != nil {
+			return retry.Permanent(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", x.IdempotencyKey())
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err // the dependency is unreachable: transient
+		}
+		defer func() { _ = resp.Body.Close() }()
+		_, _ = io.Copy(io.Discard, resp.Body)
+
+		switch {
+		case resp.StatusCode < 300:
+			return nil
+		case resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests:
+			// The message itself is wrong; retrying cannot help. It is parked for a person.
+			return retry.Permanent(fmt.Errorf("%s answered %d", url, resp.StatusCode))
+		default:
+			return fmt.Errorf("%s answered %d", url, resp.StatusCode)
+		}
+	}
+}
+```
+
+The durable log, with payloads encrypted at rest:
+
+```go
+func (s ordersService) openStore() (dlq.Store, error) {
+	wal, err := dlq.OpenWAL(s.DataDir, dlq.WALOptions{MaxBytes: 2 << 30}) // your disk budget
+	if err != nil {
+		return nil, fmt.Errorf("opening the dead-letter log: %w", err)
+	}
+	enc, err := secure.NewAESGCM(secure.Key{ID: "2026-09", Material: s.EncryptKey})
+	if err != nil {
+		_ = wal.Close()
+		return nil, fmt.Errorf("building the encryptor: %w", err)
+	}
+	store, err := dlq.Secure(wal, dlq.SecureOptions{Encryptor: enc})
+	if err != nil {
+		_ = wal.Close()
+		return nil, err
+	}
+	return store, nil
+}
+```
+
+The pipeline, the redriver and the consumer, wired together (the body of `Run`, after the breakers and the store are opened):
+
+```go
+orders, err := pipeline.New("orders", "v1", []pipeline.Step{
+	{Name: "reserve", Breaker: inventory, Timeout: 5 * time.Second, Run: post(s.InventoryURL + "/reserve")},
+	{Name: "charge", Breaker: payments, Timeout: 5 * time.Second, Run: post(s.PaymentsURL + "/charge")},
+})
+if err != nil {
+	return fmt.Errorf("building the pipeline: %w", err)
+}
+
+producer, err := confluent.NewProducer(ck.ConfigMap{"bootstrap.servers": s.Brokers})
+if err != nil {
+	return fmt.Errorf("creating the dead-letter producer: %w", err)
+}
+defer producer.Close()
+mirror, err := kafka.NewDLQPublisher(kafka.PublisherConfig{Producer: producer}) // "orders.dlq"
+if err != nil {
+	return err
+}
+
+rd, err := dlq.NewRedriver(dlq.RedriveConfig{
+	Store:    store,
+	Handler:  orders.Handler(),
+	Breakers: map[string]*breaker.Breaker{"inventory": inventory, "payments": payments},
+	Rate:     100, RampUp: 30 * time.Second, // do not flood a dependency that just came back
+	OnPark: mirror.Publish,
+	Events: s.Events,
+})
+if err != nil {
+	return fmt.Errorf("creating the redriver: %w", err)
+}
+redriver.Store(rd)
+
+client, err := confluent.NewClient(ck.ConfigMap{
+	"bootstrap.servers": s.Brokers,
+	"group.id":          "orders-service",
+	"auto.offset.reset": "earliest",
+}, []string{"orders"})
+if err != nil {
+	return fmt.Errorf("creating the consumer client: %w", err)
+}
+defer func() { _ = client.Close() }()
+
+consumer, err := kafka.NewConsumer(kafka.Config{
+	Client:         client,
+	Store:          store,
+	Bindings:       []kafka.Binding{{Topic: "orders", Pipeline: orders}},
+	Workers:        4,
+	ProcessTimeout: 30 * time.Second,
+	Mirror:         mirror,
+})
+if err != nil {
+	return fmt.Errorf("creating the consumer: %w", err)
+}
+
+return runBoth(ctx, consumer.Run, rd.Run)
+```
+
+Two details worth knowing. The breakers' `Events` must reach the redriver so it wakes the moment a circuit stops being open (`redriver.Sink()`), rather than at its next poll. And if you already have a single "process this message" function, `kafka.HandlerBinding` gives you the same guarantees without writing a pipeline.
+
+### What you can rely on, and what you must do
+
+| | HTTP | Kafka |
+|---|---|---|
+| A refused or failed call is | Reported to the caller, then gone | Stored with its progress, then replayed |
+| Data kept while a dependency is down | None | Message, checkpoint and order key, fsynced |
+| Retries | Idempotent methods only, budgeted | In-process per step, then redrive with backoff, up to `MaxAttempts` |
+| Ordering | Not applicable | Per key: later messages wait behind a stored one |
+| Duplicates | Not applicable | Possible after a crash: **make steps idempotent** with `x.IdempotencyKey()` |
+| Recovery | Health probe, then one canary call | Health probe, canary, then a rate-limited redrive from the checkpoint |
+
+**Your responsibilities:**
+
+- Make every step and downstream call idempotent. Delivery is at-least-once.
+- Put the store on a persistent volume and keep the encryption key outside it.
+- Choose `MaxBytes` and `MaxRecords` for the worst outage you want to ride out. Past them, `Append` returns `ErrFull`, and the consumer pauses instead of skipping.
+- Run one process per store directory (it is locked), and Unix only.
+- The consumer's logic is tested against a simulated broker. `KAFKA_BROKERS=host:9092 make kafka-integration` runs the suite against a real one.
 
 ## HTTP: you choose what is protected
 
