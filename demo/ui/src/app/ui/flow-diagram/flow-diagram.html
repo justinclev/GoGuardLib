@@ -34,13 +34,13 @@
 
     <!-- edges -->
     <g class="edges">
-      <path class="edge http" [attr.d]="'M ' + (nodes.http.x + 52) + ' ' + nodes.http.y + ' L ' + (nodes.gateway.x - 62) + ' ' + nodes.gateway.y" />
+      <path class="edge http" [attr.d]="'M ' + (nodes.http.x + 60) + ' ' + nodes.http.y + ' L ' + (nodes.gateway.x - 66) + ' ' + nodes.gateway.y" />
       <path class="edge http" [attr.d]="gatewayToFirst" />
-      <path class="edge kafka" [attr.d]="'M ' + (nodes.producer.x + 52) + ' ' + nodes.producer.y + ' L ' + (nodes.topic.x - 66) + ' ' + nodes.topic.y" />
-      <path class="edge kafka" [attr.d]="'M ' + (nodes.topic.x + 66) + ' ' + nodes.topic.y + ' L ' + (nodes.consumer.x - 66) + ' ' + nodes.consumer.y" />
+      <path class="edge kafka" [attr.d]="'M ' + (nodes.producer.x + 60) + ' ' + nodes.producer.y + ' L ' + (nodes.topic.x - 66) + ' ' + nodes.topic.y" />
+      <path class="edge kafka" [attr.d]="'M ' + (nodes.topic.x + 66) + ' ' + nodes.topic.y + ' L ' + (nodes.consumer.x - 72) + ' ' + nodes.consumer.y" />
       <path class="edge kafka" [attr.d]="consumerToFirst" />
       @for (s of services(); track s.name) {
-        <path class="edge row" [attr.d]="'M ' + (s.gx + 26) + ' ' + rowY + ' L ' + (s.x - 50) + ' ' + rowY" />
+        <path class="edge row" [attr.d]="'M ' + (s.gx + 26) + ' ' + rowY + ' L ' + (s.x - 54) + ' ' + rowY" />
         @if (s.prevX !== null) {
           <path class="edge row" [attr.d]="'M ' + s.prevX + ' ' + rowY + ' L ' + (s.gx - 26) + ' ' + rowY" />
         }
@@ -50,7 +50,7 @@
 
     <!-- HTTP side -->
     <g class="node" [attr.transform]="'translate(' + nodes.http.x + ' ' + nodes.http.y + ')'">
-      <rect class="box http" x="-52" y="-40" width="104" height="80" rx="18" />
+      <rect class="box http" x="-60" y="-40" width="120" height="80" rx="18" />
       <g class="icon" transform="translate(-14 -30) scale(1.15)">
         <circle cx="12" cy="12" r="9" />
         <path d="M3 12h18 M12 3c3 3 3 15 0 18 M12 3c-3 3-3 15 0 18" />
@@ -59,7 +59,7 @@
       <text class="sub" y="34">{{ store.snapshot()?.traffic?.httpRps ?? 0 }} req/s</text>
     </g>
     <g class="node" [attr.transform]="'translate(' + nodes.gateway.x + ' ' + nodes.gateway.y + ')'">
-      <rect class="box http" x="-62" y="-40" width="124" height="80" rx="18" />
+      <rect class="box http" x="-66" y="-40" width="132" height="80" rx="18" />
       <g class="icon" transform="translate(-14 -30) scale(1.15)">
         <path d="M4 4h16v6H4z M4 14h16v6H4z M7 7h.01 M7 17h.01" />
       </g>
@@ -71,7 +71,7 @@
 
     <!-- Kafka side -->
     <g class="node" [attr.transform]="'translate(' + nodes.producer.x + ' ' + nodes.producer.y + ')'">
-      <rect class="box kafka" x="-52" y="-40" width="104" height="80" rx="18" />
+      <rect class="box kafka" x="-60" y="-40" width="120" height="80" rx="18" />
       <g class="icon" transform="translate(-14 -30) scale(1.15)">
         <rect x="3" y="4" width="18" height="6" rx="1.5" />
         <rect x="3" y="14" width="18" height="6" rx="1.5" />
@@ -95,7 +95,7 @@
     </g>
 
     <g class="node" [attr.transform]="'translate(' + nodes.consumer.x + ' ' + nodes.consumer.y + ')'">
-      <rect class="box kafka" x="-66" y="-40" width="132" height="80" rx="18" />
+      <rect class="box kafka" x="-72" y="-40" width="144" height="80" rx="18" />
       <g class="icon" transform="translate(-14 -30) scale(1.15)">
         <path d="M4 6h16 M4 12h16 M4 18h10 M17 16l3 2-3 2" />
       </g>
@@ -118,16 +118,16 @@
             <path d="M8 11V8a4 4 0 0 1 8 0 M5 11h14v10H5z M12 15v2" />
           }
         </g>
-        <text class="gate-state" y="52">{{ s.state | uppercase }}</text>
+        <text class="gate-state" y="-40">{{ s.state | uppercase }}</text>
       </g>
 
       <g class="node svc" [class.down]="s.down" [class.slow]="s.mode === 'slow'" [class.flaky]="s.mode === 'flaky'"
          [attr.transform]="'translate(' + s.x + ' ' + rowY + ')'">
-        <rect class="box svc-box" x="-50" y="-52" width="100" height="104" rx="20" [attr.fill]="s.down ? 'url(#panelDown)' : 'url(#panel)'" />
+        <rect class="box svc-box" x="-54" y="-52" width="108" height="104" rx="20" [attr.fill]="s.down ? 'url(#panelDown)' : 'url(#panel)'" />
         <g class="icon svc-icon" transform="translate(-16 -40) scale(1.35)">
           <path [attr.d]="s.icon" />
         </g>
-        <text class="title" y="20">{{ s.label }}</text>
+        <text class="title svc-title" y="20">{{ s.label }}</text>
         <text class="sub" y="38">{{ s.down ? 'OFFLINE' : s.mode === 'unknown' ? '…' : s.mode === 'up' ? s.served + ' served' : s.mode }}</text>
         <circle class="led" cx="36" cy="-38" r="5" />
         @if (s.down) {
@@ -141,7 +141,7 @@
       <rect class="box dlq-box" x="-118" y="-62" width="236" height="104" rx="22" />
       <rect class="fill dlq" x="-112" [attr.y]="36 - dlqFill() * 92" width="224" [attr.height]="dlqFill() * 92" rx="16" />
       <text class="title" y="-36">Durable dead-letter log</text>
-      <text class="big-num" y="6">{{ (store.snapshot()?.dlq?.pending ?? 0) + (store.snapshot()?.dlq?.leased ?? 0) }}</text>
+      <text class="big-num" x="-70" y="14">{{ (store.snapshot()?.dlq?.pending ?? 0) + (store.snapshot()?.dlq?.leased ?? 0) }}</text>
       <text class="sub" y="26">
         stored on disk · {{ store.snapshot()?.dlq?.redriven ?? 0 }} redriven
         @if ((store.snapshot()?.dlq?.parked ?? 0) > 0) { · {{ store.snapshot()?.dlq?.parked }} parked }

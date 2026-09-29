@@ -39,6 +39,8 @@ Press **✦ Guided demo** and let it run, or do it by hand:
 5. The shield goes **green**. The redriver drains the log **from the Payments step** (Inventory is not repeated), ramping up gently so the recovering service is not flooded.
 6. The commentary and counters confirm: nothing was lost.
 
+Note: while orders are waiting in the log, new Kafka orders for the *same customer* are stored behind them (amber, "held in order") so they cannot overtake an earlier order. That is per-key ordering doing its job, and the backlog drains as the redriver catches up.
+
 Other things worth trying: **slow** (calls exceed the timeout), **flaky** (about half fail, so the breaker hovers), taking down **two** services, the **Storm** preset, and slow motion (0.5×).
 
 ## How it is built

@@ -101,7 +101,7 @@ func run() error {
 		Store: store, Handler: a.pipe.Handler(), Breakers: a.breakers,
 		Workers: 4, LeaseTTL: 20 * time.Second, PollInterval: 200 * time.Millisecond, MaxAttempts: 8,
 		Backoff: retry.Jitter(retry.Constant(time.Second), 0.3),
-		Rate:    15, Burst: 5, RampUp: 6 * time.Second, // don't flood a service that just came back
+		Rate:    40, Burst: 10, RampUp: 5 * time.Second, // don't flood a service that just came back
 	})
 	if err != nil {
 		return err
@@ -249,8 +249,8 @@ type breakerState struct {
 }
 
 type Snapshot struct {
-	T       int64          `json:"t"`
-	Backend string         `json:"backend"` // "kafka" or "sim"
+	T       int64  `json:"t"`
+	Backend string `json:"backend"` // "kafka" or "sim"
 	Traffic struct {
 		HTTPRPS  float64 `json:"httpRps"`
 		KafkaRPS float64 `json:"kafkaRps"`

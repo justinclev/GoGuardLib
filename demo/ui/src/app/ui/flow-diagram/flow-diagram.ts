@@ -76,7 +76,7 @@ export class FlowDiagram implements AfterViewInit {
         rejected: br?.rejected ?? 0,
         opens: br?.opens ?? 0,
         // where the previous stage's line ends and the next begins
-        prevX: i === 0 ? null : SERVICE_X[STEPS[i - 1]] + 47,
+        prevX: i === 0 ? null : SERVICE_X[STEPS[i - 1]] + 54,
         left: (x / W) * 100,
         toolbarTop: ((ROW_Y + 74) / H) * 100,
       };

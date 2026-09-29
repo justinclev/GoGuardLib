@@ -12,20 +12,20 @@ export interface Pt {
 export const ROW_Y = 290;
 
 export const SERVICE_X: Record<StepName, number> = {
-  inventory: 655,
-  payments: 810,
+  inventory: 615,
+  payments: 790,
   shipping: 965,
-  notifications: 1115,
+  notifications: 1135,
 };
 
-export const GATE_OFFSET = 68;
+export const GATE_OFFSET = 84;
 
 export const NODES = {
   http: { x: 78, y: 118 } as Pt,
-  gateway: { x: 372, y: 118 } as Pt,
+  gateway: { x: 345, y: 118 } as Pt,
   producer: { x: 78, y: 512 } as Pt,
-  topic: { x: 250, y: 512 } as Pt,
-  consumer: { x: 442, y: 512 } as Pt,
+  topic: { x: 240, y: 512 } as Pt,
+  consumer: { x: 415, y: 512 } as Pt,
   dlq: { x: 880, y: 540 } as Pt,
 };
 

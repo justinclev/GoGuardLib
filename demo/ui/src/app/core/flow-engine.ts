@@ -365,9 +365,9 @@ export class FlowEngine {
     if (!p.cur && p.queue.length === 0 && p.home) {
       // waiting in the topic or the dead-letter queue: drift gently
       p.angle += 0.01 * this.speed;
-      const h = p.home === 'topic' ? NODES.topic : NODES.dlq;
-      const rx = p.home === 'topic' ? 34 : 70;
-      const ry = p.home === 'topic' ? 24 : 34;
+      const h = p.home === 'topic' ? { x: NODES.topic.x, y: NODES.topic.y + 6 } : { x: NODES.dlq.x + 34, y: NODES.dlq.y + 12 };
+      const rx = p.home === 'topic' ? 34 : 58;
+      const ry = p.home === 'topic' ? 18 : 18;
       const tx = h.x + p.slot.x * rx + Math.cos(p.angle) * 4;
       const ty = h.y + p.slot.y * ry + Math.sin(p.angle) * 4;
       p.x += (tx - p.x) * 0.08;

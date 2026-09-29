@@ -137,6 +137,10 @@ text {
   fill: var(--muted);
 }
 
+.svc-title {
+  font-size: 13.5px;
+}
+
 .big-num {
   font-size: 30px;
   font-weight: 750;
@@ -334,6 +338,7 @@ text {
   font-size: clamp(9px, 0.95vw, 13px);
 
   .kill {
+    white-space: nowrap;
     font: inherit;
     font-weight: 700;
     letter-spacing: 0.04em;
