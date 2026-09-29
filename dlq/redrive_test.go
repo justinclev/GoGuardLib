@@ -812,3 +812,22 @@ func TestRunReturnsEvenIfAHandlerIgnoresItsContext(t *testing.T) {
 		t.Fatal("Run did not return: a stuck handler held up shutdown")
 	}
 }
+
+// A mirror that never answers must not hold a redrive worker for ever.
+func TestOnParkIsBoundedByItsTimeout(t *testing.T) {
+	store := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	addBlocked(t, store, 2, "pay")
+	r := newRedriver(t, dlq.RedriveConfig{
+		Store: store,
+		Handler: func(ctx context.Context, it *dlq.Item) error {
+			return retry.Permanent(errors.New("rejected"))
+		},
+		OnParkTimeout: 50 * time.Millisecond,
+		OnPark: func(ctx context.Context, rec dlq.Record, reason string) error {
+			<-ctx.Done() // a hung producer: only the deadline ends this
+			return ctx.Err()
+		},
+	})
+	start(t, r)
+	eventually(t, "both hung mirrors to time out", func() bool { return r.Stats().MirrorErrors == 2 })
+}

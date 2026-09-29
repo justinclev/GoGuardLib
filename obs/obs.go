@@ -29,6 +29,7 @@ const (
 	KindRetried      Kind = "retried"
 	KindProbeResult  Kind = "probe_result"
 	KindRedrive      Kind = "redrive"
+	KindStore        Kind = "store"
 )
 
 // Event is a signal emitted by the library.
@@ -92,6 +93,28 @@ type Redrive struct {
 
 func (Redrive) EventKind() Kind { return KindRedrive }
 
+// StoreCode says what happened to a dead-letter store.
+type StoreCode string
+
+const (
+	StoreCompactionFailed    StoreCode = "compaction_failed"    // a snapshot or compaction attempt failed; the log keeps growing
+	StoreCompactionRecovered StoreCode = "compaction_recovered" // compaction works again
+	StoreFailedClosed        StoreCode = "failed_closed"        // a write or fsync failed; the store refuses writes until reopened
+	StoreSyncTimeout         StoreCode = "sync_timeout"         // fsync did not finish within SyncTimeout
+	StoreDiskLow             StoreCode = "disk_low"             // free space is below the configured floor
+	StoreQuarantined         StoreCode = "quarantined"          // a damaged segment tail was set aside
+)
+
+// StoreEvent reports a condition of a dead-letter store that an operator must
+// know about without polling Stats. It carries no record contents and no error
+// text, since an error can embed a file path or a payload fragment.
+type StoreEvent struct {
+	Code StoreCode
+	At   time.Time
+}
+
+func (StoreEvent) EventKind() Kind { return KindStore }
+
 // Sink receives events. Emit is called on hot paths, so implementations must
 // return quickly and must not block; use a Dispatcher to hand events to code
 // that may be slow.
@@ -104,18 +127,22 @@ type SinkFunc func(Event)
 
 func (f SinkFunc) Emit(e Event) { f(e) }
 
-// Emit sends e to s if s is non-nil.
+// Emit sends e to s if s is non-nil. A sink that panics is contained: the
+// library calls Emit from request paths and background goroutines, and a bug in
+// an observer must never take those down.
 func Emit(s Sink, e Event) {
-	if s != nil {
-		s.Emit(e)
+	if s == nil {
+		return
 	}
+	defer func() { _ = recover() }()
+	s.Emit(e)
 }
 
 type multi []Sink
 
 func (m multi) Emit(e Event) {
 	for _, s := range m {
-		s.Emit(e)
+		Emit(s, e)
 	}
 }
 

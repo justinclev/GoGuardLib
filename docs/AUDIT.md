@@ -241,6 +241,20 @@ After the fixes above, the code they added or changed (the queue index, the two-
 
 **Demo scenario added.** A "bad order" is refused permanently by Payments and parked. The first version used a customer key shared with normal traffic, and the ordering guarantee (correctly) held back every later order for that customer behind the parked one, 24 orders behind 3 bad ones, which contradicted "the rest carries on". Bad orders now use their own key; the README states the same-key behaviour plainly. Checked natively: 51 produced, 48 done, 3 parked, none held, ledger agrees. slow, flaky and the guided demo were also driven in Chromium with no console errors.
 
+## Fourth pass: enterprise review of the library, batch 1 ("never lose it, never wedge")
+
+A read of every non-test source file in the root and `kafka` modules. Each fix below has a regression test that failed before the change. Behaviour changes are opt-in, or a bound that only applies where the code previously hung.
+
+| Ref | Severity | Finding | Fix |
+|---|---|---|---|
+| D1 | High | A message the store can never hold (over `MaxRecordBytes`) that also fails processing was retried forever: the partition stopped, the consumer looked healthy, nothing said why. | `Config.OnUnstorable`: `UnstorableHalt` (default) stops `Run` with `kafka.ErrUnstorable` naming topic, partition and offset (never the payload); `UnstorableSkip` commits past it, counts it in `Stats.Unstorable` and copies it to the mirror. |
+| D2 | Medium | `KafkaID(topic, partition, offset)` names a message only within one cluster. A recreated topic or a failover to a replica cluster made a new message look like a stored duplicate and dropped it. | `dlq.KafkaIDIn(namespace, ...)` and `Config.IDNamespace`. Empty namespace is unchanged, so existing stores keep matching. A payload-fingerprint check on duplicates was considered and not built: it needs a record-format change. |
+| D4 | High | `waitDurable` ignored the caller's context. A stalled fsync held every store call and `Close` indefinitely. | The wait honours the context; `WALOptions.SyncTimeout` (opt-in) fails the store closed when an fsync does not return; `Close` on a failed store gives up on a stuck syncer after 5s without closing its file or releasing the directory lock; segment rotation no longer waits behind a failed syncer. |
+| D5 | Medium | A transient read error (EMFILE, EIO) while leasing was classified as corruption and parked a healthy record. | Only a missing file or a short file is corruption. Other errors leave the record queued and it is retried on the next poll. |
+| D6 | Medium | `Config.Mirror` and `RedriveConfig.OnPark` had no timeout: a hung dead-letter producer froze a worker and its partition. | `Config.MirrorTimeout` and `RedriveConfig.OnParkTimeout`, default 10s. |
+| D9 | Medium | Compaction failure was visible only by polling `WALStats`. | `obs.StoreEvent` (compaction failed/recovered, failed closed, sync timeout, disk low, quarantined) to `WALOptions.Events`. |
+| S8 | Medium | `obs.Emit` did not recover: a panicking sink crashed request paths and background goroutines. | `Emit` recovers; `Multi` continues to later sinks. |
+
 ## What was checked and found sound
 
 Recorded so the next reviewer does not repeat it.

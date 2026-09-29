@@ -98,3 +98,16 @@ func TestMultiAndEmit(t *testing.T) {
 		t.Fatal("wrong event kinds")
 	}
 }
+
+func TestEmitContainsPanickingSink(t *testing.T) {
+	var got int
+	good := SinkFunc(func(Event) { got++ })
+	bad := SinkFunc(func(Event) { panic("sink bug") })
+	// A faulty sink must not crash the emitting code path, and must not stop
+	// the sinks after it in a Multi.
+	Emit(bad, StateChanged{})
+	Emit(Multi(bad, good), StateChanged{})
+	if got != 1 {
+		t.Fatalf("sink after a panicking one saw %d events, want 1", got)
+	}
+}

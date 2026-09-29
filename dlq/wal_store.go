@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/justinclev/GoGuardLib/obs"
 	"github.com/justinclev/GoGuardLib/secure"
 )
 
@@ -158,6 +159,21 @@ type WALOptions struct {
 	// Default 32.
 	FileCacheSize int
 
+	// SyncTimeout bounds how long an operation waits for its fsync under SyncAlways.
+	// A disk that stalls (a hung network volume, a dying device) would otherwise
+	// hold every caller and Close indefinitely. When the wait exceeds it the store
+	// fails closed exactly as it does for a failed fsync: the on-disk state of the
+	// unsynced entries is unknown, so it stops serving and recovery on reopen
+	// restores everything that was acknowledged. Zero waits without a bound (a
+	// caller's context deadline still applies); it is off by default and will
+	// default to 30s at v1.0.
+	SyncTimeout time.Duration
+
+	// Events receives obs.StoreEvent for conditions an operator must act on:
+	// compaction failing or recovering, the store failing closed, a sync timeout.
+	// Emit must not block; wrap slow sinks in an obs.Dispatcher.
+	Events obs.Sink
+
 	// Clock replaces time.Now, for tests.
 	Clock func() time.Time
 
@@ -289,6 +305,7 @@ type WALStore struct {
 	diskFree      uint64
 	diskCheckedAt time.Time
 	diskWritten   uint64
+	diskLow       bool
 
 	mu          sync.Mutex // state, log position and files
 	m           *machine
@@ -319,6 +336,11 @@ type WALStore struct {
 }
 
 var _ Store = (*WALStore)(nil)
+
+// emit reports a store condition to Options.Events.
+func (w *WALStore) emit(code obs.StoreCode) {
+	obs.Emit(w.opts.Events, obs.StoreEvent{Code: code, At: w.opts.Clock()})
+}
 
 func (w *WALStore) leaseHook(stage string) {
 	if h := w.opts.leaseHook; h != nil {
@@ -711,6 +733,7 @@ func (w *WALStore) quarantine(path string, from, to int64) error {
 		return err
 	}
 	w.recovery.QuarantineFile = qpath
+	w.emit(obs.StoreQuarantined)
 	return syncDir(w.dir)
 }
 

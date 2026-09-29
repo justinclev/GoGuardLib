@@ -20,6 +20,30 @@ import (
 // was configured with a different topic list.
 var ErrUnboundTopic = errors.New("kafka: message from a topic with no binding")
 
+// ErrUnstorable is returned by Run when a message can be neither processed nor
+// stored (for example, it is larger than the store accepts) and OnUnstorable is
+// UnstorableHalt. Retrying cannot help, so the consumer stops instead of leaving
+// the partition blocked while looking healthy. The error names the topic,
+// partition and offset, never the payload.
+var ErrUnstorable = errors.New("kafka: message can be neither processed nor stored")
+
+// UnstorablePolicy says what to do with a message that fails and that the store
+// will never accept.
+type UnstorablePolicy int
+
+const (
+	// UnstorableHalt stops Run with ErrUnstorable, committing only what is safe.
+	// Nothing is lost; an operator must deal with the message (raise the store's
+	// limit, fix the producer, or restart with UnstorableSkip after deciding it may
+	// go). This is the default.
+	UnstorableHalt UnstorablePolicy = iota
+	// UnstorableSkip commits past the message. It is lost from this consumer: it is
+	// counted in Stats.Unstorable and copied to Config.Mirror if one is set (best
+	// effort, and that copy can fail for the same reason). Choose it only when
+	// availability matters more than any single message.
+	UnstorableSkip
+)
+
 // Binding guards one topic: every message on it runs through Pipeline. Topics with
 // no binding are not consumed by this Consumer.
 type Binding struct {
@@ -83,6 +107,19 @@ type Config struct {
 	// with jitter.
 	RetryBackoff retry.Backoff
 
+	// OnUnstorable is what happens to a message that fails and cannot be stored
+	// (see UnstorablePolicy). Default UnstorableHalt.
+	OnUnstorable UnstorablePolicy
+	// IDNamespace names the Kafka cluster this consumer reads (see dlq.KafkaIDIn).
+	// Set it whenever topics can be recreated or the consumer can fail over to
+	// another cluster, and keep it stable for the life of the store: changing it
+	// makes messages already stored look new. Default empty.
+	IDNamespace string
+	// MirrorTimeout bounds one publish to the dead-letter topic. A producer that
+	// hangs (broker down, full queue) would otherwise hold a worker, and with it the
+	// partition, indefinitely. Default 10 seconds.
+	MirrorTimeout time.Duration
+
 	// Mirror, if set, receives a copy of every message the pipeline parks, for a
 	// Kafka dead-letter topic. It is best effort: the message is already parked in
 	// the Store.
@@ -105,8 +142,9 @@ type Stats struct {
 	CommitErrors uint64
 	Rebalances   uint64
 	MirrorErrors uint64
-	Paused       int // partitions currently paused
-	InFlight     int // messages taken from the client and not yet finished
+	Unstorable   uint64 // skipped because they could not be stored (UnstorableSkip)
+	Paused       int    // partitions currently paused
+	InFlight     int    // messages taken from the client and not yet finished
 }
 
 type partition struct {
@@ -163,7 +201,7 @@ type Consumer struct {
 	keyQueues map[failedKey][]task
 
 	received, done, deferred, parked, orderHeld, retried, backpressure atomic.Uint64
-	commits, commitErrors, rebalances, mirrorErrors                    atomic.Uint64
+	commits, commitErrors, rebalances, mirrorErrors, unstorable        atomic.Uint64
 	pausedNow, inflightNow                                             atomic.Int64
 }
 
@@ -197,6 +235,9 @@ func NewConsumer(cfg Config) (*Consumer, error) {
 	}
 	if cfg.ProcessTimeout <= 0 {
 		cfg.ProcessTimeout = 2 * time.Minute
+	}
+	if cfg.MirrorTimeout <= 0 {
+		cfg.MirrorTimeout = 10 * time.Second
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = 5 * time.Second
@@ -247,7 +288,7 @@ func (c *Consumer) Stats() Stats {
 		Received: c.received.Load(), Done: c.done.Load(), Deferred: c.deferred.Load(), Parked: c.parked.Load(),
 		OrderHeld: c.orderHeld.Load(), Retried: c.retried.Load(), Backpressure: c.backpressure.Load(),
 		Commits: c.commits.Load(), CommitErrors: c.commitErrors.Load(), Rebalances: c.rebalances.Load(),
-		MirrorErrors: c.mirrorErrors.Load(), Paused: int(c.pausedNow.Load()), InFlight: int(c.inflightNow.Load()),
+		MirrorErrors: c.mirrorErrors.Load(), Unstorable: c.unstorable.Load(), Paused: int(c.pausedNow.Load()), InFlight: int(c.inflightNow.Load()),
 	}
 }
 
@@ -546,7 +587,7 @@ func (c *Consumer) accept(ctx context.Context, m Message) error {
 	c.received.Add(1)
 
 	in := pipeline.Input{
-		ID:      dlq.KafkaID(m.Topic, m.Partition, m.Offset),
+		ID:      dlq.KafkaIDIn(c.cfg.IDNamespace, m.Topic, m.Partition, m.Offset),
 		Source:  dlq.Source{Kind: "kafka", Name: m.Topic, Partition: m.Partition, Offset: m.Offset},
 		Key:     m.Key,
 		Value:   m.Value,
@@ -724,6 +765,20 @@ func (c *Consumer) complete(ctx context.Context, r result) error {
 		return nil // the partition was revoked meanwhile: its new owner starts from the committed offset
 	}
 	p.inflight--
+	if r.res != pipeline.Done && r.res != pipeline.Deferred && r.res != pipeline.Parked && errors.Is(r.err, dlq.ErrInvalidRecord) {
+		// The store will never accept this message, so retrying is pointless.
+		if c.cfg.OnUnstorable != UnstorableSkip {
+			return fmt.Errorf("%w: %s offset %d: %w", ErrUnstorable, tp, r.m.Offset, r.err)
+		}
+		c.unstorable.Add(1)
+		c.mirror(ctx, r.in)
+		c.markDone(tp, p, r.m.Offset)
+		c.released(r.task)
+		if p.failedAt >= 0 && p.inflight == 0 && !c.stopping {
+			return c.rewind(tp, p)
+		}
+		return nil
+	}
 	switch r.res {
 	case pipeline.Done, pipeline.Deferred, pipeline.Parked:
 		switch r.res {
@@ -837,7 +892,9 @@ func (c *Consumer) mirror(ctx context.Context, in pipeline.Input) {
 	rec := dlq.Record{
 		ID: in.ID, State: dlq.Parked, Source: in.Source, Key: in.Key, Value: in.Value, Headers: in.Headers, OrderKey: in.OrderKey,
 	}
-	if err := c.cfg.Mirror.Publish(context.WithoutCancel(ctx), rec, "parked by the pipeline: see the dead-letter store"); err != nil {
+	mctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.MirrorTimeout)
+	defer cancel()
+	if err := c.cfg.Mirror.Publish(mctx, rec, "parked by the pipeline: see the dead-letter store"); err != nil {
 		c.mirrorErrors.Add(1)
 	}
 }

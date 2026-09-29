@@ -55,6 +55,7 @@ type fileCache struct {
 	files  map[fileKey]*list.Element
 	lru    *list.List // *cachedFile, most recently used first
 	closed bool
+	openFn func(path string) (*os.File, error) // os.Open unless a test replaces it
 }
 
 func newFileCache(dir string, max int) *fileCache {
@@ -86,7 +87,11 @@ func (c *fileCache) acquire(k fileKey) (*cachedFile, error) {
 		cf.refs++
 		return cf, nil
 	}
-	f, err := os.Open(c.path(k))
+	open := c.openFn
+	if open == nil {
+		open = os.Open
+	}
+	f, err := open(c.path(k))
 	if err != nil {
 		return nil, err
 	}
@@ -157,6 +162,21 @@ func (c *fileCache) closeAll() {
 	}
 }
 
+// errTransientRead marks a read that failed for a reason that says nothing about
+// the data: out of file descriptors, an I/O error, a timeout. The record is fine
+// and the read is worth repeating; parking it as corrupt would take a healthy
+// record out of service on a passing fault.
+var errTransientRead = errors.New("dlq: transient read failure")
+
+// readFailure classifies an error from opening or reading a log file. A missing
+// file or a file shorter than its reference is damage; anything else is transient.
+func readFailure(err error) error {
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return unreadable("%v", err)
+	}
+	return fmt.Errorf("%w: %w", errTransientRead, err)
+}
+
 func unreadable(format string, args ...any) error {
 	return fmt.Errorf("%w: payload unreadable: %s", ErrCorrupt, fmt.Sprintf(format, args...))
 }
@@ -165,7 +185,7 @@ func unreadable(format string, args ...any) error {
 func (w *WALStore) loadFrame(ref blobRef) (frame, error) {
 	b, err := w.files.readAt(fileKey{snap: ref.snap, id: ref.file}, ref.off, int(ref.n))
 	if err != nil {
-		return frame{}, unreadable("%v", err)
+		return frame{}, readFailure(err)
 	}
 	fr, err := readFrame(bufio.NewReader(bytes.NewReader(b)), int64(len(b)), w.opts.maxEntryBytes)
 	if err != nil {

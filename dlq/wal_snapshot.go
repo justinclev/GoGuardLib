@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/justinclev/GoGuardLib/obs"
 	"io"
 	"os"
 	"path/filepath"
@@ -118,7 +119,7 @@ func (w *WALStore) compactOnce(ctx context.Context) error {
 		return *f
 	}
 	err := w.compactLocked()
-	w.compactErr = err
+	w.setCompactErr(err)
 	return err
 }
 
@@ -165,7 +166,7 @@ func (w *WALStore) compactOffload(ctx context.Context) (err error) {
 			return
 		}
 		w.mu.Lock()
-		w.compactErr = err
+		w.setCompactErr(err)
 		w.mu.Unlock()
 	}()
 	w.mu.Lock()
@@ -420,3 +421,16 @@ func (w *WALStore) writeSnapshot(path string, last uint64) error {
 type fileWriter struct{ f walFile }
 
 func (fw fileWriter) Write(p []byte) (int, error) { return fw.f.Write(p) }
+
+// setCompactErr records the outcome of a compaction and reports the transitions
+// an operator needs: it started failing, or works again. The caller holds w.mu.
+func (w *WALStore) setCompactErr(err error) {
+	failing, wasFailing := err != nil, w.compactErr != nil
+	w.compactErr = err
+	switch {
+	case failing && !wasFailing:
+		w.emit(obs.StoreCompactionFailed)
+	case !failing && wasFailing:
+		w.emit(obs.StoreCompactionRecovered)
+	}
+}

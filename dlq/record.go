@@ -204,6 +204,20 @@ func KafkaID(topic string, partition int32, offset int64) string {
 	return DeterministicID("kafka", topic, strconv.FormatInt(int64(partition), 10), strconv.FormatInt(offset, 10))
 }
 
+// KafkaIDIn is KafkaID scoped to a namespace: the name of the cluster (or of the
+// disaster-recovery pairing) the message came from. A message's topic, partition
+// and offset identify it only within one cluster. When a topic is deleted and
+// recreated, or a consumer fails over to a replica cluster whose offsets differ,
+// the same triple names a different message, and a stored record from the old one
+// would make the store treat the new message as a duplicate and drop it. Give
+// every cluster its own namespace. An empty namespace gives KafkaID.
+func KafkaIDIn(namespace, topic string, partition int32, offset int64) string {
+	if namespace == "" {
+		return KafkaID(topic, partition, offset)
+	}
+	return DeterministicID("kafka", namespace, topic, strconv.FormatInt(int64(partition), 10), strconv.FormatInt(offset, 10))
+}
+
 func formatUUID(b [16]byte) string {
 	var out [36]byte
 	hex.Encode(out[0:8], b[0:4])

@@ -2,10 +2,13 @@ package dlq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/justinclev/GoGuardLib/obs"
 )
 
 // ---- failing closed ----
@@ -13,7 +16,9 @@ import (
 // setFailure records the first fatal error. After it, every operation is refused.
 func (w *WALStore) setFailure(cause error) error {
 	e := fmt.Errorf("%w: %w", ErrStoreFailed, cause)
-	w.failure.CompareAndSwap(nil, &e)
+	if w.failure.CompareAndSwap(nil, &e) {
+		w.emit(obs.StoreFailedClosed)
+	}
 	return *w.failure.Load()
 }
 
@@ -86,8 +91,11 @@ func (w *WALStore) newSegmentLocked(start uint64) error {
 func (w *WALStore) rotateLocked() error {
 	w.syncMu.Lock()
 	defer w.syncMu.Unlock()
-	for w.syncing { // never close a file the syncer is still flushing
+	for w.syncing && w.failure.Load() == nil { // never close a file the syncer is still flushing
 		w.syncDone.Wait()
+	}
+	if f := w.failure.Load(); f != nil {
+		return *f // the syncer is stuck or failed: do not touch its file
 	}
 	if err := w.active.Sync(); err != nil {
 		_ = w.setFailure(fmt.Errorf("fsync on rotation: %w", err))
@@ -161,8 +169,11 @@ func (w *WALStore) currentSeq() uint64 {
 }
 
 // waitDurable blocks until the entry at seq has been fsynced (SyncAlways), or
-// returns the failure that prevented it.
-func (w *WALStore) waitDurable(seq uint64) error {
+// returns why it could not: the store failed, the caller's context ended, or the
+// fsync took longer than SyncTimeout (which fails the store closed). When the
+// context ends first the entry may still become durable, so the caller must treat
+// the outcome as unknown; Append is idempotent by ID, so retrying is safe.
+func (w *WALStore) waitDurable(ctx context.Context, seq uint64) error {
 	if w.opts.Sync != SyncAlways {
 		if f := w.failure.Load(); f != nil {
 			return *f
@@ -171,13 +182,38 @@ func (w *WALStore) waitDurable(seq uint64) error {
 	}
 	w.syncMu.Lock()
 	defer w.syncMu.Unlock()
-	for w.durable < seq && w.failure.Load() == nil {
+	if w.durable >= seq {
+		return nil
+	}
+	wctx, cancel := ctx, context.CancelFunc(func() {})
+	if w.opts.SyncTimeout > 0 {
+		wctx, cancel = context.WithTimeout(ctx, w.opts.SyncTimeout)
+	}
+	defer cancel()
+	// Wake the wait below when either deadline passes; sync.Cond has no timeout.
+	stop := context.AfterFunc(wctx, func() {
+		w.syncMu.Lock()
+		w.syncDone.Broadcast()
+		w.syncMu.Unlock()
+	})
+	defer stop()
+	for w.durable < seq && w.failure.Load() == nil && wctx.Err() == nil {
 		w.syncDone.Wait()
 	}
 	if w.durable >= seq {
 		return nil
 	}
-	return *w.failure.Load()
+	if f := w.failure.Load(); f != nil {
+		return *f
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	// Only SyncTimeout can have ended the wait: the disk is not answering.
+	w.emit(obs.StoreSyncTimeout)
+	err := w.setFailure(fmt.Errorf("fsync did not finish within %v", w.opts.SyncTimeout))
+	w.syncDone.Broadcast()
+	return err
 }
 
 // syncLoopAlways is the group committer: while one fsync runs, later operations
@@ -249,9 +285,9 @@ func (w *WALStore) syncOnce() {
 // ---- Store ----
 
 // finish releases the lock and waits for durability of seq.
-func (w *WALStore) finish(seq uint64) error {
+func (w *WALStore) finish(ctx context.Context, seq uint64) error {
 	w.mu.Unlock()
-	return w.waitDurable(seq)
+	return w.waitDurable(ctx, seq)
 }
 
 // diskCheckEvery bounds how often the volume is measured.
@@ -275,7 +311,14 @@ func (w *WALStore) checkDiskLocked(need uint64) error {
 	if w.diskFree > w.diskWritten {
 		free = w.diskFree - w.diskWritten
 	}
-	if free < uint64(min)+need {
+	low := free < uint64(min)+need
+	if low != w.diskLow {
+		w.diskLow = low
+		if low {
+			w.emit(obs.StoreDiskLow)
+		}
+	}
+	if low {
 		return fmt.Errorf("%w: %w: %d bytes free, %d must stay free", ErrFull, ErrDiskLow, free, min)
 	}
 	return nil
@@ -312,7 +355,7 @@ func (w *WALStore) Append(ctx context.Context, r Record) error {
 	if dup {
 		// The original may still be waiting for its fsync: do not report the
 		// record safe before it is.
-		return w.finish(w.currentSeq())
+		return w.finish(ctx, w.currentSeq())
 	}
 	if err := w.checkDiskLocked(0); err != nil {
 		w.mu.Unlock()
@@ -327,7 +370,7 @@ func (w *WALStore) Append(ctx context.Context, r Record) error {
 	}
 	w.insertRecord(rec, ref)
 	w.maybeCompactLocked()
-	return w.finish(seq)
+	return w.finish(ctx, seq)
 }
 
 // leaseCand is a record a Lease has picked and reserved.
@@ -396,7 +439,7 @@ func (w *WALStore) Lease(ctx context.Context, req LeaseRequest) ([]Lease, error)
 		return nil, err
 	}
 	w.maybeCompactLocked()
-	if err := w.finish(seq); err != nil {
+	if err := w.finish(ctx, seq); err != nil {
 		return nil, err
 	}
 	if len(leases) == 0 {
@@ -435,6 +478,9 @@ func (w *WALStore) commitLease(ctx context.Context, req LeaseRequest, cands []le
 			c.rec, c.err = w.hydrate(c.it)
 		}
 		if c.err != nil {
+			if errors.Is(c.err, errTransientRead) {
+				continue // the record is fine, the read was not: leave it queued for the next poll
+			}
 			bad = append(bad, c.it)
 			continue
 		}
@@ -526,7 +572,7 @@ func (w *WALStore) Checkpoint(ctx context.Context, id, token string, checkpoint 
 	}
 	w.setCheckpointAt(it, checkpoint, ref)
 	w.maybeCompactLocked()
-	return w.finish(seq)
+	return w.finish(ctx, seq)
 }
 
 // withLease runs a lease-fenced state change: verify, log, apply.
@@ -553,7 +599,7 @@ func (w *WALStore) withLease(ctx context.Context, id, token string, typ byte, bo
 	}
 	apply(it)
 	w.maybeCompactLocked()
-	return w.finish(seq)
+	return w.finish(ctx, seq)
 }
 
 // Ack implements Store.
@@ -619,7 +665,7 @@ func (w *WALStore) withParked(ctx context.Context, id string, typ byte, apply fu
 	}
 	apply(it)
 	w.maybeCompactLocked()
-	return w.finish(seq)
+	return w.finish(ctx, seq)
 }
 
 // Requeue implements Store.
@@ -667,7 +713,7 @@ func (w *WALStore) RequeueWith(ctx context.Context, id string, o RequeueOptions)
 		w.setCheckpointAt(it, o.Checkpoint, ref)
 	}
 	w.maybeCompactLocked()
-	return w.finish(seq)
+	return w.finish(ctx, seq)
 }
 
 // Get implements Store. The payload is read with the lock released.
@@ -808,7 +854,12 @@ func (w *WALStore) Close() error {
 	w.syncStop = true
 	w.syncWake.Broadcast()
 	w.syncMu.Unlock()
-	w.wg.Wait()
+	if !w.waitBackground() {
+		// A background fsync is stuck in the kernel. Do not close the file it is
+		// using or release the directory lock: another store must not open a log
+		// whose last write is still in flight. Restart the process.
+		return fmt.Errorf("%w: a stalled fsync did not return", ErrStoreFailed)
+	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -829,4 +880,26 @@ func (w *WALStore) Close() error {
 	w.files.closeAll()
 	w.lock.unlock()
 	return err
+}
+
+// closeStallGrace is how long Close waits for background goroutines once the
+// store has failed: a failed store may have an fsync that never returns.
+const closeStallGrace = 5 * time.Second
+
+// waitBackground waits for the sync and compaction goroutines. Normally that is
+// unbounded, since they finish promptly; on a failed store it gives up after
+// closeStallGrace and reports false.
+func (w *WALStore) waitBackground() bool {
+	if w.failure.Load() == nil {
+		w.wg.Wait()
+		return true
+	}
+	done := make(chan struct{})
+	go func() { w.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(closeStallGrace):
+		return false
+	}
 }

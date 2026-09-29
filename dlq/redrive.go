@@ -98,6 +98,10 @@ type RedriveConfig struct {
 	// nothing: return an error only to have it counted in Stats().MirrorErrors.
 	// The record contains the message payload; sending it elsewhere is your choice.
 	OnPark func(ctx context.Context, rec Record, reason string) error
+	// OnParkTimeout bounds one OnPark call. A hung mirror (a Kafka producer with a
+	// full queue, say) would otherwise hold a redrive worker indefinitely. Default
+	// 10 seconds.
+	OnParkTimeout time.Duration
 }
 
 // RedriveStats counts what a Redriver has done.
@@ -140,6 +144,9 @@ func NewRedriver(cfg RedriveConfig) (*Redriver, error) {
 	}
 	if cfg.Workers <= 0 {
 		cfg.Workers = 4
+	}
+	if cfg.OnParkTimeout <= 0 {
+		cfg.OnParkTimeout = 10 * time.Second
 	}
 	if cfg.LeaseTTL <= 0 {
 		cfg.LeaseTTL = time.Minute
@@ -514,6 +521,8 @@ func (r *Redriver) mirror(ctx context.Context, rec Record, reason string) (err e
 			err = errors.New("OnPark panicked")
 		}
 	}()
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.OnParkTimeout)
+	defer cancel()
 	return r.cfg.OnPark(ctx, rec, reason)
 }
 
