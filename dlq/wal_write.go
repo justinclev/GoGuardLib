@@ -57,7 +57,7 @@ func (w *WALStore) createSegment(start uint64) (walFile, error) {
 		}
 		return nil, err
 	}
-	if _, err := f.Write(encodeHeader(walMagic, start)); err != nil {
+	if _, err := f.Write(encodeHeaderFlags(walMagic, start, w.fileFlags())); err != nil {
 		return fail(err)
 	}
 	if err := f.Sync(); err != nil {
@@ -120,13 +120,13 @@ func (w *WALStore) logLocked(typ byte, body []byte) (uint64, blobRef, error) {
 	if len(body) > w.opts.maxEntryBytes {
 		return 0, blobRef{}, fmt.Errorf("%w: entry is %d bytes, limit is %d", ErrInvalidRecord, len(body), w.opts.maxEntryBytes)
 	}
-	frameBytes := appendFrame(nil, w.nextLSN, typ, body)
+	frameBytes := appendFrame(nil, w.nextLSN, typ, w.sealBody(false, w.nextLSN, typ, body))
 	if w.activeSize > headerSize && w.activeSize+int64(len(frameBytes)) > w.opts.SegmentBytes {
 		if err := w.rotateLocked(); err != nil {
 			return 0, blobRef{}, err
 		}
 	}
-	ref := blobRef{kind: typ, file: w.segments[len(w.segments)-1].start, off: w.activeSize, n: int32(len(frameBytes))}
+	ref := blobRef{kind: typ, file: w.segments[len(w.segments)-1].start, off: w.activeSize, n: int32(len(frameBytes)), signed: w.opts.Signer != nil}
 	n, err := w.active.Write(frameBytes)
 	if err != nil || n != len(frameBytes) {
 		if err == nil {
@@ -142,6 +142,7 @@ func (w *WALStore) logLocked(typ byte, body []byte) (uint64, blobRef, error) {
 	}
 	w.activeSize += int64(n)
 	w.logBytes += int64(n)
+	w.diskWritten += uint64(n)
 	w.nextLSN++
 
 	w.syncMu.Lock()
@@ -253,6 +254,33 @@ func (w *WALStore) finish(seq uint64) error {
 	return w.waitDurable(seq)
 }
 
+// diskCheckEvery bounds how often the volume is measured.
+const diskCheckEvery = 200 * time.Millisecond
+
+// checkDiskLocked refuses work that would grow the log when the volume is nearly
+// full. need is extra space the operation itself wants beyond the reserve.
+func (w *WALStore) checkDiskLocked(need uint64) error {
+	min := w.opts.MinFreeBytes
+	if min <= 0 {
+		return nil
+	}
+	if now := time.Now(); now.Sub(w.diskCheckedAt) >= diskCheckEvery {
+		free, err := w.opts.freeFn(w.dir)
+		if err != nil {
+			return nil // cannot tell: do not block work on a measurement that failed
+		}
+		w.diskFree, w.diskCheckedAt, w.diskWritten = free, now, 0
+	}
+	free := uint64(0)
+	if w.diskFree > w.diskWritten {
+		free = w.diskFree - w.diskWritten
+	}
+	if free < uint64(min)+need {
+		return fmt.Errorf("%w: %w: %d bytes free, %d must stay free", ErrFull, ErrDiskLow, free, min)
+	}
+	return nil
+}
+
 func (w *WALStore) maybeCompactLocked() {
 	if w.opts.DisableAutoCompact {
 		return
@@ -285,6 +313,10 @@ func (w *WALStore) Append(ctx context.Context, r Record) error {
 		// The original may still be waiting for its fsync: do not report the
 		// record safe before it is.
 		return w.finish(w.currentSeq())
+	}
+	if err := w.checkDiskLocked(0); err != nil {
+		w.mu.Unlock()
+		return err
 	}
 	var e encoder
 	encodeRecord(&e, &rec)
@@ -477,6 +509,10 @@ func (w *WALStore) Checkpoint(ctx context.Context, id, token string, checkpoint 
 		err = w.m.checkCheckpoint(it, checkpoint)
 	}
 	if err != nil {
+		w.mu.Unlock()
+		return err
+	}
+	if err := w.checkDiskLocked(0); err != nil {
 		w.mu.Unlock()
 		return err
 	}

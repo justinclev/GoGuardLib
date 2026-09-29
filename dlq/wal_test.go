@@ -1,6 +1,7 @@
 package dlq_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/justinclev/GoGuardLib/dlq"
 	"github.com/justinclev/GoGuardLib/dlq/storetest"
+	"github.com/justinclev/GoGuardLib/secure"
 )
 
 func openWAL(t testing.TB, dir string, opts dlq.WALOptions) *dlq.WALStore {
@@ -37,6 +39,16 @@ func walFactory(opts dlq.WALOptions) storetest.Factory {
 
 func TestWALStoreConformance(t *testing.T) {
 	storetest.Run(t, walFactory(dlq.WALOptions{}))
+}
+
+func TestWALStoreConformanceSigned(t *testing.T) {
+	sg, err := secure.NewHMAC(secure.Key{ID: "k1", Material: bytes.Repeat([]byte{9}, 32)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storetest.Run(t, walFactory(dlq.WALOptions{Signer: sg}))
+	storetest.Run(t, walFactory(dlq.WALOptions{Signer: sg, SegmentBytes: 512, CompactMinBytes: 1, CompactRatio: 0.01}))
+	storetest.Run(t, walFactory(dlq.WALOptions{Signer: sg, PayloadsInMemory: true, SegmentBytes: 512, CompactMinBytes: 1, CompactRatio: 0.01}))
 }
 
 func TestWALStoreConformancePayloadsInMemory(t *testing.T) {

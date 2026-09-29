@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/justinclev/GoGuardLib/secure"
 )
 
 var (
@@ -32,6 +34,11 @@ var (
 	// ErrInsecurePermissions means the directory or a file in it is readable or
 	// writable by other users.
 	ErrInsecurePermissions = errors.New("dlq: WAL directory has insecure permissions")
+	// ErrDiskLow means the volume holding the log is below WALOptions.MinFreeBytes.
+	// Appends that would grow the log are refused with an error that also matches
+	// ErrFull, so consumers pause instead of driving the disk to zero; work that
+	// frees space (acks, parks, compaction if it fits) is still accepted.
+	ErrDiskLow = errors.New("dlq: WAL volume is low on free space")
 )
 
 // SyncPolicy chooses when written data is forced to stable storage.
@@ -60,6 +67,7 @@ const (
 	// payloads are on disk and WALOptions.MaxRecords is zero. Without it a flood of
 	// tiny records could fit the byte limit and still need gigabytes of index.
 	DefaultWALMaxRecords  = 1_000_000
+	defaultMinFreeBytes   = 64 << 20
 	defaultSegmentBytes   = 64 << 20
 	defaultCompactMin     = 64 << 20
 	defaultCompactRatio   = 2.0
@@ -118,6 +126,28 @@ type WALOptions struct {
 	// files (for volumes mounted with fixed modes).
 	AllowInsecurePermissions bool
 
+	// Signer, when set, signs every log entry and snapshot record, so that changing
+	// the files (not just damaging them) is detected on open and on every read: the
+	// CRC only catches accidents, because anyone can recompute it. Open refuses a
+	// log that fails verification (ErrTampered). Use a key kept outside the volume.
+	// The log's format is unchanged for stores without a Signer; see
+	// AcceptUnsignedLegacy to move an existing log to signing.
+	Signer secure.Signer
+	// AcceptUnsignedLegacy lets a store with a Signer read files written before
+	// signing was on. New entries go to a fresh signed segment and the next
+	// compaction writes a signed snapshot, which retires the old files;
+	// RecoveryReport.UnsignedFiles says how many were read. Turn it off once that
+	// count is zero: while it is on, someone who can rewrite the files can also strip
+	// their signatures.
+	AcceptUnsignedLegacy bool
+
+	// MinFreeBytes is the free space the log's volume must keep. Below it, Append and
+	// Checkpoint are refused (see ErrDiskLow), so a full disk shows up as
+	// backpressure rather than as a failed write. Compaction, which needs room for a
+	// snapshot as large as the live data, also waits for it. Default 64 MiB; a
+	// negative value turns the check off.
+	MinFreeBytes int64
+
 	// PayloadsInMemory keeps every record's key, value, headers and checkpoint in
 	// memory, as earlier versions did: Lease is faster, but memory grows with the
 	// data. By default only a small index per record is kept in memory and payloads
@@ -136,6 +166,7 @@ type WALOptions struct {
 	openFile      func(name string, flag int, perm os.FileMode) (walFile, error)
 	compactHook   func(stage string) // "captured" and "copied", to interleave work with a compaction
 	leaseHook     func(stage string) // "selected" and "read", to interleave work with a lease's unlocked read
+	freeFn        func(dir string) (uint64, error)
 }
 
 func (o *WALOptions) applyDefaults() error {
@@ -144,6 +175,12 @@ func (o *WALOptions) applyDefaults() error {
 	}
 	if o.MaxBytes == 0 {
 		o.MaxBytes = DefaultWALMaxBytes
+	}
+	if o.MinFreeBytes == 0 {
+		o.MinFreeBytes = defaultMinFreeBytes
+	}
+	if o.freeFn == nil {
+		o.freeFn = freeBytes
 	}
 	if o.MaxRecordBytes == 0 {
 		o.MaxRecordBytes = defaultMaxRecordBytes
@@ -191,7 +228,9 @@ type RecoveryReport struct {
 	// segment. They are copied to QuarantineFile first, never just deleted.
 	TruncatedBytes int64
 	QuarantineFile string
-	Duration       time.Duration
+	// UnsignedFiles counts legacy unsigned files read by a store with a Signer.
+	UnsignedFiles int
+	Duration      time.Duration
 }
 
 // WALStats describes the log itself.
@@ -208,6 +247,10 @@ type WALStats struct {
 	// disk (corruption or a missing file). Such records are parked, not lost from
 	// the index, so an operator can see them.
 	UnreadablePayloads uint64
+	// DiskFreeBytes is the free space on the log's volume when WALStats was called
+	// (0 if it could not be read), and DiskLow says whether it is below MinFreeBytes.
+	DiskFreeBytes uint64
+	DiskLow       bool
 }
 
 type segment struct {
@@ -237,6 +280,15 @@ type WALStore struct {
 	files      *fileCache
 	unreadable atomic.Uint64
 	compactMu  sync.Mutex // one compaction at a time; held for its whole run
+
+	lastSegSigned bool // recovery: whether the segment replayed last carries signatures
+
+	// Free-space guard, under mu. The volume is measured at most every diskCheckEvery
+	// and what has been written since is subtracted, so a fast writer cannot outrun
+	// a stale reading.
+	diskFree      uint64
+	diskCheckedAt time.Time
+	diskWritten   uint64
 
 	mu          sync.Mutex // state, log position and files
 	m           *machine
@@ -398,6 +450,10 @@ func (w *WALStore) WALStats() WALStats {
 	if f := w.failure.Load(); f != nil {
 		st.Failed = *f
 	}
+	if free, err := w.opts.freeFn(w.dir); err == nil {
+		st.DiskFreeBytes = free
+		st.DiskLow = w.opts.MinFreeBytes > 0 && free < uint64(w.opts.MinFreeBytes)
+	}
 	return st
 }
 
@@ -405,6 +461,12 @@ func (w *WALStore) WALStats() WALStats {
 
 func corrupt(path string, off int64, format string, args ...any) error {
 	return fmt.Errorf("%w: %s at offset %d: %s", ErrCorrupt, filepath.Base(path), off, fmt.Sprintf(format, args...))
+}
+
+// tampered reports an entry that failed verification. It matches ErrCorrupt and
+// the specific cause (ErrTampered, ErrSignerRequired).
+func tampered(path string, off int64, cause error) error {
+	return fmt.Errorf("%w: %s at offset %d: %w", ErrCorrupt, filepath.Base(path), off, cause)
 }
 
 func (w *WALStore) recover() error {
@@ -480,6 +542,12 @@ func (w *WALStore) recover() error {
 		if err := w.newSegmentLocked(expected); err != nil {
 			return err
 		}
+	} else if w.opts.Signer != nil && !w.lastSegSigned {
+		// New entries must be signed, and a legacy segment cannot hold them: start a
+		// fresh signed segment and leave the legacy ones read-only.
+		if err := w.newSegmentLocked(expected); err != nil {
+			return err
+		}
 	} else {
 		last := segs[len(segs)-1]
 		f, err := w.opts.openFile(last.path, os.O_WRONLY|os.O_APPEND, 0o600)
@@ -516,7 +584,7 @@ func (w *WALStore) replaySegment(sg segment, expected uint64, isLast bool) (end 
 
 	hdr := make([]byte, headerSize)
 	n, _ := io.ReadFull(f, hdr)
-	startLSN, herr := decodeHeader(hdr[:n], walMagic)
+	startLSN, flags, herr := decodeHeaderFlags(hdr[:n], walMagic)
 	if herr != nil || startLSN != sg.start {
 		if isLast && herr != nil && sg.start >= expected {
 			// The crash hit while the file was being created: it holds no entries.
@@ -536,6 +604,11 @@ func (w *WALStore) replaySegment(sg segment, expected uint64, isLast bool) (end 
 	if sg.start > expected {
 		return 0, 0, corrupt(sg.path, 0, "log entries %d to %d are missing", expected, sg.start-1)
 	}
+	signed, ferr := w.checkFileFlags(flags)
+	if ferr != nil {
+		return 0, 0, fmt.Errorf("%w: %s: %w", ErrCorrupt, filepath.Base(sg.path), ferr)
+	}
+	w.lastSegSigned = signed
 
 	r := bufio.NewReaderSize(f, 1<<20)
 	off := int64(headerSize)
@@ -555,7 +628,14 @@ func (w *WALStore) replaySegment(sg segment, expected uint64, isLast bool) (end 
 		case fr.lsn <= w.snapLSN:
 			// already covered by the snapshot
 		case fr.lsn == next:
-			ref := blobRef{kind: fr.typ, file: sg.start, off: off, n: int32(fr.size)}
+			body, serr := w.openBody(signed, false, fr.lsn, fr.typ, fr.body)
+			if serr != nil {
+				// A valid checksum with a bad signature is a deliberate change, not an
+				// interrupted write: never repair it, even in the last segment.
+				return 0, 0, tampered(sg.path, off, serr)
+			}
+			fr.body = body
+			ref := blobRef{kind: fr.typ, file: sg.start, off: off, n: int32(fr.size), signed: signed}
 			if aerr := w.applyEntry(fr, ref); aerr != nil {
 				return 0, 0, corrupt(sg.path, off, "entry %d: %v", fr.lsn, aerr)
 			}

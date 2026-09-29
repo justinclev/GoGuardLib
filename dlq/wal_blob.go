@@ -16,11 +16,12 @@ import (
 // segment or snapshot file. kind is the type of that frame, which says how to
 // decode it. The zero value means "nothing stored".
 type blobRef struct {
-	kind byte   // entAppend / snapRecord (a whole record), entCheckpoint, entRequeue
-	snap bool   // the file is a snapshot (file = its LSN) rather than a segment (file = its first LSN)
-	file uint64 //
-	off  int64  // offset of the frame in the file
-	n    int32  // length of the frame in bytes, header included
+	kind   byte   // entAppend / snapRecord (a whole record), entCheckpoint, entRequeue
+	signed bool   // the frame carries a signature
+	snap   bool   // the file is a snapshot (file = its LSN) rather than a segment (file = its first LSN)
+	file   uint64 //
+	off    int64  // offset of the frame in the file
+	n      int32  // length of the frame in bytes, header included
 }
 
 func (r blobRef) valid() bool { return r.kind != 0 }
@@ -173,6 +174,15 @@ func (w *WALStore) loadFrame(ref blobRef) (frame, error) {
 	if fr.typ != ref.kind {
 		return frame{}, unreadable("frame type %d, expected %d", fr.typ, ref.kind)
 	}
+	ctx := fr.lsn
+	if ref.snap {
+		ctx = ref.file // snapshot frames are signed under the snapshot's LSN
+	}
+	body, err := w.openBody(ref.signed, ref.snap, ctx, fr.typ, fr.body)
+	if err != nil {
+		return frame{}, unreadable("%v", err)
+	}
+	fr.body = body
 	return fr, nil
 }
 

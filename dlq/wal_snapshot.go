@@ -3,6 +3,7 @@ package dlq
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -31,12 +32,16 @@ func (w *WALStore) loadSnapshot(path string, lsn uint64) error {
 
 	hdr := make([]byte, headerSize)
 	n, _ := io.ReadFull(f, hdr)
-	got, herr := decodeHeader(hdr[:n], snapMagic)
+	got, flags, herr := decodeHeaderFlags(hdr[:n], snapMagic)
 	if herr != nil || got != lsn {
 		if herr == nil {
 			herr = fmt.Errorf("header says LSN %d", got)
 		}
 		return corrupt(path, 0, "bad snapshot header: %v", herr)
+	}
+	signed, ferr := w.checkFileFlags(flags)
+	if ferr != nil {
+		return fmt.Errorf("%w: %s: %w", ErrCorrupt, filepath.Base(path), ferr)
 	}
 
 	r := bufio.NewReaderSize(f, 1<<20)
@@ -49,6 +54,11 @@ func (w *WALStore) loadSnapshot(path string, lsn uint64) error {
 		}
 		frameStart := off
 		off += fr.size
+		body, serr := w.openBody(signed, true, lsn, fr.typ, fr.body)
+		if serr != nil {
+			return tampered(path, frameStart, serr)
+		}
+		fr.body = body
 		switch fr.typ {
 		case snapRecord:
 			d := decoder{b: fr.body}
@@ -59,7 +69,7 @@ func (w *WALStore) loadSnapshot(path string, lsn uint64) error {
 			if _, dup := w.m.items[rec.ID]; dup {
 				return corrupt(path, off, "duplicate record in snapshot")
 			}
-			w.insertRecord(rec, blobRef{kind: snapRecord, snap: true, file: lsn, off: frameStart, n: int32(fr.size)})
+			w.insertRecord(rec, blobRef{kind: snapRecord, snap: true, signed: signed, file: lsn, off: frameStart, n: int32(fr.size)})
 			count++
 		case snapEnd:
 			d := decoder{b: fr.body}
@@ -150,6 +160,14 @@ type snapEntry struct {
 // recovery replays on top of the snapshot; the swap only re-points references
 // that did not change in the meantime. The caller holds compactMu.
 func (w *WALStore) compactOffload(ctx context.Context) (err error) {
+	defer func() {
+		if errors.Is(err, ErrClosed) {
+			return
+		}
+		w.mu.Lock()
+		w.compactErr = err
+		w.mu.Unlock()
+	}()
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
@@ -162,6 +180,10 @@ func (w *WALStore) compactOffload(ctx context.Context) (err error) {
 	if w.nextLSN-1 <= w.snapLSN {
 		w.mu.Unlock()
 		return nil
+	}
+	if err := w.checkDiskLocked(uint64(w.m.bytes)); err != nil { // the snapshot is as big as the live data
+		w.mu.Unlock()
+		return err
 	}
 	if w.activeSize > headerSize {
 		if err := w.rotateLocked(); err != nil {
@@ -185,11 +207,6 @@ func (w *WALStore) compactOffload(ctx context.Context) (err error) {
 	}
 	w.mu.Unlock()
 
-	defer func() {
-		w.mu.Lock()
-		w.compactErr = err
-		w.mu.Unlock()
-	}()
 	if h := w.opts.compactHook; h != nil {
 		h("captured")
 	}
@@ -263,7 +280,7 @@ func (w *WALStore) writeSnapshotOffload(ctx context.Context, path string, last, 
 		_ = f.Close()
 		return err
 	}
-	if _, err := bw.Write(encodeHeader(snapMagic, last)); err != nil {
+	if _, err := bw.Write(encodeHeaderFlags(snapMagic, last, w.fileFlags())); err != nil {
 		return fail(err)
 	}
 	off := int64(headerSize)
@@ -284,17 +301,17 @@ func (w *WALStore) writeSnapshotOffload(ctx context.Context, path string, last, 
 		}
 		var enc encoder
 		encodeRecord(&enc, &rec)
-		frameBuf = appendFrame(frameBuf[:0], 0, snapRecord, enc.b)
+		frameBuf = appendFrame(frameBuf[:0], 0, snapRecord, w.sealBody(true, last, snapRecord, enc.b))
 		if _, err := bw.Write(frameBuf); err != nil {
 			return fail(err)
 		}
-		e.newRef = blobRef{kind: snapRecord, snap: true, file: last, off: off, n: int32(len(frameBuf))}
+		e.newRef = blobRef{kind: snapRecord, snap: true, signed: w.opts.Signer != nil, file: last, off: off, n: int32(len(frameBuf))}
 		off += int64(len(frameBuf))
 	}
 	var enc encoder
 	enc.uvarint(uint64(len(entries)))
 	enc.uvarint(seq)
-	frameBuf = appendFrame(frameBuf[:0], 0, snapEnd, enc.b)
+	frameBuf = appendFrame(frameBuf[:0], 0, snapEnd, w.sealBody(true, last, snapEnd, enc.b))
 	if _, err := bw.Write(frameBuf); err != nil {
 		return fail(err)
 	}
@@ -310,6 +327,9 @@ func (w *WALStore) writeSnapshotOffload(ctx context.Context, path string, last, 
 func (w *WALStore) compactLocked() error {
 	if w.nextLSN-1 <= w.snapLSN {
 		return nil // nothing new since the last snapshot
+	}
+	if err := w.checkDiskLocked(uint64(w.m.bytes)); err != nil { // the snapshot is as big as the live data
+		return err
 	}
 	// Seal the active segment so every entry up to L sits in closed segments and
 	// the new active segment starts at L+1.
@@ -357,7 +377,7 @@ func (w *WALStore) writeSnapshot(path string, last uint64) error {
 		return err
 	}
 	bw := bufio.NewWriterSize(fileWriter{f}, 1<<20)
-	if _, err := bw.Write(encodeHeader(snapMagic, last)); err != nil {
+	if _, err := bw.Write(encodeHeaderFlags(snapMagic, last, w.fileFlags())); err != nil {
 		_ = f.Close()
 		return err
 	}
@@ -370,7 +390,7 @@ func (w *WALStore) writeSnapshot(path string, last uint64) error {
 		}
 		var e encoder
 		encodeRecord(&e, &rec)
-		frameBuf = appendFrame(frameBuf[:0], 0, snapRecord, e.b)
+		frameBuf = appendFrame(frameBuf[:0], 0, snapRecord, w.sealBody(true, last, snapRecord, e.b))
 		if _, err := bw.Write(frameBuf); err != nil {
 			_ = f.Close()
 			return err
@@ -380,7 +400,7 @@ func (w *WALStore) writeSnapshot(path string, last uint64) error {
 	var e encoder
 	e.uvarint(count)
 	e.uvarint(w.m.seq)
-	frameBuf = appendFrame(frameBuf[:0], 0, snapEnd, e.b)
+	frameBuf = appendFrame(frameBuf[:0], 0, snapEnd, w.sealBody(true, last, snapEnd, e.b))
 	if _, err := bw.Write(frameBuf); err != nil {
 		_ = f.Close()
 		return err

@@ -61,10 +61,13 @@ var (
 	errBadEntry = errors.New("dlq: undecodable entry")
 )
 
-func encodeHeader(magic string, lsn uint64) []byte {
+func encodeHeader(magic string, lsn uint64) []byte { return encodeHeaderFlags(magic, lsn, 0) }
+
+func encodeHeaderFlags(magic string, lsn uint64, flags uint32) []byte {
 	h := make([]byte, headerSize)
 	copy(h, magic)
 	binary.LittleEndian.PutUint32(h[8:], formatVersion)
+	binary.LittleEndian.PutUint32(h[12:], flags)
 	binary.LittleEndian.PutUint64(h[16:], lsn)
 	binary.LittleEndian.PutUint32(h[24:], crc32.Checksum(h[:24], castagnoli))
 	return h
@@ -72,19 +75,29 @@ func encodeHeader(magic string, lsn uint64) []byte {
 
 // decodeHeader validates a header and returns its lsn.
 func decodeHeader(h []byte, magic string) (uint64, error) {
+	lsn, _, err := decodeHeaderFlags(h, magic)
+	return lsn, err
+}
+
+// decodeHeaderFlags validates a header and returns its lsn and flags.
+func decodeHeaderFlags(h []byte, magic string) (uint64, uint32, error) {
 	if len(h) < headerSize {
-		return 0, errTorn
+		return 0, 0, errTorn
 	}
 	if string(h[:8]) != magic {
-		return 0, fmt.Errorf("%w: bad magic", errBadFrame)
+		return 0, 0, fmt.Errorf("%w: bad magic", errBadFrame)
 	}
 	if binary.LittleEndian.Uint32(h[24:]) != crc32.Checksum(h[:24], castagnoli) {
-		return 0, fmt.Errorf("%w: header checksum mismatch", errBadFrame)
+		return 0, 0, fmt.Errorf("%w: header checksum mismatch", errBadFrame)
 	}
 	if v := binary.LittleEndian.Uint32(h[8:]); v != formatVersion {
-		return 0, fmt.Errorf("dlq: unsupported format version %d", v)
+		return 0, 0, fmt.Errorf("dlq: unsupported format version %d", v)
 	}
-	return binary.LittleEndian.Uint64(h[16:]), nil
+	flags := binary.LittleEndian.Uint32(h[12:])
+	if flags&^knownFlags != 0 {
+		return 0, 0, fmt.Errorf("dlq: unsupported file flags %#x (written by a newer version?)", flags)
+	}
+	return binary.LittleEndian.Uint64(h[16:]), flags, nil
 }
 
 // appendFrame appends one frame to dst.
