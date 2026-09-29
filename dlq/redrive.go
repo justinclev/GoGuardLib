@@ -55,6 +55,11 @@ type RedriveConfig struct {
 	// breakers. Records blocked on a dependency whose circuit is open are not
 	// leased at all, so a long outage costs no attempts and no churn.
 	Breakers map[string]*breaker.Breaker
+	// BreakerSource is Breakers for circuits that are created while the service runs,
+	// such as a guarded HTTP client's, which only exist once traffic has reached
+	// them: it is asked on every cycle and its result is used together with Breakers.
+	// goguard's ResilientTransport.Breakers fits it directly.
+	BreakerSource func() map[string]*breaker.Breaker
 
 	// Workers is how many records are handled at once. Default 4.
 	Workers int
@@ -341,10 +346,18 @@ func (r *Redriver) unavailable(now time.Time) []string {
 	defer r.mu.Unlock()
 	var skip []string
 	current := map[string]bool{}
-	for name, br := range r.cfg.Breakers {
-		if br.State() == obs.StateOpen {
+	check := func(name string, br *breaker.Breaker) {
+		if br.State() == obs.StateOpen && !current[name] {
 			current[name] = true
 			skip = append(skip, name)
+		}
+	}
+	for name, br := range r.cfg.Breakers {
+		check(name, br)
+	}
+	if r.cfg.BreakerSource != nil {
+		for name, br := range r.cfg.BreakerSource() {
+			check(name, br)
 		}
 	}
 	for name := range r.wasUnavailable {

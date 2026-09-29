@@ -831,3 +831,37 @@ func TestOnParkIsBoundedByItsTimeout(t *testing.T) {
 	start(t, r)
 	eventually(t, "both hung mirrors to time out", func() bool { return r.Stats().MirrorErrors == 2 })
 }
+
+// Circuits that appear while the service runs (a guarded HTTP client's) must be
+// honoured too, not only the ones known when the redriver was built.
+func TestBreakerSourceHoldsRecordsWhileALateCircuitIsOpen(t *testing.T) {
+	store := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	addBlocked(t, store, 2, "late")
+	br := breaker.New(breaker.Config{Name: "late", FailureThreshold: 0.1, MinSamples: 1, SleepWindow: time.Hour})
+	defer br.Close()
+	_ = br.Do(context.Background(), func(context.Context) error { return errors.New("down") })
+	if br.State() != obs.StateOpen {
+		t.Fatal("test setup: the circuit should be open")
+	}
+	var handled atomic.Int32
+	var known atomic.Bool // the circuit is unknown to the redriver at first, as a lazy one is
+	r := newRedriver(t, dlq.RedriveConfig{
+		Store: store,
+		Handler: func(ctx context.Context, it *dlq.Item) error {
+			handled.Add(1)
+			return nil
+		},
+		BreakerSource: func() map[string]*breaker.Breaker {
+			if known.Load() {
+				return map[string]*breaker.Breaker{"late": br}
+			}
+			return nil
+		},
+	})
+	known.Store(true)
+	start(t, r)
+	time.Sleep(150 * time.Millisecond)
+	if n := handled.Load(); n != 0 {
+		t.Fatalf("the handler ran %d times while the circuit was open", n)
+	}
+}

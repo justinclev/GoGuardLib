@@ -117,9 +117,12 @@ func TestDeferredRequestsAreSavedThenReplayedOnce(t *testing.T) {
 				t.Fatal("nothing should reach a service that is down")
 			}
 
-			// No credential may be on the record.
+			// No credential may be on the record, and each names the circuit it waits on.
 			recs, _ := drain(t, store)
 			for _, r := range recs {
+				if r.BlockedOn != "svc" {
+					t.Fatalf("record BlockedOn = %q, want the circuit name %q", r.BlockedOn, "svc")
+				}
 				for _, h := range r.Headers {
 					if strings.EqualFold(h.Key, "Authorization") || strings.Contains(string(h.Value), "SECRET-TOKEN") {
 						t.Fatalf("a credential was saved: %s: %s", h.Key, h.Value)
@@ -305,5 +308,33 @@ func TestDeferNeedsAStore(t *testing.T) {
 	_, err := goguard.New(goguard.Config{}, goguard.WithEndpoint("svc", goguard.Host("x"), goguard.Policy{Defer: &goguard.Defer{}}))
 	if err == nil {
 		t.Fatal("Defer without a Store must be rejected")
+	}
+}
+
+// The switch turns deferral on and off while the transport keeps running.
+func TestDeferEnabledSwitchesDeferralAtRunTime(t *testing.T) {
+	svc := newService()
+	defer svc.Close()
+	svc.down.Store(true)
+	store := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	var on atomic.Bool
+	_, client := guardWithDefer(t, svc.Listener.Addr().String(), &goguard.Defer{Store: store, Enabled: on.Load})
+	send := func(id string) error {
+		return post(client, svc.URL+"/x", "b", map[string]string{"Idempotency-Key": id})
+	}
+
+	if err := send("off-1"); errors.Is(err, goguard.ErrDeferred) {
+		t.Fatal("a request was saved while the switch was off")
+	}
+	on.Store(true)
+	if err := send("on-1"); !errors.Is(err, goguard.ErrDeferred) {
+		t.Fatalf("with the switch on, got %v, want ErrDeferred", err)
+	}
+	on.Store(false)
+	if err := send("off-2"); errors.Is(err, goguard.ErrDeferred) {
+		t.Fatal("a request was saved after the switch went off again")
+	}
+	if st, _ := store.Stats(context.Background()); st.Total() != 1 {
+		t.Fatalf("store holds %d records, want only the one saved while on", st.Total())
 	}
 }

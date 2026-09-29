@@ -11,7 +11,11 @@ for v1.0" so it can be adopted early.
   retries) to any `dlq.Store`, memory or disk, and `goguard.ReplayHandler` sends them
   through the redriver when the service is healthy. Opt-in per endpoint; needs an
   idempotency key; never stores credentials; `ErrDeferred` tells the caller.
-  `ResilientTransport.Breakers()` feeds the redriver.
+  `ResilientTransport.Breakers()` feeds the redriver through the new
+  `RedriveConfig.BreakerSource` (circuits of a guarded client appear as traffic reaches
+  them, so a fixed map would miss them); saved requests are tagged with their circuit's
+  name so the redriver holds them while it is open. `Defer.Enabled` switches deferral on
+  and off at run time.
 - `kafka.RedriveFor(bindings)`: one redrive handler and breaker map for a consumer with
   several topics. Before, a redriver built from one pipeline parked the other topics'
   records as mismatched, or ran records with no progress through the wrong pipeline.

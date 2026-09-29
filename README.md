@@ -134,7 +134,7 @@ func sendWebhook(client *http.Client, eventID string, payload []byte) error {
 }
 ```
 
-`goguard.ErrDeferred` means "not sent, but saved". Run a redriver to send the saved requests when the service is healthy:
+`goguard.ErrDeferred` means "not sent, but saved". Run a redriver to send the saved requests when the service is healthy. `BreakerSource` tells it which circuits to watch, so it leaves saved requests alone while their circuit is open:
 
 ```go
 func newWebhookRedriver(store dlq.Store, guard *goguard.ResilientTransport, client *http.Client) (*dlq.Redriver, error) {
@@ -148,7 +148,7 @@ func newWebhookRedriver(store dlq.Store, guard *goguard.ResilientTransport, clie
 	if err != nil {
 		return nil, err
 	}
-	return dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: replay, Breakers: guard.Breakers()})
+	return dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: replay, BreakerSource: guard.Breakers})
 }
 ```
 

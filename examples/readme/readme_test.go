@@ -143,7 +143,7 @@ func newWebhookRedriver(store dlq.Store, guard *goguard.ResilientTransport, clie
 	if err != nil {
 		return nil, err
 	}
-	return dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: replay, Breakers: guard.Breakers()})
+	return dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: replay, BreakerSource: guard.Breakers})
 }
 
 func Example_saveRequestsForLater() {

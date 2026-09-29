@@ -73,6 +73,13 @@ type Defer struct {
 	OrderKey func(*http.Request) string
 	// MaxBodyBytes is the largest body that will be saved. Default 1 MiB.
 	MaxBodyBytes int
+	// Enabled, when set, is asked before every request: while it returns false the
+	// endpoint behaves as if Defer were not configured (requests fail as they would
+	// without it). It lets a service turn deferral on and off at run time, from a
+	// feature flag or an operator switch, without rebuilding the transport and losing
+	// its circuits. Requests already saved are unaffected and are still replayed.
+	// It is called on the request path, so it must be fast.
+	Enabled func() bool
 }
 
 const (
@@ -147,7 +154,7 @@ type replayKeyType struct{}
 // give the caller when the request was saved, and nil when it was not.
 func (t *ResilientTransport) tryDefer(ent *entry, pol Policy, req *http.Request, cause error) error {
 	d := pol.Defer
-	if d == nil || pol.DryRun {
+	if d == nil || pol.DryRun || (d.Enabled != nil && !d.Enabled()) {
 		return nil
 	}
 	if replaying, _ := req.Context().Value(replayKeyType{}).(bool); replaying {
@@ -157,6 +164,7 @@ func (t *ResilientTransport) tryDefer(ent *entry, pol Policy, req *http.Request,
 	if !ok {
 		return nil
 	}
+	rec.BlockedOn = ent.name // the redriver leaves it alone while this circuit is open
 	err := d.Store.Append(context.WithoutCancel(req.Context()), rec)
 	obs.Emit(t.sink, obs.HTTPDeferred{Endpoint: ent.name, RecordID: rec.ID, Saved: err == nil, At: time.Now()})
 	if err != nil {
