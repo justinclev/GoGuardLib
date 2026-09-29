@@ -1,4 +1,4 @@
-import { COLORS, NodeKey, NODES, Pt, gateOf, pos, svcOf, H, W } from './layout';
+import { COLORS, NodeKey, NODES, Pt, TopicNode, gateOf, pos, svcOf, topicNode, H, W } from './layout';
 import { StreamEvent, isStep } from './models';
 
 /**
@@ -36,6 +36,8 @@ class Particle {
   queue: Action[] = [];
   cur?: Running;
   home: 'topic' | 'dlq' | null = null;
+  /** The topic node this message waits in (orders or refunds). */
+  tn: TopicNode = 'topic';
   slot: Pt;
   angle = Math.random() * Math.PI * 2;
   target: NodeKey | null = null;
@@ -161,7 +163,8 @@ export class FlowEngine {
       } else if (this.waiting('topic') < MAX_WAIT_TOPIC) {
         const p = this.spawn(id, 'producer', COLORS.kafka, now);
         if (p) {
-          this.go(p, 'topic', 460);
+          p.tn = topicNode(ev.topic);
+          this.go(p, p.tn, 460);
           p.queue.push({ k: 'home', home: 'topic' });
         }
       }
@@ -186,7 +189,8 @@ export class FlowEngine {
     if (!id) return undefined;
     let p = this.ps.get(id);
     if (!p && ev.flow === 'kafka') {
-      p = this.spawn(id, ev.redriven ? 'dlq' : 'topic', ev.redriven ? COLORS.redriven : COLORS.kafka, now);
+      p = this.spawn(id, ev.redriven ? 'dlq' : topicNode(ev.topic), ev.redriven ? COLORS.redriven : COLORS.kafka, now);
+      if (p) p.tn = topicNode(ev.topic);
       if (p && !ev.redriven) p.home = 'topic';
     }
     return p;
@@ -368,9 +372,9 @@ export class FlowEngine {
     if (!p.cur && p.queue.length === 0 && p.home) {
       // waiting in the topic or the dead-letter queue: drift gently
       p.angle += 0.01 * this.speed;
-      const h = p.home === 'topic' ? { x: NODES.topic.x, y: NODES.topic.y + 6 } : { x: NODES.dlq.x + 34, y: NODES.dlq.y + 12 };
+      const h = p.home === 'topic' ? { x: NODES[p.tn].x, y: NODES[p.tn].y + 4 } : { x: NODES.dlq.x + 34, y: NODES.dlq.y + 12 };
       const rx = p.home === 'topic' ? 34 : 58;
-      const ry = p.home === 'topic' ? 18 : 18;
+      const ry = p.home === 'topic' ? 12 : 18;
       const tx = h.x + p.slot.x * rx + Math.cos(p.angle) * 4;
       const ty = h.y + p.slot.y * ry + Math.sin(p.angle) * 4;
       p.x += (tx - p.x) * 0.08;

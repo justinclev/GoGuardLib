@@ -24,10 +24,19 @@ export const NODES = {
   http: { x: 78, y: 118 } as Pt,
   gateway: { x: 345, y: 118 } as Pt,
   producer: { x: 78, y: 512 } as Pt,
-  topic: { x: 240, y: 512 } as Pt,
-  consumer: { x: 415, y: 512 } as Pt,
+  // Two topics, one above the other: orders and refunds.
+  topic: { x: 250, y: 466 } as Pt,
+  topic2: { x: 250, y: 562 } as Pt,
+  consumer: { x: 435, y: 514 } as Pt,
   dlq: { x: 880, y: 540 } as Pt,
 };
+
+/** Which diagram node a Kafka topic is drawn as. */
+export type TopicNode = 'topic' | 'topic2';
+
+export function topicNode(topic?: string): TopicNode {
+  return topic === 'refunds' ? 'topic2' : 'topic';
+}
 
 export type NodeKey = keyof typeof NODES | `gate:${StepName}` | `svc:${StepName}`;
 

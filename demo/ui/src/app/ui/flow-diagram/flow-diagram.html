@@ -1,6 +1,6 @@
 <div class="stage" #stage>
   <svg class="svg" [attr.viewBox]="viewBox" preserveAspectRatio="xMidYMid meet" role="img"
-       aria-label="Live diagram of requests flowing through four guarded services">
+       aria-label="Live diagram of HTTP requests and two Kafka topics flowing through four guarded services">
     <defs>
       <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
         <stop offset="0" stop-color="#1b2450" stop-opacity="0.9" />
@@ -29,15 +29,17 @@
 
     <!-- lane captions -->
     <text class="lane-cap" x="40" y="46">HTTP · the caller waits</text>
-    <text class="lane-cap" x="40" y="586">KAFKA · nothing may be lost</text>
+    <text class="lane-cap" x="40" y="404">KAFKA · two topics · nothing may be lost</text>
     <text class="lane-cap right" [attr.x]="W - 40" y="46">GUARDED DEPENDENCIES</text>
 
     <!-- edges -->
     <g class="edges">
       <path class="edge http" [attr.d]="'M ' + (nodes.http.x + 60) + ' ' + nodes.http.y + ' L ' + (nodes.gateway.x - 66) + ' ' + nodes.gateway.y" />
       <path class="edge http" [attr.d]="gatewayToFirst" />
-      <path class="edge kafka" [attr.d]="'M ' + (nodes.producer.x + 60) + ' ' + nodes.producer.y + ' L ' + (nodes.topic.x - 66) + ' ' + nodes.topic.y" />
-      <path class="edge kafka" [attr.d]="'M ' + (nodes.topic.x + 66) + ' ' + nodes.topic.y + ' L ' + (nodes.consumer.x - 72) + ' ' + nodes.consumer.y" />
+      @for (t of topicNodes(); track t.name) {
+        <path class="edge kafka" [attr.d]="'M ' + (nodes.producer.x + 60) + ' ' + nodes.producer.y + ' L ' + (t.node.x - 66) + ' ' + t.node.y" />
+        <path class="edge kafka" [attr.d]="'M ' + (t.node.x + 66) + ' ' + t.node.y + ' L ' + (nodes.consumer.x - 72) + ' ' + nodes.consumer.y" />
+      }
       <path class="edge kafka" [attr.d]="consumerToFirst" />
       @for (s of services(); track s.name) {
         <path class="edge row" [attr.d]="'M ' + (s.gx + 26) + ' ' + rowY + ' L ' + (s.x - 54) + ' ' + rowY" />
@@ -57,6 +59,13 @@
       </g>
       <text class="title" y="18">HTTP clients</text>
       <text class="sub" y="34">{{ store.snapshot()?.traffic?.httpRps ?? 0 }} req/s</text>
+    </g>
+    <!-- the HTTP client's "save what cannot be sent" switch, and what it has saved -->
+    <g class="defer-chip" [class.on]="deferOn()" role="button" tabindex="0" (click)="toggleDefer()" (keydown.enter)="toggleDefer()"
+       [attr.aria-label]="'Saving HTTP notifications is ' + (deferOn() ? 'on' : 'off') + '. Press to switch.'"
+       [attr.transform]="'translate(' + (nodes.http.x + 34) + ' ' + (nodes.http.y + 68) + ')'">
+      <rect x="-96" y="-16" width="192" height="32" rx="16" />
+      <text y="5">saving {{ deferOn() ? 'ON' : 'OFF' }} · {{ httpSaved() }} saved</text>
     </g>
     <g class="node" [attr.transform]="'translate(' + nodes.gateway.x + ' ' + nodes.gateway.y + ')'">
       <rect class="box http" x="-66" y="-40" width="132" height="80" rx="18" />
@@ -81,18 +90,18 @@
       <text class="sub" y="34">{{ store.snapshot()?.traffic?.kafkaRps ?? 0 }} msg/s</text>
     </g>
 
-    <g class="node topic" [class.paused]="topicPaused()" [attr.transform]="'translate(' + nodes.topic.x + ' ' + nodes.topic.y + ')'">
-      <rect class="box kafka big" x="-66" y="-54" width="132" height="108" rx="20" />
-      <rect class="fill kafka" x="-60" [attr.y]="48 - topicFill() * 96" width="120" [attr.height]="topicFill() * 96" rx="14" />
-      <text class="title" y="-26">orders topic</text>
-      <g class="parts">
-        <rect x="-46" y="-14" width="26" height="8" rx="4" />
-        <rect x="-13" y="-14" width="26" height="8" rx="4" />
-        <rect x="20" y="-14" width="26" height="8" rx="4" />
+    @for (t of topicNodes(); track t.name) {
+      <g class="node topic" [class.paused]="t.paused" [attr.transform]="'translate(' + t.node.x + ' ' + t.node.y + ')'">
+        <rect class="box kafka" x="-66" y="-38" width="132" height="76" rx="18" />
+        <text class="title" y="-12">{{ t.name }}</text>
+        <g class="parts">
+          <rect x="-46" y="-2" width="26" height="7" rx="3.5" />
+          <rect x="-13" y="-2" width="26" height="7" rx="3.5" />
+          <rect x="20" y="-2" width="26" height="7" rx="3.5" />
+        </g>
+        <text class="sub" y="26">{{ t.paused ? 'paused · waiting safely' : t.produced + ' produced' }}</text>
       </g>
-      <text class="big-num" y="24">{{ store.snapshot()?.ledger?.waiting ?? 0 }}</text>
-      <text class="sub" y="40">{{ topicPaused() ? 'paused · waiting safely' : 'waiting to be consumed' }}</text>
-    </g>
+    }
 
     <g class="node" [attr.transform]="'translate(' + nodes.consumer.x + ' ' + nodes.consumer.y + ')'">
       <rect class="box kafka" x="-72" y="-40" width="144" height="80" rx="18" />
@@ -145,6 +154,7 @@
       <text class="sub" y="26">
         stored on disk · {{ store.snapshot()?.dlq?.redriven ?? 0 }} redriven
         @if ((store.snapshot()?.dlq?.parked ?? 0) > 0) { · {{ store.snapshot()?.dlq?.parked }} parked }
+        @if (httpSaved() > 0) { · {{ httpSaved() }} HTTP saved }
       </text>
     </g>
     <text class="dlq-note" [attr.x]="nodes.dlq.x" [attr.y]="nodes.dlq.y + 64">the redriver replays from the failed step when the circuit closes</text>

@@ -13,7 +13,7 @@ import {
 } from '@angular/core';
 import { ApiService } from '../../core/api.service';
 import { FlowEngine } from '../../core/flow-engine';
-import { GATE_OFFSET, H, NODES, ROW_Y, SERVICE_X, W, pos, gateOf } from '../../core/layout';
+import { GATE_OFFSET, H, NODES, ROW_Y, SERVICE_X, W, pos, gateOf, topicNode } from '../../core/layout';
 import { STEPS, STEP_LABEL, ServiceMode, StepName } from '../../core/models';
 import { DemoStore } from '../../core/store';
 
@@ -99,9 +99,22 @@ export class FlowDiagram implements AfterViewInit {
     return Math.min(1, (d.pending + d.leased + d.parked) / 120);
   });
 
-  readonly topicFill = computed(() => Math.min(1, (this.store.snapshot()?.ledger.waiting ?? 0) / 120));
+  /** The two topic nodes, with what the snapshot says about each. */
+  readonly topicNodes = computed(() => {
+    const snap = this.store.snapshot()?.topics ?? [];
+    return (['orders', 'refunds'] as const).map((name) => {
+      const t = snap.find((x) => x.name === name);
+      return { name, node: NODES[topicNode(name)], produced: t?.produced ?? 0, paused: t?.paused ?? false };
+    });
+  });
 
-  readonly topicPaused = computed(() => (this.store.snapshot()?.kafka.pausedPartitions ?? 0) > 0);
+  /** Whether the HTTP client saves notifications it cannot send, and how many it has saved. */
+  readonly deferOn = computed(() => this.store.snapshot()?.http.deferOn ?? true);
+  readonly httpSaved = computed(() => this.store.snapshot()?.http.deferred ?? 0);
+
+  toggleDefer(): void {
+    void this.api.setDeferral(!this.deferOn());
+  }
 
   private curve(a: { x: number; y: number }, b: { x: number; y: number }, bend: number, startOffset: number, endOffset: number): string {
     const dx = b.x - a.x;
