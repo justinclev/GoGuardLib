@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/justinclev/GoGuardLib/obs"
+	"github.com/justinclev/GoGuardLib/secure"
 )
 
 // A stalled fsync must not hold a caller past its own deadline.
@@ -142,4 +143,131 @@ func TestCompactionFailureAndRecoveryAreReported(t *testing.T) {
 	if len(codes) != len(want) || codes[0] != want[0] || codes[1] != want[1] {
 		t.Fatalf("store events = %v, want %v", codes, want)
 	}
+}
+
+// Mode bits are not enough: a directory another user owns can be rewritten by
+// that user whatever its mode says now.
+func TestWALRefusesADirectoryOwnedByAnotherUser(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to hand a directory to another user")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(dir, 54321, 54321); err != nil {
+		t.Skipf("cannot chown here: %v", err)
+	}
+	if _, err := OpenWAL(dir, WALOptions{}); !errors.Is(err, ErrInsecurePermissions) {
+		t.Fatalf("OpenWAL = %v, want ErrInsecurePermissions", err)
+	}
+	s, err := OpenWAL(dir, WALOptions{AllowInsecurePermissions: true})
+	if err != nil {
+		t.Fatalf("override should open it: %v", err)
+	}
+	_ = s.Close()
+}
+
+// Rotating the order-key pepper must not let a new message overtake an earlier
+// one that is still stored under the old pepper.
+func TestPepperRotationKeepsOrderAcrossTheRotation(t *testing.T) {
+	inner := NewMemoryStore(MemoryOptions{})
+	enc := testEncryptor(t)
+	oldP, newP := []byte("old-pepper-old-pepper-old-pepper"), []byte("new-pepper-new-pepper-new-pepper")
+	ctx := context.Background()
+
+	before, _ := Secure(inner, SecureOptions{Encryptor: enc, OrderKeyPepper: oldP})
+	if err := before.Append(ctx, Record{ID: "r1", OrderKey: "cust", Value: []byte("1")}); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := Secure(inner, SecureOptions{Encryptor: enc, OrderKeyPeppers: [][]byte{newP, oldP}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := after.Append(ctx, Record{ID: "r2", OrderKey: "cust", Value: []byte("2")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := after.Append(ctx, Record{ID: "r3", OrderKey: "fresh", Value: []byte("3")}); err != nil {
+		t.Fatal(err)
+	}
+	if held, _ := after.HasOrderKey(ctx, "cust"); !held {
+		t.Fatal("the old key is no longer found after rotation")
+	}
+	// r2 shares r1's stored key: only r1 (and the unrelated r3) may be leased.
+	ls, _ := after.Lease(ctx, LeaseRequest{Max: 10, TTL: time.Hour})
+	got := map[string]bool{}
+	for _, l := range ls {
+		got[l.Record.ID] = true
+	}
+	if !got["r1"] || got["r2"] || !got["r3"] {
+		t.Fatalf("leased %v: r2 must wait for r1", got)
+	}
+	if held, _ := before.HasOrderKey(ctx, "fresh"); held {
+		t.Fatal("a new key should be stored under the new pepper only")
+	}
+}
+
+func testEncryptor(t testing.TB) secure.Encryptor {
+	t.Helper()
+	e, err := secure.NewAESGCM(secure.Key{ID: "k", Material: []byte("0123456789abcdef0123456789abcdef")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+// Reseal must leave nothing readable under the retired key.
+func TestResealMovesDataToNewKeysAndKeepsItsState(t *testing.T) {
+	ctx := context.Background()
+	oldEnc := testEncryptor(t)
+	newEnc, err := secure.NewAESGCM(secure.Key{ID: "k2", Material: []byte("fedcba9876543210fedcba9876543210")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := openF(t, t.TempDir(), nil, WALOptions{})
+	defer func() { _ = src.Close() }()
+	sec, _ := Secure(src, SecureOptions{Encryptor: oldEnc, OrderKeyPepper: []byte("pepper-pepper-pepper-pepper-1234")})
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(sec.Append(ctx, Record{ID: "a", OrderKey: "cust", Key: []byte("k"), Value: []byte("va"), Headers: []Header{{Key: "h", Value: []byte("hv")}}}))
+	must(sec.Append(ctx, Record{ID: "b", Value: []byte("vb")}))
+	ls, _ := sec.Lease(ctx, LeaseRequest{Max: 1, TTL: time.Hour})
+	must(sec.Checkpoint(ctx, ls[0].Record.ID, ls[0].Token, []byte("progress")))
+	must(sec.Park(ctx, ls[0].Record.ID, ls[0].Token, "needs a human"))
+
+	dst := NewMemoryStore(MemoryOptions{})
+	rep, err := Reseal(ctx, src, dst, oldEnc, newEnc)
+	if err != nil || rep.Records != 2 || rep.Parked != 1 {
+		t.Fatalf("Reseal = %+v, %v", rep, err)
+	}
+
+	after, _ := Secure(dst, SecureOptions{Encryptor: newEnc})
+	got, err := after.Get(ctx, "a")
+	if err != nil || string(got.Value) != "va" || string(got.Checkpoint) != "progress" || string(got.Headers[0].Value) != "hv" || got.State != Parked {
+		t.Fatalf("record a after reseal = %+v, %v", got, err)
+	}
+	if _, err := Secure(dst, SecureOptions{Encryptor: oldEnc}); err != nil {
+		t.Fatal(err)
+	}
+	stale, _ := Secure(dst, SecureOptions{Encryptor: oldEnc})
+	if _, err := stale.Get(ctx, "a"); err == nil {
+		t.Fatal("data is still readable with the retired key")
+	}
+}
+
+func TestWALRefusesANetworkFilesystemUnlessAllowed(t *testing.T) {
+	fake := func(string) (string, bool) { return "nfs", true }
+	if _, err := OpenWAL(t.TempDir(), WALOptions{netFSFn: fake}); !errors.Is(err, ErrNetworkFilesystem) {
+		t.Fatalf("OpenWAL on NFS = %v, want ErrNetworkFilesystem", err)
+	}
+	s, err := OpenWAL(t.TempDir(), WALOptions{netFSFn: fake, AllowNetworkFilesystem: true})
+	if err != nil {
+		t.Fatalf("override should open it: %v", err)
+	}
+	_ = s.Close()
 }

@@ -27,6 +27,10 @@ var ErrUnboundTopic = errors.New("kafka: message from a topic with no binding")
 // partition and offset, never the payload.
 var ErrUnstorable = errors.New("kafka: message can be neither processed nor stored")
 
+// ErrStoreNotDurable is returned by NewConsumer when RequireDurableStore is set and
+// the Store does not report DurabilityDurable.
+var ErrStoreNotDurable = errors.New("kafka: the store is not durable")
+
 // UnstorablePolicy says what to do with a message that fails and that the store
 // will never accept.
 type UnstorablePolicy int
@@ -107,6 +111,13 @@ type Config struct {
 	// with jitter.
 	RetryBackoff retry.Backoff
 
+	// RequireDurableStore makes NewConsumer refuse a Store that cannot promise an
+	// acknowledged Append survives a crash and a power failure (see
+	// dlq.StoreDurability): a MemoryStore, or a WAL with SyncInterval or SyncNone.
+	// The consumer commits an offset once a message is in the store, so a store
+	// that forgets makes that commit a data-loss event. A custom Store must
+	// implement dlq.DurabilityReporter to pass. It will default to true at v1.0.
+	RequireDurableStore bool
 	// OnUnstorable is what happens to a message that fails and cannot be stored
 	// (see UnstorablePolicy). Default UnstorableHalt.
 	OnUnstorable UnstorablePolicy
@@ -220,6 +231,11 @@ type binding struct {
 func NewConsumer(cfg Config) (*Consumer, error) {
 	if cfg.Client == nil || cfg.Store == nil {
 		return nil, errors.New("kafka: Config needs a Client and a Store")
+	}
+	if cfg.RequireDurableStore {
+		if d := dlq.StoreDurability(cfg.Store); d != dlq.DurabilityDurable {
+			return nil, fmt.Errorf("%w: it reports %s; use a dlq.WALStore with SyncAlways, or implement dlq.DurabilityReporter", ErrStoreNotDurable, d)
+		}
 	}
 	if len(cfg.Bindings) == 0 {
 		return nil, errors.New("kafka: at least one Binding is required")

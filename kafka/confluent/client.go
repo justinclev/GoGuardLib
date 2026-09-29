@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +23,8 @@ type Client struct {
 	handler atomic.Pointer[kafka.RebalanceHandler]
 	failure atomic.Pointer[error] // an error from the handler, reported by the next Poll
 	onError func(error)
+
+	requireTLS bool
 }
 
 // Option customises NewClient.
@@ -33,6 +36,27 @@ type Option func(*Client)
 // topic. The handler is called on the polling goroutine and must not block; the
 // error text can name broker addresses but never message data.
 func WithErrorHandler(f func(error)) Option { return func(c *Client) { c.onError = f } }
+
+// ErrInsecureTransport is returned when WithRequireTLS or WithProducerRequireTLS is
+// set and security.protocol is not ssl or sasl_ssl. librdkafka defaults to
+// plaintext, so a configuration that forgets the setting would otherwise send
+// messages, and SASL credentials, in the clear without any warning.
+var ErrInsecureTransport = errors.New("confluent: security.protocol must be ssl or sasl_ssl")
+
+// WithRequireTLS makes NewClient fail with ErrInsecureTransport unless
+// security.protocol is ssl or sasl_ssl.
+func WithRequireTLS() Option { return func(c *Client) { c.requireTLS = true } }
+
+// checkTLS enforces the requirement on a configuration.
+func checkTLS(cfg ck.ConfigMap) error {
+	v, _ := cfg.Get("security.protocol", "plaintext")
+	p, _ := v.(string)
+	switch strings.ToLower(p) {
+	case "ssl", "sasl_ssl":
+		return nil
+	}
+	return fmt.Errorf("%w (got %q)", ErrInsecureTransport, p)
+}
 
 var _ kafka.Client = (*Client)(nil)
 
@@ -50,6 +74,15 @@ func NewClient(cfg ck.ConfigMap, topics []string, opts ...Option) (*Client, erro
 	}
 	if g, _ := cfg.Get("group.id", ""); g == "" {
 		return nil, errors.New("confluent: group.id is required")
+	}
+	cl := &Client{}
+	for _, o := range opts {
+		o(cl)
+	}
+	if cl.requireTLS {
+		if err := checkTLS(cfg); err != nil {
+			return nil, err
+		}
 	}
 	cm := ck.ConfigMap{}
 	for k, v := range cfg {
@@ -69,10 +102,7 @@ func NewClient(cfg ck.ConfigMap, topics []string, opts ...Option) (*Client, erro
 	if err != nil {
 		return nil, fmt.Errorf("confluent: creating consumer: %w", err)
 	}
-	cl := &Client{c: c}
-	for _, o := range opts {
-		o(cl)
-	}
+	cl.c = c
 	if err := c.SubscribeTopics(topics, cl.rebalance); err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("confluent: subscribing: %w", err)
@@ -198,6 +228,15 @@ func (c *Client) Commit(offsets []kafka.TopicPartitionOffset) error {
 	return err
 }
 
+type producerOptions struct{ requireTLS bool }
+
+// ProducerOption customises NewProducer.
+type ProducerOption func(*producerOptions)
+
+// WithProducerRequireTLS makes NewProducer fail with ErrInsecureTransport unless
+// security.protocol is ssl or sasl_ssl.
+func WithProducerRequireTLS() ProducerOption { return func(o *producerOptions) { o.requireTLS = true } }
+
 // Producer is a kafka.Producer backed by an idempotent confluent-kafka-go producer.
 type Producer struct{ p *ck.Producer }
 
@@ -206,7 +245,16 @@ var _ kafka.Producer = (*Producer)(nil)
 // NewProducer creates a producer for dead-letter topics. It forces
 // enable.idempotence=true and acks=all so a retried publish cannot duplicate or be
 // silently dropped. Connection, TLS and SASL settings are yours.
-func NewProducer(cfg ck.ConfigMap) (*Producer, error) {
+func NewProducer(cfg ck.ConfigMap, opts ...ProducerOption) (*Producer, error) {
+	var po producerOptions
+	for _, o := range opts {
+		o(&po)
+	}
+	if po.requireTLS {
+		if err := checkTLS(cfg); err != nil {
+			return nil, err
+		}
+	}
 	cm := ck.ConfigMap{}
 	for k, v := range cfg {
 		cm[k] = v

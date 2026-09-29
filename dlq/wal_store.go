@@ -35,6 +35,12 @@ var (
 	// ErrInsecurePermissions means the directory or a file in it is readable or
 	// writable by other users.
 	ErrInsecurePermissions = errors.New("dlq: WAL directory has insecure permissions")
+	// ErrNetworkFilesystem means the directory is on a network or user-space
+	// filesystem (NFS, SMB, FUSE, ...). The log depends on flock to keep two writers
+	// out and on fsync reaching stable storage; on those filesystems either can be
+	// silently untrue, which corrupts the log. Use local storage, or set
+	// WALOptions.AllowNetworkFilesystem if you have verified the mount.
+	ErrNetworkFilesystem = errors.New("dlq: WAL directory is on a network filesystem")
 	// ErrDiskLow means the volume holding the log is below WALOptions.MinFreeBytes.
 	// Appends that would grow the log are refused with an error that also matches
 	// ErrFull, so consumers pause instead of driving the disk to zero; work that
@@ -123,8 +129,8 @@ type WALOptions struct {
 	// write, and Open refuses because cutting would discard entries that were
 	// acknowledged. The cut bytes are still quarantined.
 	ForceRepair bool
-	// AllowInsecurePermissions skips the permission checks on the directory and
-	// files (for volumes mounted with fixed modes).
+	// AllowInsecurePermissions skips the permission and ownership checks on the
+	// directory and files (for volumes mounted with fixed modes or owners).
 	AllowInsecurePermissions bool
 
 	// Signer, when set, signs every log entry and snapshot record, so that changing
@@ -148,6 +154,11 @@ type WALOptions struct {
 	// snapshot as large as the live data, also waits for it. Default 64 MiB; a
 	// negative value turns the check off.
 	MinFreeBytes int64
+
+	// AllowNetworkFilesystem lets the store open a directory on NFS, SMB, FUSE and
+	// similar mounts (see ErrNetworkFilesystem). Only set it after confirming that
+	// the mount honours flock and fsync, and that no second process can reach it.
+	AllowNetworkFilesystem bool
 
 	// PayloadsInMemory keeps every record's key, value, headers and checkpoint in
 	// memory, as earlier versions did: Lease is faster, but memory grows with the
@@ -183,6 +194,7 @@ type WALOptions struct {
 	compactHook   func(stage string) // "captured" and "copied", to interleave work with a compaction
 	leaseHook     func(stage string) // "selected" and "read", to interleave work with a lease's unlocked read
 	freeFn        func(dir string) (uint64, error)
+	netFSFn       func(dir string) (string, bool)
 }
 
 func (o *WALOptions) applyDefaults() error {
@@ -194,6 +206,9 @@ func (o *WALOptions) applyDefaults() error {
 	}
 	if o.MinFreeBytes == 0 {
 		o.MinFreeBytes = defaultMinFreeBytes
+	}
+	if o.netFSFn == nil {
+		o.netFSFn = networkFS
 	}
 	if o.freeFn == nil {
 		o.freeFn = freeBytes
@@ -376,6 +391,9 @@ func checkPerm(path string, info os.FileInfo, dir bool, o *WALOptions) error {
 	if o.AllowInsecurePermissions {
 		return nil
 	}
+	if !ownedByTrustedUser(info) {
+		return fmt.Errorf("%w: %s is owned by another user", ErrInsecurePermissions, path)
+	}
 	mask := os.FileMode(0o077)
 	if dir {
 		mask = 0o022 // other users may traverse, but must not write
@@ -405,6 +423,11 @@ func OpenWAL(dir string, opts WALOptions) (*WALStore, error) {
 	}
 	if err := checkPerm(dir, info, true, &opts); err != nil {
 		return nil, err
+	}
+	if !opts.AllowNetworkFilesystem {
+		if name, bad := opts.netFSFn(dir); bad {
+			return nil, fmt.Errorf("%w (%s): %s", ErrNetworkFilesystem, name, dir)
+		}
 	}
 	lk, err := lockDir(dir)
 	if err != nil {

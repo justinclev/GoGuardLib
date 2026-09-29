@@ -255,6 +255,23 @@ A read of every non-test source file in the root and `kafka` modules. Each fix b
 | D9 | Medium | Compaction failure was visible only by polling `WALStats`. | `obs.StoreEvent` (compaction failed/recovered, failed closed, sync timeout, disk low, quarantined) to `WALOptions.Events`. |
 | S8 | Medium | `obs.Emit` did not recover: a panicking sink crashed request paths and background goroutines. | `Emit` recovers; `Multi` continues to later sinks. |
 
+## Fourth pass, batch 2 ("secure by option")
+
+Each item has a regression test that failed before the change. Behaviour changes are opt-in, except the two marked default-on, which refuse configurations that silently corrupt or expose data and have an explicit override.
+
+| Ref | Severity | Finding | Fix |
+|---|---|---|---|
+| S1 | High | The redactor missed `access_token`, `refresh_token`, `id_token` (`\btoken\b` does not match after `_`), camelCase keys, AWS key IDs, GitHub, Slack, Google and Stripe keys, and PEM private keys. | Prefixed sensitive keys and eight credential formats, with a table test, a negative test (`author=`, `tokenizer=`) and a fuzz target. |
+| S3 | Medium | AES-GCM with random 96-bit nonces is safe for about 2^32 messages per key; nothing enforced it. | `secure.NewAESGCMDerived`: a key per message (HKDF-SHA256, random salt, format 2). Both constructors read both formats, so deploy readers first. |
+| S4 | Medium | The permission check looked at mode bits only; a directory or file owned by another user passed. | Files and the directory must belong to the running user or root (default-on; `AllowInsecurePermissions` overrides). |
+| S5 | Medium | `OrderKeyPepper` could not be rotated. | `SecureOptions.OrderKeyPeppers`: new keys use the first pepper; a message whose key is already stored under an older pepper reuses that hash, so ordering holds across the rotation. |
+| S6 | Medium | No way to retire an encryption key: rotation leaves old data readable under it. | `dlq.Reseal(ctx, src, dst, from, to)` with `WALStore.Scan`: copies every record into a new store re-encrypted, keeping state, attempts and checkpoints. It cannot change order-key hashes; retire a pepper by draining. |
+| S2 | Medium | The dead-letter mirror publishes plaintext unless an `Encryptor` is set. | `PublisherConfig.RequireEncryption` fails start-up instead. |
+| S9 | Medium | librdkafka defaults to plaintext; a forgotten `security.protocol` sends data and SASL credentials in clear. | `confluent.WithRequireTLS` and `WithProducerRequireTLS` (`ErrInsecureTransport`). |
+| D7 | High | `flock` and `fsync` are unreliable on NFS, SMB and FUSE; the log could be corrupted by two writers or lose acknowledged data. | `OpenWAL` refuses those filesystems on Linux (`ErrNetworkFilesystem`, default-on; `AllowNetworkFilesystem` overrides). |
+| D8 | High | The consumer accepted a store that forgets (`MemoryStore`, WAL with `SyncInterval`) and committed offsets past messages it held. | Stores report `dlq.Durability`; `kafka.Config.RequireDurableStore` refuses anything but durable. |
+| S10 | Medium | Requeue and Discard, the actions that release or delete a customer's message, left no trail. | `dlq.Audited` and `dlq.WithActor` emit `obs.OperatorAction` (action, record ID, actor, outcome; never contents). |
+
 ## What was checked and found sound
 
 Recorded so the next reviewer does not repeat it.

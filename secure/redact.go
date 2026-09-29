@@ -35,8 +35,17 @@ var defaultRules = []rule{
 	{regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*`), Redacted},
 	// user:password@ inside URLs.
 	{regexp.MustCompile(`(?i)([a-z][a-z0-9+.\-]*://)([^/\s:@]+):([^/\s@]+)@`), "${1}${2}:" + Redacted + "@"},
-	// key=value, key: value and "key":"value" for sensitive keys.
-	{regexp.MustCompile(`(?i)\b(password|passwd|pwd|passphrase|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|client[_-]?secret|credentials?|authorization|auth)\b(["']?\s*[:=]\s*["']?)([^\s"'&,;}\]]+)`), "${1}${2}" + Redacted},
+	// key=value, key: value and "key":"value" for sensitive keys. The key may carry
+	// a prefix (access_token, refresh_token, clientSecret, x-api-key).
+	{regexp.MustCompile(`(?i)\b([\w-]*(?:password|passwd|pwd|passphrase|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|client[_-]?secret|credentials?|authorization|auth))\b(["']?\s*[:=]\s*["']?)([^\s"'&,;}\]]+)`), "${1}${2}" + Redacted},
+	// Well-known credential formats, recognised wherever they appear.
+	{regexp.MustCompile(`\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[A-Z0-9]{16}\b`), Redacted},                      // AWS access key IDs
+	{regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{30,}`), Redacted},                                                     // GitHub tokens
+	{regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,}`), Redacted},                                                   // GitHub fine-grained tokens
+	{regexp.MustCompile(`\bxox[abprs]-[A-Za-z0-9-]{10,}`), Redacted},                                                   // Slack tokens
+	{regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{35}`), Redacted},                                                          // Google API keys
+	{regexp.MustCompile(`\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}`), Redacted},                                           // Stripe keys
+	{regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)`), Redacted}, // PEM private keys, even cut short
 }
 
 // Redactor removes secrets from text and headers before they are stored, put in

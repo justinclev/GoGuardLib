@@ -30,6 +30,7 @@ const (
 	KindProbeResult  Kind = "probe_result"
 	KindRedrive      Kind = "redrive"
 	KindStore        Kind = "store"
+	KindOperator     Kind = "operator"
 )
 
 // Event is a signal emitted by the library.
@@ -114,6 +115,27 @@ type StoreEvent struct {
 }
 
 func (StoreEvent) EventKind() Kind { return KindStore }
+
+// OperatorActionKind names an action a person takes on a dead-letter store.
+type OperatorActionKind string
+
+const (
+	ActionRequeue OperatorActionKind = "requeue" // a parked record was sent back to pending
+	ActionDiscard OperatorActionKind = "discard" // a parked record was deleted without being handled
+)
+
+// OperatorAction records something a person did to the dead-letter store, so that
+// releasing or deleting a customer's message leaves a trail. It carries the
+// record's ID and the actor's name, never the record's contents.
+type OperatorAction struct {
+	Action   OperatorActionKind
+	RecordID string
+	Actor    string // as given to dlq.WithActor; "" if none
+	OK       bool   // false if the store refused or failed
+	At       time.Time
+}
+
+func (OperatorAction) EventKind() Kind { return KindOperator }
 
 // Sink receives events. Emit is called on hot paths, so implementations must
 // return quickly and must not block; use a Dispatcher to hand events to code

@@ -903,3 +903,37 @@ func (w *WALStore) waitBackground() bool {
 		return false
 	}
 }
+
+// Scan calls fn for every record in the store, in arrival order, with its payload
+// as stored (sealed, if the store is wrapped by Secure). A record that is leased
+// reports State Leased. It is a read-only export for migration tools such as
+// Reseal: it reads the whole store into memory first (bounded by MaxBytes) and
+// calls fn without holding the store's lock, so it sees a consistent snapshot but
+// not later changes. Run it on a store no worker is using.
+func (w *WALStore) Scan(ctx context.Context, fn func(Record) error) error {
+	w.mu.Lock()
+	if err := w.begin(ctx); err != nil {
+		w.mu.Unlock()
+		return err
+	}
+	recs := make([]Record, 0, len(w.m.items))
+	for el := w.m.order.Front(); el != nil; el = el.Next() {
+		it := el.Value.(*memItem)
+		rec, err := w.hydrate(it)
+		if err != nil {
+			w.mu.Unlock()
+			return fmt.Errorf("dlq: reading record %s: %w", it.rec.ID, err)
+		}
+		recs = append(recs, rec)
+	}
+	w.mu.Unlock()
+	for _, r := range recs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}

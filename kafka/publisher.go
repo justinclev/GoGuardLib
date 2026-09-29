@@ -53,7 +53,17 @@ type PublisherConfig struct {
 	// payload exactly as received, which is right only if the topic is as trusted
 	// as the store.
 	Encryptor secure.Encryptor
+	// RequireEncryption makes NewDLQPublisher fail unless Encryptor is set. The
+	// dead-letter topic usually has wider access than the store (other teams, other
+	// tooling, longer retention), so a payload mirrored in clear undoes the store's
+	// encryption. Set it in production so that forgetting the Encryptor is an error
+	// at start-up instead of a leak. It will default to true at v1.0.
+	RequireEncryption bool
 }
+
+// ErrEncryptionRequired is returned by NewDLQPublisher when RequireEncryption is
+// set and there is no Encryptor.
+var ErrEncryptionRequired = errors.New("kafka: PublisherConfig.RequireEncryption is set but no Encryptor was given")
 
 // DLQPublisher copies parked records to a Kafka dead-letter topic so other tools
 // can inspect or reprocess them. It is a mirror, not the source of truth: the
@@ -65,6 +75,9 @@ type DLQPublisher struct{ cfg PublisherConfig }
 func NewDLQPublisher(cfg PublisherConfig) (*DLQPublisher, error) {
 	if cfg.Producer == nil {
 		return nil, errors.New("kafka: PublisherConfig needs a Producer")
+	}
+	if cfg.RequireEncryption && cfg.Encryptor == nil {
+		return nil, ErrEncryptionRequired
 	}
 	if cfg.Topic == nil {
 		cfg.Topic = func(t string) string { return t + ".dlq" }
