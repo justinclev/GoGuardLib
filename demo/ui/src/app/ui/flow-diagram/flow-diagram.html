@@ -32,13 +32,28 @@
     <text class="lane-cap" x="40" y="404">KAFKA · two topics · nothing may be lost</text>
     <text class="lane-cap right" [attr.x]="W - 40" y="46">GUARDED DEPENDENCIES</text>
 
+    <!-- which flow calls which services: each Kafka topic runs its own pipeline -->
+    <g class="route-key">
+      @for (r of routes(); track r.name; let i = $index) {
+        <circle [attr.cx]="662" [attr.cy]="76 + i * 24 - 4" r="5" [attr.fill]="r.color" />
+        <text x="676" [attr.y]="76 + i * 24"><tspan class="rk-name" [attr.fill]="r.color">{{ r.name }}</tspan> calls {{ r.count }}: {{ r.text }}</text>
+      }
+      <circle cx="662" [attr.cy]="76 + routes().length * 24 - 4" r="5" fill="#3ee6ff" />
+      <text x="676" [attr.y]="76 + routes().length * 24"><tspan class="rk-name" fill="#3ee6ff">HTTP</tspan> calls all four; Notifications can be saved for later</text>
+    </g>
+
     <!-- edges -->
     <g class="edges">
       <path class="edge http" [attr.d]="'M ' + (nodes.http.x + 60) + ' ' + nodes.http.y + ' L ' + (nodes.gateway.x - 66) + ' ' + nodes.gateway.y" />
       <path class="edge http" [attr.d]="gatewayToFirst" />
       @for (t of topicNodes(); track t.name) {
-        <path class="edge kafka" [attr.d]="'M ' + (nodes.producer.x + 60) + ' ' + nodes.producer.y + ' L ' + (t.node.x - 66) + ' ' + t.node.y" />
-        <path class="edge kafka" [attr.d]="'M ' + (t.node.x + 66) + ' ' + t.node.y + ' L ' + (nodes.consumer.x - 72) + ' ' + nodes.consumer.y" />
+        <path class="edge kafka" [attr.stroke]="t.color" [attr.d]="'M ' + (nodes.producer.x + 60) + ' ' + nodes.producer.y + ' L ' + (t.node.x - 66) + ' ' + t.node.y" />
+        <path class="edge kafka" [attr.stroke]="t.color" [attr.d]="'M ' + (t.node.x + 66) + ' ' + t.node.y + ' L ' + (nodes.consumer.x - 72) + ' ' + nodes.consumer.y" />
+      }
+      @for (r of routes(); track r.name) {
+        @for (d of r.paths; track d) {
+          <path class="edge route" [attr.stroke]="r.color" [attr.d]="d" marker-end="url(#arrow)" [style.color]="r.color" />
+        }
       }
       <path class="edge kafka" [attr.d]="consumerToFirst" />
       @for (s of services(); track s.name) {
@@ -91,15 +106,15 @@
     </g>
 
     @for (t of topicNodes(); track t.name) {
-      <g class="node topic" [class.paused]="t.paused" [attr.transform]="'translate(' + t.node.x + ' ' + t.node.y + ')'">
-        <rect class="box kafka" x="-66" y="-38" width="132" height="76" rx="18" />
-        <text class="title" y="-12">{{ t.name }}</text>
+      <g class="node topic" [class.paused]="t.paused" [class.refunds]="t.name === 'refunds'" [attr.transform]="'translate(' + t.node.x + ' ' + t.node.y + ')'">
+        <rect class="box kafka" x="-66" y="-38" width="132" height="76" rx="18" [attr.stroke]="t.paused ? null : t.color" />
+        <text class="title" y="-12" [attr.fill]="t.color">{{ t.name }}</text>
         <g class="parts">
           <rect x="-46" y="-2" width="26" height="7" rx="3.5" />
           <rect x="-13" y="-2" width="26" height="7" rx="3.5" />
           <rect x="20" y="-2" width="26" height="7" rx="3.5" />
         </g>
-        <text class="sub" y="26">{{ t.paused ? 'paused · waiting safely' : t.produced + ' produced' }}</text>
+        <text class="sub" y="26">{{ t.paused ? 'paused · waiting safely' : t.steps + ' steps · ' + t.produced + ' sent' }}</text>
       </g>
     }
 
@@ -139,6 +154,13 @@
         <text class="title svc-title" y="20">{{ s.label }}</text>
         <text class="sub" y="38">{{ s.down ? 'OFFLINE' : s.mode === 'unknown' ? '…' : s.mode === 'up' ? s.served + ' served' : s.mode }}</text>
         <circle class="led" cx="36" cy="-38" r="5" />
+        <!-- which flows call this service -->
+        <g class="uses">
+          <title>Called by: {{ s.uses.map(u => u.label).join(', ') }}</title>
+          @for (u of s.uses; track u.label; let k = $index) {
+            <circle [attr.cx]="(k - (s.uses.length - 1) / 2) * 14" cy="45" r="4" [attr.fill]="u.color" />
+          }
+        </g>
         @if (s.down) {
           <g class="cross"><path d="M-30 -30 L30 30 M30 -30 L-30 30" /></g>
         }

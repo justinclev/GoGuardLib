@@ -47,6 +47,8 @@ Note: while orders are waiting in the log, new Kafka orders for the *same custom
 
 ### Two topics
 
+The **route key** at the top of the diagram says what each flow calls: `orders` all four services, `refunds` only Payments and Notifications, HTTP all four. Each topic is drawn in its own colour (violet, pink), the pink refunds route arcs over the services it skips, and the dots under each service show which flows call it. A stopped Shipping therefore pauses `orders` but leaves `refunds` running.
+
 The **Kafka topics** panel shows `orders` and `refunds` side by side: each has its own steps, tallies and a *reading* or *paused* state. A topic pauses when a breaker in **its own** pipeline is open. Both use the Payments and Notifications breakers, so taking either down pauses both topics; taking Inventory or Shipping down pauses only `orders`. One redriver finishes everything the log holds, and `kafka.RedriveFor` sends each stored message to the pipeline of its own topic (one handler built from a single pipeline would park the other topic's messages as mismatched). About one message in four is a refund.
 
 ### Saving HTTP requests for later (the switch)

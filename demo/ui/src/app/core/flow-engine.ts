@@ -1,4 +1,4 @@
-import { COLORS, GATE_OFFSET, NodeKey, NODES, Pt, ROW_Y, SERVICE_X, STEP_INDEX, TopicNode, gateOf, pos, svcOf, topicNode, H, W } from './layout';
+import { COLORS, GATE_OFFSET, NodeKey, NODES, Pt, ROW_Y, SERVICE_X, STEP_INDEX, TopicNode, gateOf, pos, svcOf, topicColor, topicNode, H, W } from './layout';
 import { StepName, StreamEvent, isStep } from './models';
 
 /**
@@ -163,7 +163,7 @@ export class FlowEngine {
         const p = this.spawn(id, 'http', COLORS.http, now);
         if (p) this.go(p, 'gateway', 420);
       } else if (this.waiting('topic') < MAX_WAIT_TOPIC) {
-        const p = this.spawn(id, 'producer', COLORS.kafka, now);
+        const p = this.spawn(id, 'producer', topicColor(ev.topic), now);
         if (p) {
           p.tn = topicNode(ev.topic);
           this.go(p, p.tn, 460);
@@ -191,7 +191,7 @@ export class FlowEngine {
     if (!id) return undefined;
     let p = this.ps.get(id);
     if (!p && ev.flow === 'kafka') {
-      p = this.spawn(id, ev.redriven ? 'dlq' : topicNode(ev.topic), ev.redriven ? COLORS.redriven : COLORS.kafka, now);
+      p = this.spawn(id, ev.redriven ? 'dlq' : topicNode(ev.topic), ev.redriven ? COLORS.redriven : topicColor(ev.topic), now);
       if (p) p.tn = topicNode(ev.topic);
       if (p && !ev.redriven) p.home = 'topic';
     }

@@ -159,6 +159,27 @@ text {
   }
 }
 
+.route-key text {
+  text-anchor: start;
+  font-size: 12.5px;
+  fill: var(--muted);
+}
+.rk-name {
+  font-weight: 750;
+}
+.edge.route {
+  stroke-width: 2.2;
+  opacity: 0.85;
+  stroke-dasharray: 7 7;
+}
+.uses circle {
+  stroke: rgba(0, 0, 0, 0.35);
+  stroke-width: 1;
+}
+.topic.refunds:not(.paused) .box {
+  filter: drop-shadow(0 0 10px rgba(255, 122, 200, 0.22));
+}
+
 .defer-chip {
   cursor: pointer;
   outline: none;

@@ -68,6 +68,7 @@ export const STEP_INDEX: Record<StepName, number> = Object.fromEntries(STEPS.map
 export const COLORS = {
   http: '#3ee6ff',
   kafka: '#8f86ff',
+  refunds: '#ff7ac8',
   ok: '#3ef0b0',
   failed: '#ff4d6d',
   rejected: '#c56bff',
@@ -75,3 +76,8 @@ export const COLORS = {
   redriven: '#4dfff0',
   parked: '#8b93b8',
 };
+
+/** The colour a Kafka topic is drawn in, so its route through the services can be followed. */
+export function topicColor(topic?: string): string {
+  return topic === 'refunds' ? COLORS.refunds : COLORS.kafka;
+}

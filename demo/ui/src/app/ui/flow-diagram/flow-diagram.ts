@@ -13,8 +13,8 @@ import {
 } from '@angular/core';
 import { ApiService } from '../../core/api.service';
 import { FlowEngine } from '../../core/flow-engine';
-import { GATE_OFFSET, H, NODES, ROW_Y, SERVICE_X, W, pos, gateOf, topicNode } from '../../core/layout';
-import { STEPS, STEP_LABEL, ServiceMode, StepName } from '../../core/models';
+import { COLORS, GATE_OFFSET, H, NODES, ROW_Y, SERVICE_X, STEP_INDEX, W, pos, gateOf, topicColor, topicNode } from '../../core/layout';
+import { STEPS, STEP_LABEL, ServiceMode, StepName, isStep } from '../../core/models';
 import { DemoStore } from '../../core/store';
 
 const ICONS: Record<StepName, string> = {
@@ -23,6 +23,12 @@ const ICONS: Record<StepName, string> = {
   shipping: 'M2 6h11v9H2z M13 9h4l3 3v3h-7z M5 17.5a1.6 1.6 0 1 0 .01 0 M16 17.5a1.6 1.6 0 1 0 .01 0',
   notifications: 'M6 16v-5a6 6 0 1 1 12 0v5l2 2H4l2-2z M10 20a2 2 0 0 0 4 0',
 };
+
+/** What the orchestrator runs, used until its first snapshot says otherwise. */
+const DEFAULT_TOPICS = [
+  { name: 'orders', steps: ['inventory', 'payments', 'shipping', 'notifications'] },
+  { name: 'refunds', steps: ['payments', 'notifications'] },
+];
 
 @Component({
   selector: 'app-flow-diagram',
@@ -75,6 +81,7 @@ export class FlowDiagram implements AfterViewInit {
         failureRate: br?.failureRate ?? 0,
         rejected: br?.rejected ?? 0,
         opens: br?.opens ?? 0,
+        uses: this.usedBy(name),
         // where the previous stage's line ends and the next begins
         prevX: i === 0 ? null : SERVICE_X[STEPS[i - 1]] + 54,
         left: (x / W) * 100,
@@ -82,6 +89,43 @@ export class FlowDiagram implements AfterViewInit {
       };
     });
   });
+
+  private topicDefs() {
+    const t = this.store.snapshot()?.topics;
+    return t?.length ? t.map((x) => ({ name: x.name, steps: x.steps })) : DEFAULT_TOPICS;
+  }
+
+  /** The colours of the flows that call a service: every topic whose pipeline has the step, and HTTP. */
+  private usedBy(step: StepName): { color: string; label: string }[] {
+    const kafka = this.topicDefs()
+      .filter((t) => t.steps.includes(step))
+      .map((t) => ({ color: topicColor(t.name), label: t.name }));
+    return [...kafka, { color: COLORS.http, label: 'HTTP' }];
+  }
+
+  /**
+   * Each topic's route through the services, drawn in its own colour where it differs from the plain
+   * row: a lead-in from underneath when it does not start at the first service, and an arc over the
+   * top wherever it skips services. The animation follows the same paths.
+   */
+  readonly routes = computed(() =>
+    this.topicDefs().map((t) => {
+      const idx = t.steps.filter(isStep).map((s) => STEP_INDEX[s]);
+      const paths: string[] = [];
+      if (idx.length && idx[0] > 0) {
+        const g = pos(gateOf(STEPS[idx[0]]));
+        paths.push(`M ${NODES.consumer.x + 72} ${NODES.consumer.y} C ${g.x - 140} ${NODES.consumer.y}, ${g.x - 4} ${ROW_Y + 150}, ${g.x} ${ROW_Y + 38}`);
+      }
+      for (let i = 1; i < idx.length; i++) {
+        if (idx[i] - idx[i - 1] < 2) continue;
+        const x0 = SERVICE_X[STEPS[idx[i - 1]]] + 18;
+        const x1 = SERVICE_X[STEPS[idx[i]]] - GATE_OFFSET - 8;
+        paths.push(`M ${x0} ${ROW_Y - 52} C ${x0 + 6} ${ROW_Y - 128}, ${x1 - 6} ${ROW_Y - 128}, ${x1} ${ROW_Y - 40}`);
+      }
+      const labels = t.steps.map((s) => (isStep(s) ? STEP_LABEL[s] : s));
+      return { name: t.name, color: topicColor(t.name), paths, text: labels.join(' → '), count: labels.length };
+    }),
+  );
 
   readonly gatewayToFirst = this.curve(NODES.gateway, pos(gateOf('inventory')), 0.12, 46, 0);
   readonly consumerToFirst = this.curve(NODES.consumer, pos(gateOf('inventory')), -0.12, 46, 0);
@@ -104,7 +148,7 @@ export class FlowDiagram implements AfterViewInit {
     const snap = this.store.snapshot()?.topics ?? [];
     return (['orders', 'refunds'] as const).map((name) => {
       const t = snap.find((x) => x.name === name);
-      return { name, node: NODES[topicNode(name)], produced: t?.produced ?? 0, paused: t?.paused ?? false };
+      return { name, node: NODES[topicNode(name)], color: topicColor(name), steps: t?.steps.length ?? (name === 'orders' ? 4 : 2), produced: t?.produced ?? 0, paused: t?.paused ?? false };
     });
   });
 
