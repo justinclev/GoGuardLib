@@ -90,6 +90,20 @@ type StoreStats struct {
 	// OldestPending is how long the oldest waiting record has existed, a good
 	// alert signal for a DLQ that is not draining.
 	OldestPending time.Duration
+	// OldestParked is how long the oldest parked record has been waiting for a
+	// person. Parked records are never retried, so this only grows until someone
+	// acts: alert on it.
+	OldestParked time.Duration
+	// BlockedKeys is how many order keys have a parked record at their head. Every
+	// later message with such a key waits behind it until the record is requeued or
+	// discarded, so this is the number of customers (or accounts, or entities)
+	// whose traffic is stopped. It scans the parked records, so read it on a
+	// monitoring interval, not per message.
+	BlockedKeys int
+	// ByDependency counts the records waiting for each dependency, by the name the
+	// breaker or step gave it (records not waiting on one are left out). It says
+	// which outage the queue is made of.
+	ByDependency map[string]int
 }
 
 // Total is the number of records held.

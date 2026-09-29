@@ -23,3 +23,8 @@ linters:
           - errcheck
           - bodyclose
           - errorlint
+      # dlqctl is a command-line program: writing to its stdout and stderr is its job.
+      # The rule stays on for every library package.
+      - path: ^cmd/
+        linters:
+          - forbidigo

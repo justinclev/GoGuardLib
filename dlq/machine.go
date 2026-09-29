@@ -582,6 +582,23 @@ func (m *machine) stats(now time.Time) StoreStats {
 	if oldest != nil {
 		st.OldestPending = now.Sub(oldest.rec.FirstFailed)
 	}
+	if front := m.parked.Front(); front != nil {
+		st.OldestParked = now.Sub(front.Value.(*memItem).rec.FirstFailed)
+	}
+	for el := m.parked.Front(); el != nil; el = el.Next() {
+		it := el.Value.(*memItem)
+		if k := it.rec.OrderKey; k != "" && m.byKey[k][0] == it {
+			st.BlockedKeys++
+		}
+	}
+	for dep, g := range m.groups {
+		if dep != "" {
+			if st.ByDependency == nil {
+				st.ByDependency = map[string]int{}
+			}
+			st.ByDependency[dep] = g.items.Len()
+		}
+	}
 	return st
 }
 

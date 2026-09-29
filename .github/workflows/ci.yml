@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# Nothing here writes to the repository, so the token gets read access only.
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -74,7 +78,7 @@ jobs:
       - name: Verify module checksums
         run: go mod verify && (cd kafka && go mod verify)
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
       - name: Scan the core module
         run: $(go env GOPATH)/bin/govulncheck ./...
       - name: Scan the Kafka module

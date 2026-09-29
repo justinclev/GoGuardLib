@@ -31,6 +31,7 @@ const (
 	KindRedrive      Kind = "redrive"
 	KindStore        Kind = "store"
 	KindOperator     Kind = "operator"
+	KindConsumer     Kind = "consumer"
 )
 
 // Event is a signal emitted by the library.
@@ -136,6 +137,38 @@ type OperatorAction struct {
 }
 
 func (OperatorAction) EventKind() Kind { return KindOperator }
+
+// ConsumerCode says what a Kafka consumer did with a message or a partition.
+type ConsumerCode string
+
+const (
+	ConsumerDeferred     ConsumerCode = "deferred"      // stored with its progress, to be finished when its dependency recovers
+	ConsumerParked       ConsumerCode = "parked"        // stored for a person
+	ConsumerOrderHeld    ConsumerCode = "order_held"    // stored behind an earlier message with the same key
+	ConsumerRetry        ConsumerCode = "retry"         // could not be processed or stored; the partition rewinds and retries
+	ConsumerBackpressure ConsumerCode = "backpressure"  // the store is full; consumption is held back
+	ConsumerUnstorable   ConsumerCode = "unstorable"    // could never be stored and was skipped (UnstorableSkip)
+	ConsumerPaused       ConsumerCode = "paused"        // a partition stopped fetching; Reason says why
+	ConsumerResumed      ConsumerCode = "resumed"       // a partition resumed
+	ConsumerCommitFailed ConsumerCode = "commit_failed" // an offset commit failed and will be retried
+	ConsumerMirrorFailed ConsumerCode = "mirror_failed" // the dead-letter topic copy failed or timed out
+	ConsumerRebalance    ConsumerCode = "rebalance"     // partitions were assigned or revoked
+)
+
+// ConsumerEvent reports something a Kafka consumer did that an operator would
+// want to alert on or chart. It carries the position of the message (topic,
+// partition, offset; Offset is -1 when it does not apply) and a short fixed
+// Reason, never the key, value, headers or error text.
+type ConsumerEvent struct {
+	Code      ConsumerCode
+	Topic     string
+	Partition int32
+	Offset    int64
+	Reason    string // for ConsumerPaused: "breaker_open", "retry_backoff" or "backlog"
+	At        time.Time
+}
+
+func (ConsumerEvent) EventKind() Kind { return KindConsumer }
 
 // Sink receives events. Emit is called on hot paths, so implementations must
 // return quickly and must not block; use a Dispatcher to hand events to code

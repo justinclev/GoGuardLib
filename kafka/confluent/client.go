@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,6 +26,11 @@ type Client struct {
 	onError func(error)
 
 	requireTLS bool
+
+	hmu       sync.Mutex
+	downSince time.Time // when librdkafka reported every broker down; zero while reachable
+	lastErr   string
+	probedAt  time.Time
 }
 
 // Option customises NewClient.
@@ -58,7 +64,60 @@ func checkTLS(cfg ck.ConfigMap) error {
 	return fmt.Errorf("%w (got %q)", ErrInsecureTransport, p)
 }
 
-var _ kafka.Client = (*Client)(nil)
+var (
+	_ kafka.Client         = (*Client)(nil)
+	_ kafka.HealthReporter = (*Client)(nil)
+)
+
+// Health implements kafka.HealthReporter.
+func (c *Client) Health() kafka.ClientHealth {
+	c.hmu.Lock()
+	defer c.hmu.Unlock()
+	return kafka.ClientHealth{AllBrokersDown: !c.downSince.IsZero(), Since: c.downSince, LastError: c.lastErr}
+}
+
+// noteError records an error librdkafka retries by itself.
+func (c *Client) noteError(e ck.Error) {
+	c.hmu.Lock()
+	defer c.hmu.Unlock()
+	c.lastErr = e.Error()
+	if e.Code() == ck.ErrAllBrokersDown && c.downSince.IsZero() {
+		c.downSince = time.Now()
+	}
+}
+
+// noteReachable clears the all-brokers-down state.
+func (c *Client) noteReachable() {
+	c.hmu.Lock()
+	c.downSince = time.Time{}
+	c.hmu.Unlock()
+}
+
+// probeIfDown asks the cluster for metadata now and then while it is believed
+// down: librdkafka reports the loss but never announces the return, and an idle
+// topic delivers no message that would show it.
+func (c *Client) probeIfDown() {
+	c.hmu.Lock()
+	due := !c.downSince.IsZero() && time.Since(c.probedAt) > 5*time.Second
+	if due {
+		c.probedAt = time.Now()
+	}
+	c.hmu.Unlock()
+	if due {
+		if _, err := c.c.GetMetadata(nil, false, 1000); err == nil {
+			c.noteReachable()
+		}
+	}
+}
+
+// defaultOffsetReset sets auto.offset.reset to earliest unless the caller chose. The
+// librdkafka default, latest, makes a new consumer group skip every message already
+// on the topic, silently; say "latest" yourself if you mean it.
+func defaultOffsetReset(cm ck.ConfigMap) {
+	if v, ok := cm["auto.offset.reset"]; !ok || v == nil {
+		cm["auto.offset.reset"] = "earliest"
+	}
+}
 
 // NewClient creates a consumer subscribed to topics.
 //
@@ -66,8 +125,9 @@ var _ kafka.Client = (*Client)(nil)
 // sasl.*, ssl.*, and so on: TLS and SASL are entirely yours to configure, and
 // nothing here logs it). Two settings are forced because the kafka package must
 // decide when an offset is safe: enable.auto.commit=false and
-// enable.auto.offset.store=false. Set auto.offset.reset (earliest is usual)
-// yourself. Both the eager and the cooperative rebalance protocols work.
+// enable.auto.offset.store=false. auto.offset.reset defaults to earliest when you
+// leave it out (librdkafka's own default, latest, skips the backlog of a new
+// group); set it explicitly to choose otherwise. Both the eager and the cooperative rebalance protocols work.
 func NewClient(cfg ck.ConfigMap, topics []string, opts ...Option) (*Client, error) {
 	if _, err := cfg.Get("group.id", nil); err != nil {
 		return nil, err
@@ -88,6 +148,7 @@ func NewClient(cfg ck.ConfigMap, topics []string, opts ...Option) (*Client, erro
 	for k, v := range cfg {
 		cm[k] = v
 	}
+	defaultOffsetReset(cm)
 	for k, v := range map[string]any{
 		"enable.auto.commit":              false,
 		"enable.auto.offset.store":        false,
@@ -174,6 +235,7 @@ func (c *Client) Poll(ctx context.Context, timeout time.Duration) (kafka.Event, 
 	if timeout > 100*time.Millisecond {
 		timeout = 100 * time.Millisecond // stay responsive to ctx; a poll cannot be interrupted
 	}
+	c.probeIfDown()
 	ev := c.c.Poll(int(timeout / time.Millisecond)) // a rebalance callback may run in here
 	if f := c.failure.Load(); f != nil {
 		return nil, *f
@@ -184,6 +246,7 @@ func (c *Client) Poll(ctx context.Context, timeout time.Duration) (kafka.Event, 
 			// A message that could not be delivered must not be skipped: stop and say why.
 			return nil, fmt.Errorf("confluent: message error on %s[%d]: %w", toTP(e.TopicPartition).Topic, e.TopicPartition.Partition, e.TopicPartition.Error)
 		}
+		c.noteReachable() // a message arrived, so the cluster is there
 		m := kafka.Message{
 			TopicPartition: toTP(e.TopicPartition), Offset: int64(e.TopicPartition.Offset),
 			Key: e.Key, Value: e.Value, Timestamp: e.Timestamp,
@@ -196,6 +259,7 @@ func (c *Client) Poll(ctx context.Context, timeout time.Duration) (kafka.Event, 
 		if e.IsFatal() {
 			return nil, e
 		}
+		c.noteError(e)
 		if c.onError != nil {
 			c.onError(e)
 		}

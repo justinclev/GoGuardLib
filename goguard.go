@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,6 +73,13 @@ type Config struct {
 	MaxIdleConns        int
 	MaxIdleConnsPerHost int
 	IdleConnTimeout     time.Duration
+	// ResponseHeaderTimeout bounds how long the default transport waits for a
+	// response's headers after sending the request. A server that accepts the
+	// connection and then says nothing would otherwise hold the caller for ever
+	// (Policy.RequestTimeout is opt-in and also bounds the body). It does not limit
+	// reading a body, so streaming responses are unaffected. Default 30 seconds; a
+	// negative value disables it.
+	ResponseHeaderTimeout time.Duration
 
 	// Endpoints lists the protected endpoints. The first whose Match accepts a
 	// request wins.
@@ -80,8 +88,10 @@ type Config struct {
 	// circuit per host. Leave nil to let unmatched requests pass through.
 	GuardAll *Policy
 
-	// MaxBreakers caps live circuits per shard; the least recently used is
-	// evicted. Default 1000.
+	// MaxBreakers caps live circuits in each shard, so the transport can hold up to
+	// MaxBreakers times ShardCount (64000 by default); the least recently used
+	// circuit of a full shard is evicted, and an evicted circuit starts closed
+	// with no history when its host is next seen. Default 1000.
 	MaxBreakers int
 	// MaxIdleTime evicts circuits unused for this long; 0 disables pruning.
 	MaxIdleTime time.Duration
@@ -255,6 +265,7 @@ func New(cfg Config, opts ...Option) (*ResilientTransport, error) {
 			MaxIdleConnsPerHost:   orDefault(cfg.MaxIdleConnsPerHost, 16),
 			IdleConnTimeout:       orDefaultDuration(cfg.IdleConnTimeout, 90*time.Second),
 			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: responseHeaderTimeout(cfg.ResponseHeaderTimeout),
 			ExpectContinueTimeout: time.Second,
 		}
 	}
@@ -732,6 +743,9 @@ func (t *ResilientTransport) guarded(ep *endpoint, req *http.Request) (*http.Res
 				if pol.RetryBackoff != nil {
 					backoff = pol.RetryBackoff(attempts)
 				}
+				if ra := retryAfter(r, time.Now()); ra > backoff {
+					backoff = ra // the server said when to come back
+				}
 				obs.Emit(t.sink, obs.Retried{Dependency: ent.name, Attempt: attempts, Delay: backoff, At: time.Now()})
 				if backoff > 0 {
 					select {
@@ -775,6 +789,29 @@ func (t *ResilientTransport) guarded(ep *endpoint, req *http.Request) (*http.Res
 	}
 }
 
+// maxRetryAfter caps how long a server's Retry-After can hold a request: a
+// misbehaving or hostile server must not park callers for hours.
+const maxRetryAfter = 30 * time.Second
+
+// retryAfter reads the Retry-After header of r (delay in seconds, or an HTTP date)
+// as a wait from now. It returns 0 for a missing, malformed or already-past value.
+func retryAfter(r *http.Response, now time.Time) time.Duration {
+	if r == nil {
+		return 0
+	}
+	v := strings.TrimSpace(r.Header.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	var d time.Duration
+	if secs, err := strconv.Atoi(v); err == nil {
+		d = time.Duration(secs) * time.Second
+	} else if at, err := http.ParseTime(v); err == nil {
+		d = at.Sub(now)
+	}
+	return min(max(d, 0), maxRetryAfter)
+}
+
 // cancelBody releases the request-timeout context when the body is closed.
 type cancelBody struct {
 	io.ReadCloser
@@ -797,4 +834,14 @@ func closeResponse(r *http.Response) {
 	if r != nil && r.Body != nil {
 		_ = r.Body.Close()
 	}
+}
+
+func responseHeaderTimeout(d time.Duration) time.Duration {
+	switch {
+	case d < 0:
+		return 0 // net/http: no limit
+	case d == 0:
+		return 30 * time.Second
+	}
+	return d
 }

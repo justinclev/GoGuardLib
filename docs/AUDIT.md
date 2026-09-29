@@ -272,6 +272,19 @@ Each item has a regression test that failed before the change. Behaviour changes
 | D8 | High | The consumer accepted a store that forgets (`MemoryStore`, WAL with `SyncInterval`) and committed offsets past messages it held. | Stores report `dlq.Durability`; `kafka.Config.RequireDurableStore` refuses anything but durable. |
 | S10 | Medium | Requeue and Discard, the actions that release or delete a customer's message, left no trail. | `dlq.Audited` and `dlq.WithActor` emit `obs.OperatorAction` (action, record ID, actor, outcome; never contents). |
 
+## Fourth pass, batch 3 ("operate it")
+
+| Ref | Finding | Fix |
+|---|---|---|
+| U1 | A parked record blocks every later message with its key, with no way to see it. | `StoreStats.BlockedKeys`, `OldestParked`, `ByDependency`. |
+| U2 | The consumer's `Events` field was unused. | `obs.ConsumerEvent` for deferred, parked, order-held, retry, backpressure, unstorable, paused/resumed (with reason), commit and mirror failures, rebalances. Positions and fixed reasons only. |
+| U3 | A server that accepts a connection and goes silent held callers for ever; `Retry-After` was ignored; `MaxBreakers` was documented per transport but applied per shard. | Default transport `ResponseHeaderTimeout` 30s (does not limit bodies, so streaming is unaffected); `Retry-After` (seconds or date, capped at 30s) lower-bounds the retry delay; the doc now says per shard. A default `RequestTimeout` was not added: it also bounds the body and would cut streams. |
+| U4 | librdkafka defaults to `latest`: a new group silently skips the backlog. | `auto.offset.reset` defaults to `earliest` when unset. |
+| U5 | An unreachable cluster looks like an idle topic. | `kafka.HealthReporter`, `Stats.Health`, the confluent client tracks all-brokers-down (and probes for the return), `Config.BrokersDownTimeout` stops `Run` with `ErrBrokersDown` (opt-in). |
+| U6 | No operator tooling. | `dlq.VerifyWAL`, `dlq.OpenWALCopy`, `WALStore.Backup`, and `cmd/dlqctl` (verify, inspect, backup, requeue, discard). `inspect` never prints payloads or order keys. |
+| S12 | CI ran with a default token, `govulncheck@latest`, no code scanning, no policy files, untagged releases. | Read-only `permissions`, pinned govulncheck, CodeQL, tag-triggered release workflow, SECURITY.md, CODEOWNERS, CONTRIBUTING.md, CHANGELOG.md. Actions are still pinned by tag, not commit SHA (Dependabot updates them); pinning needs the SHAs looked up on GitHub. |
+| U8 | No runbook, threat model or versioning policy. | docs/OPERATIONS.md, docs/SECURITY.md, CHANGELOG.md's planned-defaults list. |
+
 ## What was checked and found sound
 
 Recorded so the next reviewer does not repeat it.

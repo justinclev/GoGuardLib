@@ -31,6 +31,10 @@ var ErrUnstorable = errors.New("kafka: message can be neither processed nor stor
 // the Store does not report DurabilityDurable.
 var ErrStoreNotDurable = errors.New("kafka: the store is not durable")
 
+// ErrBrokersDown is returned by Run when the Client has reported that no broker is
+// reachable for longer than Config.BrokersDownTimeout.
+var ErrBrokersDown = errors.New("kafka: no broker has been reachable for longer than BrokersDownTimeout")
+
 // UnstorablePolicy says what to do with a message that fails and that the store
 // will never accept.
 type UnstorablePolicy int
@@ -111,6 +115,12 @@ type Config struct {
 	// with jitter.
 	RetryBackoff retry.Backoff
 
+	// BrokersDownTimeout stops Run with ErrBrokersDown once the Client (if it is a
+	// HealthReporter) has had no reachable broker for this long, so that a
+	// supervisor restarts the process and an alert fires. Without it a consumer
+	// that has lost the cluster keeps polling and looks idle. Zero (the default)
+	// never stops; it will default to 5 minutes at v1.0.
+	BrokersDownTimeout time.Duration
 	// RequireDurableStore makes NewConsumer refuse a Store that cannot promise an
 	// acknowledged Append survives a crash and a power failure (see
 	// dlq.StoreDurability): a MemoryStore, or a WAL with SyncInterval or SyncNone.
@@ -135,8 +145,12 @@ type Config struct {
 	// Kafka dead-letter topic. It is best effort: the message is already parked in
 	// the Store.
 	Mirror *DLQPublisher
-	// Events receives obs events. Currently unused by the consumer itself and
-	// reserved; breakers and the redriver emit their own.
+	// Events receives an obs.ConsumerEvent for what the consumer does that an
+	// operator would alert on: messages deferred, parked or held for ordering,
+	// retries and backpressure, partitions paused and resumed, failed commits and
+	// mirror publishes, rebalances. Events carry positions and fixed reasons, never
+	// message data. It may be called from several goroutines at once and must not block; wrap a slow sink in an obs.Dispatcher.
+	// Breakers and the redriver emit their own events to their own sinks.
 	Events obs.Sink
 }
 
@@ -154,15 +168,19 @@ type Stats struct {
 	Rebalances   uint64
 	MirrorErrors uint64
 	Unstorable   uint64 // skipped because they could not be stored (UnstorableSkip)
-	Paused       int    // partitions currently paused
-	InFlight     int    // messages taken from the client and not yet finished
+	// Health is what the Client reports about the cluster connection; the zero
+	// value if the Client does not report (see HealthReporter).
+	Health   ClientHealth
+	Paused   int // partitions currently paused
+	InFlight int // messages taken from the client and not yet finished
 }
 
 type partition struct {
-	paused   bool
-	retryAt  time.Time
-	failures int
-	gen      uint64 // identifies this assignment; results from an older one are discarded
+	paused      bool
+	pauseReason string
+	retryAt     time.Time
+	failures    int
+	gen         uint64 // identifies this assignment; results from an older one are discarded
 
 	next      int64              // the next offset to accept from the client; -1 until the first message
 	frontier  int64              // every offset below it is safe (done or durably stored)
@@ -214,6 +232,11 @@ type Consumer struct {
 	received, done, deferred, parked, orderHeld, retried, backpressure atomic.Uint64
 	commits, commitErrors, rebalances, mirrorErrors, unstorable        atomic.Uint64
 	pausedNow, inflightNow                                             atomic.Int64
+}
+
+// emit reports a consumer event. offset is -1 when the event is not about one message.
+func (c *Consumer) emit(code obs.ConsumerCode, tp TopicPartition, offset int64, reason string) {
+	obs.Emit(c.cfg.Events, obs.ConsumerEvent{Code: code, Topic: tp.Topic, Partition: tp.Partition, Offset: offset, Reason: reason, At: time.Now()})
 }
 
 // keyID identifies a key within a partition: Kafka orders messages only there.
@@ -300,7 +323,12 @@ func (c *Consumer) Topics() []string {
 
 // Stats returns the counters.
 func (c *Consumer) Stats() Stats {
+	var health ClientHealth
+	if hr, ok := c.cfg.Client.(HealthReporter); ok {
+		health = hr.Health()
+	}
 	return Stats{
+		Health:   health,
 		Received: c.received.Load(), Done: c.done.Load(), Deferred: c.deferred.Load(), Parked: c.parked.Load(),
 		OrderHeld: c.orderHeld.Load(), Retried: c.retried.Load(), Backpressure: c.backpressure.Load(),
 		Commits: c.commits.Load(), CommitErrors: c.commitErrors.Load(), Rebalances: c.rebalances.Load(),
@@ -337,6 +365,10 @@ loop:
 		timeout := c.cfg.PollTimeout
 		if c.inflight > 0 && timeout > 10*time.Millisecond {
 			timeout = 10 * time.Millisecond // results are waiting on workers: come back soon
+		}
+		if err := c.checkBrokers(); err != nil {
+			fatal = err
+			break
 		}
 		ev, err := c.cfg.Client.Poll(ctx, timeout)
 		if err != nil {
@@ -408,10 +440,20 @@ func (c *Consumer) reconcile() {
 	now := time.Now()
 	var pause, resume []TopicPartition
 	for tp, p := range c.parts {
-		want := p.retryAt.After(now) || c.breakerOpen(tp.Topic) || c.throttled
+		reason := ""
+		switch {
+		case c.breakerOpen(tp.Topic):
+			reason = "breaker_open"
+		case p.retryAt.After(now):
+			reason = "retry_backoff"
+		case c.throttled:
+			reason = "backlog"
+		}
+		want := reason != ""
 		switch {
 		case want && !p.paused:
 			pause = append(pause, tp)
+			p.pauseReason = reason
 		case !want && p.paused:
 			resume = append(resume, tp)
 		}
@@ -419,11 +461,13 @@ func (c *Consumer) reconcile() {
 	if len(pause) > 0 && c.cfg.Client.Pause(pause) == nil {
 		for _, tp := range pause {
 			c.parts[tp].paused = true
+			c.emit(obs.ConsumerPaused, tp, -1, c.parts[tp].pauseReason)
 		}
 	}
 	if len(resume) > 0 && c.cfg.Client.Resume(resume) == nil {
 		for _, tp := range resume {
 			c.parts[tp].paused = false
+			c.emit(obs.ConsumerResumed, tp, -1, "")
 		}
 	}
 	var n int64
@@ -449,6 +493,9 @@ func (c *Consumer) newPartition() *partition {
 
 func (c *Consumer) onAssigned(parts []TopicPartition) error {
 	c.rebalances.Add(1)
+	for _, tp := range parts {
+		c.emit(obs.ConsumerRebalance, tp, -1, "assigned")
+	}
 	for _, tp := range parts {
 		c.parts[tp] = c.newPartition() // a new assignment starts unpaused; reconcile re-applies pauses
 		delete(c.committed, tp)
@@ -477,6 +524,9 @@ func (c *Consumer) onRevoked(parts []TopicPartition) error {
 	}
 	c.backlog = kept
 	c.rebalances.Add(1)
+	for _, tp := range parts {
+		c.emit(obs.ConsumerRebalance, tp, -1, "revoked")
+	}
 	return nil
 }
 
@@ -532,6 +582,7 @@ func (c *Consumer) commitOffsets(offs []TopicPartitionOffset) error {
 	}
 	if err := c.cfg.Client.Commit(offs); err != nil {
 		c.commitErrors.Add(1)
+		c.emit(obs.ConsumerCommitFailed, offs[0].TopicPartition, offs[0].Offset, "")
 		return fmt.Errorf("kafka: committing offsets: %w", err)
 	}
 	for _, o := range offs {
@@ -787,6 +838,7 @@ func (c *Consumer) complete(ctx context.Context, r result) error {
 			return fmt.Errorf("%w: %s offset %d: %w", ErrUnstorable, tp, r.m.Offset, r.err)
 		}
 		c.unstorable.Add(1)
+		c.emit(obs.ConsumerUnstorable, tp, r.m.Offset, "")
 		c.mirror(ctx, r.in)
 		c.markDone(tp, p, r.m.Offset)
 		c.released(r.task)
@@ -802,8 +854,10 @@ func (c *Consumer) complete(ctx context.Context, r result) error {
 			c.done.Add(1)
 		case pipeline.Deferred:
 			c.deferred.Add(1)
+			c.emit(obs.ConsumerDeferred, tp, r.m.Offset, "")
 		default:
 			c.parked.Add(1)
+			c.emit(obs.ConsumerParked, tp, r.m.Offset, "")
 		}
 		c.markDone(tp, p, r.m.Offset)
 		c.released(r.task)
@@ -837,11 +891,13 @@ func (c *Consumer) noteFailure(ctx context.Context, p *partition, r result) erro
 		return nil // shutting down: leave the message uncommitted
 	case errors.Is(err, dlq.ErrFull):
 		c.backpressure.Add(1)
+		c.emit(obs.ConsumerBackpressure, r.m.TopicPartition, r.m.Offset, "")
 	}
 	if p.failedAt < 0 || r.m.Offset < p.failedAt {
 		p.failedAt = r.m.Offset
 	}
 	c.retried.Add(1)
+	c.emit(obs.ConsumerRetry, r.m.TopicPartition, r.m.Offset, "")
 	return nil
 }
 
@@ -895,6 +951,7 @@ func (c *Consumer) process(ctx context.Context, b *binding, in pipeline.Input) (
 				return pipeline.Failed, err
 			}
 			c.orderHeld.Add(1)
+			c.emit(obs.ConsumerOrderHeld, TopicPartition{Topic: in.Source.Name, Partition: in.Source.Partition}, in.Source.Offset, "")
 			return pipeline.Deferred, nil
 		}
 	}
@@ -912,5 +969,21 @@ func (c *Consumer) mirror(ctx context.Context, in pipeline.Input) {
 	defer cancel()
 	if err := c.cfg.Mirror.Publish(mctx, rec, "parked by the pipeline: see the dead-letter store"); err != nil {
 		c.mirrorErrors.Add(1)
+		c.emit(obs.ConsumerMirrorFailed, TopicPartition{Topic: in.Source.Name, Partition: in.Source.Partition}, in.Source.Offset, "")
 	}
+}
+
+// checkBrokers applies BrokersDownTimeout.
+func (c *Consumer) checkBrokers() error {
+	if c.cfg.BrokersDownTimeout <= 0 {
+		return nil
+	}
+	hr, ok := c.cfg.Client.(HealthReporter)
+	if !ok {
+		return nil
+	}
+	if h := hr.Health(); h.AllBrokersDown && !h.Since.IsZero() && time.Since(h.Since) > c.cfg.BrokersDownTimeout {
+		return fmt.Errorf("%w (down since %s)", ErrBrokersDown, h.Since.UTC().Format(time.RFC3339))
+	}
+	return nil
 }

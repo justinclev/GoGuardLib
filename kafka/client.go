@@ -84,3 +84,20 @@ type Client interface {
 	// Commit synchronously stores the offsets for the consumer group.
 	Commit(offsets []TopicPartitionOffset) error
 }
+
+// ClientHealth is what a Client knows about its connection to the cluster.
+type ClientHealth struct {
+	// AllBrokersDown is true while the client cannot reach any broker. Without this
+	// signal an unreachable cluster looks exactly like an idle topic.
+	AllBrokersDown bool
+	// Since is when AllBrokersDown began; zero otherwise.
+	Since time.Time
+	// LastError is the text of the last error the client library reported. It can
+	// name broker addresses but never message data. Empty if none.
+	LastError string
+}
+
+// HealthReporter is implemented by Clients that can say whether the cluster is
+// reachable. The confluent Client does. Consumer.Stats reports it and
+// Config.BrokersDownTimeout acts on it.
+type HealthReporter interface{ Health() ClientHealth }
