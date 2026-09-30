@@ -192,3 +192,34 @@ func runGuardedOrders(ctx context.Context, brokers, dataDir, paymentsURL string)
 func Example_readmeGuarded() {
 	_ = runGuardedOrders
 }
+
+// proposalExample is the short version used in the proposal: the parts a developer writes once the
+// Kafka client and the store exist. Errors are dropped here only to keep it short; runGuardedOrders
+// is the complete version.
+func proposalExample(ctx context.Context, client kafka.Client, store dlq.Store, paymentsHealth health.Check) {
+	payments := breaker.New(breaker.Config{
+		Name: "payments", FailureThreshold: 0.5, MinSamples: 20,
+		Health: &health.Config{Check: paymentsHealth}, // ask payments' /health when it is back
+	})
+
+	orders, _ := kafka.HandlerBinding(kafka.HandlerConfig{
+		Topic:   "orders",
+		Breaker: payments, // topic pauses while this circuit is open
+		Handle: func(ctx context.Context, m kafka.HandledMessage) error {
+			return chargeOrder(ctx, m.Value) // return an error: saved to disk, retried later
+		},
+	})
+
+	consumer, _ := kafka.NewConsumer(kafka.Config{Client: client, Store: store, Bindings: []kafka.Binding{orders}})
+	redriver, _ := dlq.NewRedriver(dlq.RedriveConfig{
+		Store: store, Handler: orders.Pipeline.Handler(),
+		Breakers: map[string]*breaker.Breaker{"payments": payments},
+	})
+
+	go func() { _ = redriver.Run(ctx) }() // retries saved messages once payments is healthy
+	_ = consumer.Run(ctx)
+}
+
+func Example_readmeProposal() {
+	_ = proposalExample
+}
