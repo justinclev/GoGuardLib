@@ -865,3 +865,28 @@ func TestBreakerSourceHoldsRecordsWhileALateCircuitIsOpen(t *testing.T) {
 		t.Fatalf("the handler ran %d times while the circuit was open", n)
 	}
 }
+
+// A breaker with no health check only leaves the open state when a request arrives. The
+// redriver must therefore let one through once the sleep window has passed, instead of
+// waiting for a state change that nothing will cause.
+func TestRedriverRetriesThroughATimerOnlyBreakerOnceItsSleepWindowPasses(t *testing.T) {
+	store := dlq.NewMemoryStore(dlq.MemoryOptions{})
+	addBlocked(t, store, 2, "svc")
+	br := breaker.New(breaker.Config{Name: "svc", FailureThreshold: 0.1, MinSamples: 1, SleepWindow: 100 * time.Millisecond})
+	defer br.Close()
+	_ = br.Do(context.Background(), func(context.Context) error { return errors.New("down") })
+	if br.State() != obs.StateOpen {
+		t.Fatal("test setup: the circuit should be open")
+	}
+	var handled atomic.Int32
+	r := newRedriver(t, dlq.RedriveConfig{
+		Store: store,
+		Handler: func(ctx context.Context, it *dlq.Item) error {
+			// The handler's call goes through the breaker, as a pipeline step's does.
+			return br.Do(ctx, func(context.Context) error { handled.Add(1); return nil })
+		},
+		Breakers: map[string]*breaker.Breaker{"svc": br},
+	})
+	start(t, r)
+	eventually(t, "both records to be handled through the breaker", func() bool { return handled.Load() == 2 })
+}

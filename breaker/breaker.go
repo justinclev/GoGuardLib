@@ -282,6 +282,16 @@ func (b *Breaker) Name() string { return b.cfg.Name }
 // State returns the current state.
 func (b *Breaker) State() State { return b.in.State() }
 
+// Refusing reports whether the circuit is open and will keep refusing calls until something
+// helps: its health check passing, or a call being tried. It is false once an open circuit
+// would admit the next call as a canary (its sleep window has passed, or the health check's
+// MaxOpen safety valve has run out), even though State still says open until that call arrives.
+//
+// Use it, not State, to decide whether to hold work back for this breaker. State only changes
+// when a request reaches the breaker, so holding work back until State changes waits for a
+// request that the waiting itself prevents.
+func (b *Breaker) Refusing() bool { return b.in.Refusing() }
+
 // SetOverride forces the breaker open or closed, or restores normal operation.
 func (b *Breaker) SetOverride(o Override) {
 	atomic.StoreInt32(&b.override, int32(o))

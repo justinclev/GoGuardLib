@@ -424,7 +424,7 @@ func (c *Consumer) finalCommit() error {
 func (c *Consumer) breakerOpen(topic string) bool {
 	if b := c.bindings[topic]; b != nil {
 		for _, br := range b.breakers {
-			if br.State() == obs.StateOpen {
+			if br.Refusing() {
 				return true
 			}
 		}

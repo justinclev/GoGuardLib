@@ -321,6 +321,21 @@ func openStore(cfg serviceConfig) (dlq.Store, error) {
 
 Then pass `orders` to `kafka.Binding{Topic: "orders", Pipeline: orders}` and start the consumer and redriver as in Step 4. The complete, working file is [kafka/example_service_test.go](kafka/example_service_test.go), including how to list orders waiting for a person and resume them.
 
+### Passing data from one step to the next
+
+A step can hand data to the next one with `Set` and `Get`. It is saved with the step's progress, so it is still there if a later step fails and the message is resumed hours later. Here step 1 asks one API for an account, and step 2 sends it to another:
+
+```go
+checkout, err := pipeline.New("checkout", "v1", []pipeline.Step{
+	{Name: "fetch-user", Breaker: usersBr, Run: func(ctx context.Context, x *pipeline.Exec) error {
+		account, err := call(ctx, http.MethodGet, users.URL, "")
+	
+```
+
+If the orders API is down, step 2 fails and the message is saved with `accountId` in its checkpoint. When orders is back, the redriver resumes at step 2, and `Get` still returns the account. Step 1 is not called again. The full example, with two fake APIs, is [examples/stepdata](examples/stepdata/stepdata_test.go).
+
+Only what you `Set` is saved, so a variable in your closure is lost on a resume. Keep it small (IDs, not payloads): it counts against the record size limit. It is stored in clear unless you wrap the store in `dlq.Secure`.
+
 When payments goes down in this setup:
 
 1. A few orders fail at the charge step. The payments breaker opens.

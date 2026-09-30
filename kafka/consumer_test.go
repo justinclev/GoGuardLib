@@ -756,3 +756,28 @@ func TestShutdownCommitRetriesWhileStillPolling(t *testing.T) {
 		t.Fatalf("CommitErrors = %d, want the 3 refusals", c.Stats().CommitErrors)
 	}
 }
+
+// A breaker with no health check reopens only when a request arrives. The consumer pauses the
+// topic while the circuit is open, so once the sleep window has passed it must resume and let
+// a message through as the canary; otherwise the topic stays paused for ever.
+func TestTopicResumesThroughATimerOnlyBreaker(t *testing.T) {
+	var healthy atomic.Bool
+	r := newRig(t)
+	r.br = breaker.New(breaker.Config{Name: "payments", FailureThreshold: 0.1, MinSamples: 1, SleepWindow: 100 * time.Millisecond})
+	defer r.br.Close()
+	r.produceN(3, "m")
+	r.setFail(func(string) error {
+		if healthy.Load() {
+			return nil
+		}
+		return errors.New("payments 503")
+	})
+	c := r.newConsumer()
+	r.assign(0)
+	stop := r.run(c)
+
+	eventually(t, "the circuit to open and the topic to pause", func() bool { return c.Stats().Paused > 0 })
+	healthy.Store(true) // the dependency recovers; nothing tells the breaker
+	eventually(t, "every message to be processed", func() bool { return r.broker.committedOffset(topic, 0) == 3 })
+	must(t, stop())
+}

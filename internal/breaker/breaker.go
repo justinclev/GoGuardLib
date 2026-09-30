@@ -155,6 +155,31 @@ func (b *Breaker) circuitAllows(shardSeed *uint64) bool {
 	}
 }
 
+// Refusing reports whether the circuit is open and will keep refusing calls unless something
+// else helps. It is false for an open circuit that would admit a call as a canary right now: one
+// whose sleep window has passed (or whose MaxOpen safety valve has run out, if a health check
+// owned the way out). The state itself does not change until a request arrives to take that
+// step, so code that waits for the state to change (pausing a consumer, holding stored work)
+// must ask this instead, or nothing ever sends the request and the circuit stays open.
+func (b *Breaker) Refusing() bool {
+	switch atomic.LoadInt32(&b.override) {
+	case 1:
+		return true // forced open
+	case 2:
+		return false // forced closed
+	}
+	if atomic.LoadInt32(&b.dryRun) == 1 || b.state.Get() != engine.StateOpen {
+		return false // a dry-run breaker never refuses
+	}
+	since := time.Now().UnixNano() - atomic.LoadInt64(&b.lastFailure)
+	if atomic.LoadInt32(&b.healthGated) == 1 && (b.maxOpen <= 0 || since < int64(b.maxOpen)) {
+		return true
+	}
+	// The real check admits after the sleep window plus up to a tenth of it in jitter; wait for
+	// the most of that, so a resumed caller is never turned away a moment too early.
+	return since <= int64(b.sleepWindow)+int64(b.sleepWindow)/10
+}
+
 // Verdict is the outcome of an admission decision.
 type Verdict int
 

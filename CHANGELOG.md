@@ -7,6 +7,12 @@ for v1.0" so it can be adopted early.
 ## Unreleased
 
 ### Reliability
+- **Fixed: a breaker without a health check could keep a consumer or redriver stalled for ever.**
+  An open breaker only moves to half-open when a request reaches it, but the consumer pauses a
+  topic while the circuit is open and the redriver skips records whose circuit is open, so
+  nothing sent that request. `Breaker.Refusing()` says whether an open circuit would admit a
+  canary now (sleep window passed, or the health check's `MaxOpen` ran out); both now use it.
+  Health-checked breakers behave as before until `MaxOpen`, which is now honoured by them too.
 - HTTP: `Policy.Defer` saves requests that cannot be sent (circuit open, or failed after
   retries) to any `dlq.Store`, memory or disk, and `goguard.ReplayHandler` sends them
   through the redriver when the service is healthy. Opt-in per endpoint; needs an

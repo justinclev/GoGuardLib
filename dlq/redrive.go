@@ -347,7 +347,7 @@ func (r *Redriver) unavailable(now time.Time) []string {
 	var skip []string
 	current := map[string]bool{}
 	check := func(name string, br *breaker.Breaker) {
-		if br.State() == obs.StateOpen && !current[name] {
+		if br.Refusing() && !current[name] {
 			current[name] = true
 			skip = append(skip, name)
 		}
