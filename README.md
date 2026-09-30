@@ -240,7 +240,117 @@ What that gives you:
 - If `chargeOrder` returns an error, the order is saved to disk and retried later. Orders from the same customer stay in order.
 - If the process crashes, saved orders are still there when it restarts.
 - If you return `retry.Permanent(err)`, the order is set aside for a person instead of being retried forever.
-- Add `Breaker: yourBreaker` to `HandlerConfig` and the consumer pauses the topic while the circuit is open. Messages wait safely in Kafka instead of piling up on disk.
+- Give the handler a circuit breaker (next section) and the consumer pauses the topic while the circuit is open. Messages wait safely in Kafka instead of piling up on disk.
+
+### In a real service
+
+The example above works, but a saved order is only retried a limited number of times (10 by default) before it is set aside for a person. If the service you call is down for a long time and nothing tells the library so, every retry fails and the orders get set aside. Give the handler a circuit breaker and the redriver knows the service is down: while the circuit is open, saved orders wait without using up their retries.
+
+```go
+func chargePayments(ctx context.Context, url string, m kafka.HandledMessage) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/charge", bytes.NewReader(m.Value))
+	if err != nil {
+		return retry.Permanent(err)
+	}
+	req.Header.Set("Idempotency-Key", m.ID) // the same on every attempt, so a repeat is recognised
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	switch {
+	case resp.StatusCode < 300:
+		return nil
+	case resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests:
+		return retry.Permanent(fmt.Errorf("payments answered %d", resp.StatusCode))
+	default:
+		return fmt.Errorf("payments answered %d", resp.StatusCode)
+	}
+}
+
+func runGuardedOrders(ctx context.Context, brokers, dataDir, paymentsURL string) error {
+	store, err := dlq.OpenWAL(dataDir, dlq.WALOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+
+	// Ask payments' own health endpoint whether it is back, instead of guessing.
+	check, err := health.HTTP(paymentsURL + "/health")
+	if err != nil {
+		return err
+	}
+	payments := breaker.New(breaker.Config{
+		Name:             "payments",
+		FailureThreshold: 0.5,                                                     // open when half of the recent calls fail...
+		MinSamples:       20,                                                      // ...but only after at least 20 calls
+		IsFailure:        func(err error) bool { return !retry.IsPermanent(err) }, // a declined card is not an outage
+		Health:           &health.Config{Check: check},
+	})
+	defer payments.Close()
+
+	orders, err := kafka.HandlerBinding(kafka.HandlerConfig{
+		Topic:   "orders",
+		Breaker: payments, // while this circuit is open the topic pauses and messages wait in Kafka
+		Timeout: 5 * time.Second,
+		Handle: func(ctx context.Context, m kafka.HandledMessage) error {
+			return chargePayments(ctx, paymentsURL, m)
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	client, err := confluent.NewClient(ck.ConfigMap{
+		"bootstrap.servers": brokers,
+		"group.id":          "orders-service",
+	}, []string{"orders"})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	consumer, err := kafka.NewConsumer(kafka.Config{
+		Client:   client,
+		Store:    store,
+		Bindings: []kafka.Binding{orders},
+		Workers:  4, // messages handled at once; offsets are still committed in order
+	})
+	if err != nil {
+		return err
+	}
+
+	// The redriver retries saved orders. Given the breaker, it leaves them alone while the circuit
+	// is open, so a long outage does not use up their retries.
+	redriver, err := dlq.NewRedriver(dlq.RedriveConfig{
+		Store:    store,
+		Handler:  orders.Pipeline.Handler(),
+		Breakers: map[string]*breaker.Breaker{"payments": payments},
+	})
+	if err != nil {
+		return err
+	}
+
+	// Run both until the context ends or one of them stops with an error.
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	errs := make(chan error, 2)
+	go func() { errs <- redriver.Run(ctx) }()
+	go func() { errs <- consumer.Run(ctx) }()
+	err = <-errs
+	stop()
+	<-errs
+	return err
+}
+```
+
+What this adds to the simple version:
+
+- **A circuit breaker with a health check** on the call to payments. The topic pauses while it is open, and saved orders wait instead of failing.
+- **`retry.Permanent`** for an order that can never succeed (a declined card). It is set aside for a person, and it doesn't count as the service being down (`IsFailure`).
+- **`Breakers` on the redriver**, so it knows which circuits to watch.
+- **`Workers`** to handle several orders at once. Offsets are still committed in order.
+- **Both loops stop together** if either fails, with the error returned.
 
 Your `Handle` function can run twice for the same order (after a crash, say), so make it safe to repeat. `m.ID` is the same every time, so you can use it to spot a repeat.
 
