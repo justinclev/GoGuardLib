@@ -280,10 +280,12 @@ A topic whose work has several steps goes in `Pipelines` instead (see Step 5). A
 
 ### Saved HTTP requests in the same service
 
-Give the service the guarded client from Step 2 and it also finishes the requests that client saved:
+Give the service the guarded client from Step 2 and it also finishes the requests that client saved. The client and the service must use the same store, so open it yourself and pass it to both:
 
 ```go
-kafka.ServiceConfig{ /* as above */ HTTP: hooks }
+store, err := dlq.OpenWAL(dataDir, dlq.WALOptions{})
+hooks, err := goguard.NewClient(goguard.Policy{Defer: &goguard.Defer{Store: store}})
+svc, err := kafka.NewService(kafka.ServiceConfig{ /* as above, but */ Store: store, HTTP: hooks })
 ```
 
 ### Wiring it yourself

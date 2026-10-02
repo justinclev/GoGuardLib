@@ -175,14 +175,20 @@ func Example_readmeGuarded() {
 // runWithWebhooks adds saved HTTP requests to the same service: one guarded client, and the service
 // sends what could not be sent once the partner is back.
 func runWithWebhooks(ctx context.Context, brokers, dataDir string) error {
-	hooks, err := goguard.NewClient(goguard.Policy{HealthPath: "/health", Defer: &goguard.Defer{Store: dlq.NewMemoryStore(dlq.MemoryOptions{})}})
+	// One store for both: the client saves into it and the service's redriver reads from it.
+	store, err := dlq.OpenWAL(dataDir, dlq.WALOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+	hooks, err := goguard.NewClient(goguard.Policy{HealthPath: "/health", Defer: &goguard.Defer{Store: store}})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = hooks.Close() }()
 	svc, err := kafka.NewService(kafka.ServiceConfig{
 		NewClient: confluent.NewClientFunc(ck.ConfigMap{"bootstrap.servers": brokers, "group.id": "orders-service"}),
-		DataDir:   dataDir,
+		Store:     store,
 		HTTP:      hooks,
 		Handlers: []kafka.HandlerConfig{{
 			Topic:  "orders",
