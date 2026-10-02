@@ -173,3 +173,36 @@ func TestHealthURLBuildsABreakerThatThePipelineOwns(t *testing.T) {
 	_ = p.Close()
 	_ = p.Close() // safe to repeat
 }
+
+// An answer that is cut off must not be saved: the next step would read half a JSON document.
+func TestHTTPStepDoesNotSaveACutOffAnswer(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: application/json\r\n\r\n{\"id\":\"a-")
+		_ = buf.Flush()
+		_ = conn.Close() // 100 bytes promised, 7 sent
+	}))
+	defer srv.Close()
+	next, hits := api(t, func(w http.ResponseWriter, r *http.Request) {})
+	p, err := pipeline.New("p", "v1", []pipeline.Step{
+		{Name: "fetch", HTTP: pipeline.Get(srv.URL), SaveAs: "account"},
+		{Name: "charge", HTTP: pipeline.Post(next.URL + "/charge/{account.id}")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := run(t, p, "k", ""); res != pipeline.Deferred {
+		t.Fatalf("result %v, want Deferred: a cut-off answer is a temporary failure", res)
+	}
+	if len(hits()) != 0 {
+		t.Fatal("the next step must not run on broken data")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("%d calls, want 1", calls.Load())
+	}
+}

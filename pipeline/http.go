@@ -105,11 +105,16 @@ func (c *HTTPCall) compile(step, saveAs string) (func(context.Context, *Exec) er
 			return err
 		}
 		defer func() { _ = resp.Body.Close() }()
-		reply, _ := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBody+1))
+		reply, readErr := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBody+1))
 		if err := retry.FromHTTP(resp, nil); err != nil {
 			return err
 		}
 		if saveAs != "" {
+			if readErr != nil {
+				// The connection broke part way through the answer. Saving the piece we got would
+				// hand the next step broken data, so fail this step (temporary) and try it again.
+				return fmt.Errorf("pipeline: step %q: reading the answer: %w", step, readErr)
+			}
 			if len(reply) > maxHTTPBody {
 				return retry.Permanent(fmt.Errorf("pipeline: step %q: the answer is too large to save (over %d bytes)", step, maxHTTPBody))
 			}
