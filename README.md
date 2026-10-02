@@ -364,6 +364,27 @@ checkout, err := pipeline.New("checkout", "v1", []pipeline.Step{
 
 If the orders API is down, step 2 fails and the message is saved with `accountId` in its checkpoint. When orders is back, the redriver resumes at step 2, and `Get` still returns the account. Step 1 is not called again. The full example, with two fake APIs, is [examples/stepdata](examples/stepdata/stepdata_test.go).
 
+To pass an object, use the JSON helpers instead of marshalling yourself:
+
+```go
+{Name: "fetch-user", Breaker: usersBr, Run: func(ctx context.Context, x *pipeline.Exec) error {
+	account, err := fetchAccount(ctx) // any struct
+	if err != nil {
+		return err
+	}
+	return pipeline.SetJSON(x, "account", account)
+}},
+{Name: "charge", Breaker: paymentsBr, Run: func(ctx context.Context, x *pipeline.Exec) error {
+	account, ok, err := pipeline.GetJSON[Account](x, "account")
+	if err != nil || !ok {
+		return err // data that cannot be read is a permanent error; a missing key is not saved
+	}
+	return charge(ctx, account)
+}},
+```
+
+A value that cannot be marshalled, or saved data that no longer decodes into your type (a deploy changed the struct), comes back as a `retry.Permanent` error: it is set aside for a person instead of retried for ever. Adding a field is safe; for a breaking change, bump the pipeline version.
+
 Only what you `Set` is saved, so a variable in your closure is lost on a resume. Keep it small (IDs, not payloads): it counts against the record size limit. It is stored in clear unless you wrap the store in `dlq.Secure`.
 
 When payments goes down in this setup:

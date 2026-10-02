@@ -14,6 +14,8 @@ for v1.0" so it can be adopted early.
   `Consumer`, `Redriver`, `WAL` and `Secure` embed the existing config structs, so every
   setting is still reachable.
 - `confluent.NewClientFunc(cfg, opts...)` is `NewClient` with the topics left to the service.
+- `pipeline.SetJSON(x, key, v)` and `pipeline.GetJSON[T](x, key)` pass an object between steps without
+  marshalling by hand; JSON that cannot be written or read is a permanent error.
 - `goguard.NewClient(policy, opts...)` returns an `*http.Client` with a guarded transport in
   one call (`Guard`, `Breakers`, `Replay`, `Close`); `NewClientWithConfig` takes a `Config`.
   `ServiceConfig.HTTP` hands it to the service, which then also finishes the requests it saved.
