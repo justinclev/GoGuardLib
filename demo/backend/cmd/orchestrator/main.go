@@ -111,53 +111,38 @@ func run() error {
 	defer closeKafka()
 	a.poison = func() { a.produceOrder(producer, orderTopic, true) }
 
-	consumer, err := kafka.NewConsumer(kafka.Config{
-		Client: client, Store: store,
-		Bindings: bindings,
-		Workers:  4, PollTimeout: 50 * time.Millisecond, CommitInterval: 500 * time.Millisecond,
-		ProcessTimeout: 10 * time.Second,
-	})
-	if err != nil {
-		return err
-	}
-	// One redriver finishes everything the store holds: Kafka messages by the pipeline of
-	// their own topic (RedriveFor), and the HTTP requests the guarded client saved.
-	rd, err := kafka.RedriveFor(bindings)
-	if err != nil {
-		return err
-	}
 	replay, err := a.replay()
 	if err != nil {
 		return err
 	}
-	handler := func(ctx context.Context, it *dlq.Item) error {
-		if it.Record.Source.Kind == "http" {
-			return replay(ctx, it)
-		}
-		return rd.Handler(ctx, it)
-	}
-	redriver, err := dlq.NewRedriver(dlq.RedriveConfig{
-		Store: store, Handler: handler, Breakers: rd.Breakers, BreakerSource: a.guard.Breakers,
-		Workers: 4, LeaseTTL: 20 * time.Second, PollInterval: 200 * time.Millisecond, MaxAttempts: 8,
-		Backoff: retry.Jitter(retry.Constant(time.Second), 0.3),
-		Rate:    40, Burst: 10, RampUp: 5 * time.Second, // don't flood a service that just came back
+	// One service reads both topics and finishes everything the store holds: Kafka messages by the
+	// pipeline of their own topic, and the HTTP requests the guarded client saved ("http" records).
+	svc, err := kafka.NewService(kafka.ServiceConfig{
+		Client: client, Store: store, Pipelines: bindings,
+		Replay: map[string]dlq.RedriveHandler{"http": replay},
+		Consumer: kafka.Config{
+			Workers: 4, PollTimeout: 50 * time.Millisecond, CommitInterval: 500 * time.Millisecond,
+			ProcessTimeout: 10 * time.Second,
+		},
+		Redriver: dlq.RedriveConfig{
+			BreakerSource: a.guard.Breakers,
+			Workers:       4, LeaseTTL: 20 * time.Second, PollInterval: 200 * time.Millisecond, MaxAttempts: 8,
+			Backoff: retry.Jitter(retry.Constant(time.Second), 0.3),
+			Rate:    40, Burst: 10, RampUp: 5 * time.Second, // don't flood a service that just came back
+		},
 	})
 	if err != nil {
 		return err
 	}
+	consumer, redriver := svc.Consumer(), svc.Redriver()
 	wake := redriver.Wake
 	sink.wake.Store(&wake)
 
 	var wg sync.WaitGroup
 	spawn := func(f func()) { wg.Add(1); go func() { defer wg.Done(); f() }() }
 	spawn(func() {
-		if err := consumer.Run(ctx); err != nil {
-			fmt.Fprintln(os.Stderr, "consumer:", err)
-		}
-	})
-	spawn(func() {
-		if err := redriver.Run(ctx); err != nil {
-			fmt.Fprintln(os.Stderr, "redriver:", err)
+		if err := svc.Run(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, "service:", err)
 		}
 	})
 
