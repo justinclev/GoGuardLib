@@ -20,96 +20,134 @@ import (
 	"github.com/justinclev/GoGuardLib/secure"
 )
 
-// The full example: a topic whose messages go through three services, each behind its own
-// breaker, with in-process retries on the read, data passed between the steps, and an encrypted
-// log. It only has to compile.
+// The full example. Every message on the "checkouts" topic goes through three services:
+//
+//	1. users      look up the customer         (a read, so it is retried right away)
+//	2. inventory  reserve the stock
+//	3. payments   charge the card
+//
+// Each service has its own circuit breaker. If one is down, the message is saved with a note of
+// the steps already done, and finished later from the step that failed. It only has to compile.
+
+type checkoutConfig struct {
+	Brokers, DataDir string
+	EncryptionKey    []byte
+	UsersURL         string
+	InventoryURL     string
+	PaymentsURL      string
+}
 
 type account struct {
 	ID    string `json:"id"`
 	Limit int    `json:"limit"`
 }
 
-// call sends one request and sorts the answer: success, temporary (retried) or permanent (parked).
-func call(ctx context.Context, method, url, idemKey string, body []byte) ([]byte, error) {
+// ---- Step 1: look up the customer ----
+
+func (c checkoutConfig) fetchUser(ctx context.Context, x *pipeline.Exec) error {
+	body, err := send(ctx, http.MethodGet, c.UsersURL+"/account/"+string(x.Key), x.IdempotencyKey(), nil)
+	if err != nil {
+		return err
+	}
+	var a account
+	if err := json.Unmarshal(body, &a); err != nil {
+		return retry.Permanent(err) // a reply we cannot read will not get better
+	}
+	return pipeline.SetJSON(x, "account", a) // kept with the message, for the steps after this one
+}
+
+// ---- Step 2: reserve the stock ----
+
+func (c checkoutConfig) reserveStock(ctx context.Context, x *pipeline.Exec) error {
+	_, err := send(ctx, http.MethodPost, c.InventoryURL+"/reserve", x.IdempotencyKey(), x.Value)
+	return err
+}
+
+// ---- Step 3: charge the card ----
+
+func (c checkoutConfig) chargeCard(ctx context.Context, x *pipeline.Exec) error {
+	a, err := pipeline.RequireJSON[account](x, "account") // saved by step 1, even if we restarted since
+	if err != nil {
+		return err
+	}
+	_, err = send(ctx, http.MethodPost, c.PaymentsURL+"/charge/"+a.ID, x.IdempotencyKey(), x.Value)
+	return err
+}
+
+// ---- Helpers shared by the steps ----
+
+// send makes one HTTP call and sorts the answer for the library:
+// success, temporary (try again later), or permanent (a person must look at it).
+func send(ctx context.Context, method, url, idempotencyKey string, body []byte) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, retry.Permanent(err)
 	}
-	req.Header.Set("Idempotency-Key", idemKey) // the same on every attempt, so a repeat is recognised
+	req.Header.Set("Idempotency-Key", idempotencyKey) // the same on every attempt, so a repeat is recognised
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	out, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	return out, retry.FromHTTP(resp, nil)
+	reply, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return reply, retry.FromHTTP(resp, nil) // 5xx and timeouts: temporary. Other 4xx: permanent.
 }
 
-// guard builds the breaker for one service: opens when half of the recent calls fail, ignores
-// permanent errors (a declined card is not an outage), and asks the service when it is back.
-func guard(name, baseURL string) *breaker.Breaker {
+// newBreaker makes the circuit breaker for one service: it opens when half of the recent calls
+// fail, and asks the service's /health endpoint when it is back.
+func serviceBreaker(name, baseURL string) *breaker.Breaker {
 	return breaker.New(breaker.Config{
-		Name: name, FailureThreshold: 0.5, MinSamples: 20, IsFailure: retry.IsOutage,
-		Health: health.MustURL(baseURL + "/health"),
+		Name:             name,
+		FailureThreshold: 0.5,
+		MinSamples:       20,
+		IsFailure:        retry.IsOutage, // a declined card is not an outage
+		Health:           health.MustURL(baseURL + "/health"),
 	})
 }
 
-func runCheckout(ctx context.Context, brokers, dataDir string, key []byte, usersURL, inventoryURL, paymentsURL string) error {
-	users, inventory, payments := guard("users", usersURL), guard("inventory", inventoryURL), guard("payments", paymentsURL)
+// ---- Putting it together ----
+
+func runCheckout(ctx context.Context, cfg checkoutConfig) error {
+	users := serviceBreaker("users", cfg.UsersURL)
+	inventory := serviceBreaker("inventory", cfg.InventoryURL)
+	payments := serviceBreaker("payments", cfg.PaymentsURL)
 	defer users.Close()
 	defer inventory.Close()
 	defer payments.Close()
 
+	// A read can be repeated safely, so the first step retries twice before giving up.
+	// The charge is not retried here: if it fails, the library saves the message and
+	// retries it later, from this step only.
+	readRetry := retry.Policy{
+		MaxRetries: 2,
+		Backoff:    retry.Jitter(retry.Exponential(100*time.Millisecond, time.Second), 0.5),
+	}
+
 	checkout, err := pipeline.New("checkout", "v1", []pipeline.Step{
-		{ // a read: safe to repeat, so retry it here before giving up on the message
-			Name: "fetch-user", Breaker: users, Timeout: 3 * time.Second,
-			Retry: retry.Policy{MaxRetries: 2, Backoff: retry.Jitter(retry.Exponential(100*time.Millisecond, time.Second), 0.5)},
-			Run: func(ctx context.Context, x *pipeline.Exec) error {
-				out, err := call(ctx, http.MethodGet, usersURL+"/account/"+string(x.Key), x.IdempotencyKey(), nil)
-				if err != nil {
-					return err
-				}
-				var a account
-				if err := json.Unmarshal(out, &a); err != nil {
-					return retry.Permanent(err)
-				}
-				return pipeline.SetJSON(x, "account", a) // kept with the message's progress
-			},
-		},
-		{
-			Name: "reserve", Breaker: inventory, Timeout: 5 * time.Second,
-			Run: func(ctx context.Context, x *pipeline.Exec) error {
-				_, err := call(ctx, http.MethodPost, inventoryURL+"/reserve", x.IdempotencyKey(), x.Value)
-				return err
-			},
-		},
-		{ // money moves here: no in-process retry, the redriver retries it, safely, from this step
-			Name: "charge", Breaker: payments, Timeout: 5 * time.Second,
-			Run: func(ctx context.Context, x *pipeline.Exec) error {
-				a, err := pipeline.RequireJSON[account](x, "account") // from step 1, even after a restart
-				if err != nil {
-					return err
-				}
-				_, err = call(ctx, http.MethodPost, paymentsURL+"/charge/"+a.ID, x.IdempotencyKey(), x.Value)
-				return err
-			},
-		},
+		{Name: "fetch-user", Breaker: users, Timeout: 3 * time.Second, Retry: readRetry, Run: cfg.fetchUser},
+		{Name: "reserve", Breaker: inventory, Timeout: 5 * time.Second, Run: cfg.reserveStock},
+		{Name: "charge", Breaker: payments, Timeout: 5 * time.Second, Run: cfg.chargeCard},
 	})
 	if err != nil {
 		return err
 	}
 
-	enc, err := secure.NewAESGCM(secure.Key{ID: "2026-10", Material: key})
+	encryptor, err := secure.NewAESGCM(secure.Key{ID: "2026-10", Material: cfg.EncryptionKey})
 	if err != nil {
 		return err
 	}
+
 	return kafka.Run(ctx, kafka.ServiceConfig{
-		NewClient: confluent.NewClientFunc(ck.ConfigMap{"bootstrap.servers": brokers, "group.id": "checkout-service", "auto.offset.reset": "earliest"}),
-		DataDir:   dataDir,
-		Secure:    &dlq.SecureOptions{Encryptor: enc}, // what is saved to disk is encrypted
+		NewClient: confluent.NewClientFunc(ck.ConfigMap{
+			"bootstrap.servers": cfg.Brokers,
+			"group.id":          "checkout-service",
+			"auto.offset.reset": "earliest",
+		}),
+		DataDir:   cfg.DataDir,                              // saved messages wait here, on disk
+		Secure:    &dlq.SecureOptions{Encryptor: encryptor}, // and are encrypted
 		Pipelines: []kafka.Binding{{Topic: "checkouts", Pipeline: checkout}},
-		Consumer:  kafka.Config{Workers: 4},
-		Redriver:  dlq.RedriveConfig{Rate: 50, RampUp: 30 * time.Second, MaxAttempts: 10},
+		Consumer:  kafka.Config{Workers: 4},                              // four messages at once; offsets still commit in order
+		Redriver:  dlq.RedriveConfig{Rate: 50, RampUp: 30 * time.Second}, // go gently when a service comes back
 	})
 }
 
