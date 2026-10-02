@@ -274,6 +274,44 @@ If you would rather open the store yourself, give the same `Store` to the client
 
 Say each order has to reserve stock, then charge the card. If charging fails, you don't want to reserve the stock a second time. A *pipeline* remembers how far each order got, and retries start from the step that failed.
 
+### The short way
+
+When each step is one HTTP call, you can describe it instead of writing it. This is the whole service:
+
+```go
+checkout, err := pipeline.New("checkout", "v1", []pipeline.Step{
+	{Name: "fetch-user", HealthURL: usersURL + "/health", Retries: 2,
+		HTTP: pipeline.Get(usersURL + "/account/{key}"), SaveAs: "account"},
+	{Name: "reserve", HealthURL: inventoryURL + "/health",
+		HTTP: pipeline.Post(inventoryURL + "/reserve")},
+	{Name: "charge", HealthURL: paymentsURL + "/health",
+		HTTP: pipeline.Post(paymentsURL + "/charge/{account.id}")},
+})
+if err != nil {
+	return err
+}
+return kafka.Run(ctx, kafka.ServiceConfig{
+	NewClient:     confluent.NewClientFunc(kafkaConfig),
+	DataDir:       dataDir,
+	EncryptionKey: key, // 32 bytes, from your secret store
+	Pipelines:     []kafka.Binding{{Topic: "checkouts", Pipeline: checkout}},
+})
+```
+
+What each part does:
+
+- **`HealthURL`** gives the step its own circuit breaker. It opens when half of the recent calls fail, ignores a declined card, and asks the URL when the service is back. While it is open the topic pauses.
+- **`Retries: 2`** retries a call that is safe to repeat. Leave it off for a charge or a write: if that fails, the message is saved and the redriver retries it later from that step only.
+- **`pipeline.Get` and `pipeline.Post`** send the request with an `Idempotency-Key`, and sort the answer: success, temporary (retried later) or permanent (a 4xx; set aside for a person). A POST sends the Kafka message as its body.
+- **`SaveAs: "account"`** keeps the answer for later steps. `{key}` is the message key, `{account.id}` a field of what was saved.
+- **`EncryptionKey`** encrypts what is saved to disk.
+
+### Full control
+
+Every part has a longer form with the same behaviour and more settings: a step with `Run` instead of `HTTP`, your own `breaker.Config`, a `retry.Policy`, `Secure` with key rotation, and a `Prepare` function on an HTTP step for credentials. [kafka/example_full_test.go](kafka/example_full_test.go) is this same service written that way.
+
+### Step by step
+
 Give each service its own breaker, with a health check:
 
 ```go

@@ -13,9 +13,9 @@ import (
 	goguard "github.com/justinclev/GoGuardLib"
 	"github.com/justinclev/GoGuardLib/breaker"
 	"github.com/justinclev/GoGuardLib/dlq"
-	"github.com/justinclev/GoGuardLib/health"
 	"github.com/justinclev/GoGuardLib/obs"
-	"github.com/justinclev/GoGuardLib/retry"
+	"github.com/justinclev/GoGuardLib/pipeline"
+	"github.com/justinclev/GoGuardLib/secure"
 )
 
 // ServiceConfig describes a whole Kafka service in one place: where messages come from, where
@@ -40,6 +40,11 @@ type ServiceConfig struct {
 	DataDir string
 	WAL     dlq.WALOptions
 	Secure  *dlq.SecureOptions
+	// EncryptionKey is the short form of Secure: a 32-byte AES-256 key (from your secret store, not
+	// the source) that encrypts what is saved to disk. It cannot be combined with Secure. Use Secure
+	// with secure.NewAESGCM when you need to rotate keys: the key given here has the ID "default",
+	// so pass it as the retired key with that ID when you switch.
+	EncryptionKey []byte
 
 	// Handlers has one function per topic (see HandlerConfig): the simple case. Pipelines has
 	// topics with several steps (see package pipeline). A topic appears in exactly one of them.
@@ -78,8 +83,9 @@ type Service struct {
 	store    dlq.Store
 
 	ownsStore     bool
-	ownedBreakers []*breaker.Breaker // built from HandlerConfig.HealthURL
-	ownedCloser   io.Closer          // the client, when the service created it
+	ownedBreakers []*breaker.Breaker   // built from HandlerConfig.HealthURL
+	pipelines     []*pipeline.Pipeline // given in Pipelines; closed with the service (see Close)
+	ownedCloser   io.Closer            // the client, when the service created it
 
 	mu        sync.Mutex
 	started   bool
@@ -103,6 +109,16 @@ func NewService(cfg ServiceConfig) (s *Service, err error) {
 	if cfg.Redriver.Store != nil {
 		return nil, errors.New("kafka: set the store on ServiceConfig, not on Redriver")
 	}
+	if len(cfg.EncryptionKey) > 0 {
+		if cfg.Secure != nil {
+			return nil, errors.New("kafka: set EncryptionKey or Secure, not both")
+		}
+		enc, eerr := secure.NewAESGCM(secure.Key{ID: "default", Material: cfg.EncryptionKey})
+		if eerr != nil {
+			return nil, fmt.Errorf("kafka: EncryptionKey: %w", eerr)
+		}
+		cfg.Secure = &dlq.SecureOptions{Encryptor: enc}
+	}
 
 	s = &Service{}
 	built := s // a return of (nil, err) clears s before this runs, so keep our own reference
@@ -113,6 +129,11 @@ func NewService(cfg ServiceConfig) (s *Service, err error) {
 	}()
 
 	bindings := append([]Binding(nil), cfg.Pipelines...)
+	for _, b := range cfg.Pipelines {
+		if b.Pipeline != nil {
+			s.pipelines = append(s.pipelines, b.Pipeline)
+		}
+	}
 	for _, h := range cfg.Handlers {
 		if h.Breaker == nil && h.HealthURL != "" {
 			br, berr := healthBreaker(h)
@@ -211,10 +232,6 @@ func NewService(cfg ServiceConfig) (s *Service, err error) {
 
 // healthBreaker builds the breaker for a handler that gave a HealthURL instead of a Breaker.
 func healthBreaker(h HandlerConfig) (*breaker.Breaker, error) {
-	check, err := health.HTTP(h.HealthURL)
-	if err != nil {
-		return nil, fmt.Errorf("kafka: handler for topic %q: HealthURL: %w", h.Topic, err)
-	}
 	name := h.Dependency
 	if name == "" {
 		name = h.Name
@@ -222,10 +239,11 @@ func healthBreaker(h HandlerConfig) (*breaker.Breaker, error) {
 	if name == "" {
 		name = h.Topic
 	}
-	return breaker.New(breaker.Config{
-		Name: name, FailureThreshold: 0.5, MinSamples: 20,
-		IsFailure: retry.IsOutage, Health: &health.Config{Check: check},
-	}), nil
+	br, err := breaker.NewHTTP(name, h.HealthURL)
+	if err != nil {
+		return nil, fmt.Errorf("kafka: handler for topic %q: HealthURL: %w", h.Topic, err)
+	}
+	return br, nil
 }
 
 // replayHandler sends a saved record to the handler for its kind of source: Kafka messages to the
@@ -342,6 +360,9 @@ func (s *Service) Close() error {
 	var errs []error
 	for _, b := range s.ownedBreakers {
 		b.Close()
+	}
+	for _, p := range s.pipelines {
+		_ = p.Close() // only the breakers a pipeline built for HealthURL; yours are left alone
 	}
 	if s.ownedCloser != nil {
 		errs = append(errs, s.ownedCloser.Close())

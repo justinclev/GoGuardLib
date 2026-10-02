@@ -13,6 +13,12 @@ for v1.0" so it can be adopted early.
   releases what the service opened. A Kafka service that took about 84 lines is now about 15.
   `Consumer`, `Redriver`, `WAL` and `Secure` embed the existing config structs, so every
   setting is still reachable.
+- Pipeline steps can be described instead of coded: `Step.HTTP` (`pipeline.Get`/`Post`, with `{key}`
+  and `{saved.field}` in the URL, `Prepare`, `Body`, `Client` for the rest), `Step.SaveAs` keeps the
+  answer for later steps, `Step.HealthURL` builds the step's breaker (`breaker.NewHTTP`, also
+  public), `Step.Retries` is a short retry policy, and `Pipeline.Close` releases the breakers the
+  pipeline built (the service does it for the pipelines it is given). `ServiceConfig.EncryptionKey`
+  is the short form of `Secure`. The three-service checkout example drops from 118 lines to about 25.
 - `kafka.Run(ctx, cfg)` is `NewService`, `RunUntilSignal` and `Close` in one call. `kafka.HandleValue(f)`
   adapts a `func(ctx, []byte) error` to `HandlerConfig.Handle`. `HandlerConfig.HealthURL` (with
   `Dependency` for the name) builds the circuit breaker for a handler: it opens when half of the

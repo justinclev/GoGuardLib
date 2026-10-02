@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -459,5 +460,51 @@ func TestRunBuildsRunsAndCloses(t *testing.T) {
 	}
 	if err := kafka.Run(context.Background(), kafka.ServiceConfig{}); err == nil {
 		t.Fatal("an empty config must be an error")
+	}
+}
+
+// EncryptionKey is the short form of Secure: what reaches disk is not readable without the key.
+func TestServiceEncryptionKeyEncryptsTheLog(t *testing.T) {
+	r := newRig(t)
+	dir := t.TempDir()
+	key := []byte("0123456789abcdef0123456789abcdef") // 32 bytes
+	svc, err := kafka.NewService(kafka.ServiceConfig{
+		Client: r.client, DataDir: dir, EncryptionKey: key,
+		Handlers: []kafka.HandlerConfig{{Topic: topic, Handle: func(context.Context, kafka.HandledMessage) error {
+			return errors.New("down")
+		}}},
+		Consumer: kafka.Config{PollTimeout: 5 * time.Millisecond, CommitInterval: 10 * time.Millisecond},
+	})
+	must(t, err)
+	r.produceN(1, "secret-payload")
+	r.assign(0)
+	stop := runService(t, svc)
+	eventually(t, "the message to be saved", func() bool {
+		st, _ := svc.Stats(context.Background())
+		return st.Store.Total() == 1
+	})
+	must(t, stop())
+	must(t, svc.Close())
+	files, _ := os.ReadDir(dir)
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		b, _ := os.ReadFile(dir + "/" + f.Name())
+		if strings.Contains(string(b), "secret-payload") {
+			t.Fatalf("%s holds the payload in clear", f.Name())
+		}
+	}
+}
+
+func TestServiceEncryptionKeyIsChecked(t *testing.T) {
+	r := newRig(t)
+	h := []kafka.HandlerConfig{{Topic: topic, Handle: func(context.Context, kafka.HandledMessage) error { return nil }}}
+	if _, err := kafka.NewService(kafka.ServiceConfig{Client: r.client, DataDir: t.TempDir(), EncryptionKey: []byte("short"), Handlers: h}); err == nil {
+		t.Fatal("a key of the wrong length must be rejected")
+	}
+	both := kafka.ServiceConfig{Client: r.client, DataDir: t.TempDir(), EncryptionKey: make([]byte, 32), Secure: &dlq.SecureOptions{}, Handlers: h}
+	if _, err := kafka.NewService(both); err == nil {
+		t.Fatal("EncryptionKey together with Secure must be rejected")
 	}
 }

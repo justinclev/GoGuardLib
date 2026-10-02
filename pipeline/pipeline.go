@@ -48,13 +48,28 @@ type Step struct {
 	// Breaker, if set, guards the step's call, so an open circuit defers the record
 	// without calling the dependency.
 	Breaker *breaker.Breaker
+	// HealthURL is the short way to get a Breaker when Breaker is nil: New builds one named
+	// Dependency (default Name) with breaker.NewHTTP, which asks this URL whether the service is
+	// back. Close the pipeline to release it. To share one breaker between steps, build it
+	// yourself and pass it as Breaker.
+	HealthURL string
 	// Timeout bounds one attempt of Run.
 	Timeout time.Duration
 	// Retry retries Run in-process before the record is deferred. Optional.
 	Retry retry.Policy
+	// Retries is the short form of Retry: this many retries with a jittered exponential backoff
+	// (100ms up to 1s). Ignored when Retry is set. Use it only for calls that are safe to repeat;
+	// keep a charge or a write out of it and let the redriver retry that later.
+	Retries int
 	// Run does the work. Return retry.Permanent(err) for a failure that retrying
-	// cannot fix. Any other error is treated as transient.
+	// cannot fix. Any other error is treated as transient. Leave it empty and set HTTP when the
+	// step is one HTTP request.
 	Run func(ctx context.Context, x *Exec) error
+	// HTTP is the step as one HTTP request, instead of Run. See HTTPCall.
+	HTTP *HTTPCall
+	// SaveAs, with HTTP, keeps the answer's body under this name for later steps ({name} and
+	// {name.field} in their URLs, Exec.Get or GetJSON in code).
+	SaveAs string
 	// Compensate undoes Run, for use when a later step fails permanently and the
 	// pipeline was built with Saga. Optional.
 	Compensate func(ctx context.Context, x *Exec) error
@@ -135,6 +150,7 @@ type Pipeline struct {
 	steps    []Step
 	saga     bool
 	redactor *secure.Redactor
+	owned    []*breaker.Breaker // built from Step.HealthURL
 }
 
 // Option customises a Pipeline.
@@ -159,23 +175,66 @@ func New(name, version string, steps []Step, opts ...Option) (*Pipeline, error) 
 		return nil, errors.New("pipeline: at least one step is required")
 	}
 	seen := map[string]bool{}
-	for i, s := range steps {
-		if s.Name == "" || s.Run == nil {
-			return nil, fmt.Errorf("pipeline: step %d needs a Name and a Run", i)
+	p := &Pipeline{name: name, version: version, steps: append([]Step(nil), steps...)}
+	built := false
+	defer func() {
+		if !built {
+			_ = p.Close() // release breakers made for HealthURL if New fails part way
+		}
+	}()
+	for i := range p.steps {
+		s := &p.steps[i]
+		if s.Name == "" || (s.Run == nil) == (s.HTTP == nil) {
+			return nil, fmt.Errorf("pipeline: step %d needs a Name and exactly one of Run and HTTP", i)
 		}
 		if seen[s.Name] {
 			return nil, fmt.Errorf("pipeline: duplicate step name %q", s.Name)
 		}
 		seen[s.Name] = true
+		if s.SaveAs != "" && s.HTTP == nil {
+			return nil, fmt.Errorf("pipeline: step %q sets SaveAs without HTTP", s.Name)
+		}
+		if s.HTTP != nil {
+			run, err := s.HTTP.compile(s.Name, s.SaveAs)
+			if err != nil {
+				return nil, err
+			}
+			s.Run = run
+		}
+		if s.Breaker == nil && s.HealthURL != "" {
+			dep := s.Dependency
+			if dep == "" {
+				dep = s.Name
+			}
+			br, err := breaker.NewHTTP(dep, s.HealthURL)
+			if err != nil {
+				return nil, fmt.Errorf("pipeline: step %q: HealthURL: %w", s.Name, err)
+			}
+			p.owned = append(p.owned, br)
+			s.Breaker = br
+		}
+		if s.Retries > 0 && s.Retry.MaxRetries == 0 {
+			s.Retry = retry.Policy{MaxRetries: s.Retries, Backoff: retry.Jitter(retry.Exponential(100*time.Millisecond, time.Second), 0.5)}
+		}
 	}
-	p := &Pipeline{name: name, version: version, steps: append([]Step(nil), steps...)}
 	for _, o := range opts {
 		o(p)
 	}
 	if p.redactor == nil {
 		p.redactor = secure.NewRedactor()
 	}
+	built = true
 	return p, nil
+}
+
+// Close releases the breakers the pipeline built itself (for Step.HealthURL). Breakers you passed in
+// are yours. It is safe to call more than once.
+func (p *Pipeline) Close() error {
+	for _, b := range p.owned {
+		b.Close()
+	}
+	p.owned = nil
+	return nil
 }
 
 // Breakers returns the distinct circuit breakers that guard the steps. A consumer

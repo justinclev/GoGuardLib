@@ -151,6 +151,6 @@ func runCheckout(ctx context.Context, cfg checkoutConfig) error {
 	})
 }
 
-func Example_full() {
+func Example_fullControl() {
 	_ = runCheckout
 }
