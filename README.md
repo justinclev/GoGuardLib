@@ -57,22 +57,20 @@ The first calls reach payments and get its errors. Once enough have failed, the 
 
 ## Step 2: protect HTTP calls
 
-If you use an `http.Client`, give it a guarded transport. Everything else the client sends is left alone; only the hosts you name are protected.
+Build a guarded client with one call. Every host it talks to gets its own circuit:
 
 ```go
-func newClient() (*http.Client, error) {
-	guard, err := goguard.New(goguard.Config{},
-		goguard.WithEndpoint("payments", goguard.Host("payments.internal"), goguard.Policy{
-			RequestTimeout: 2 * time.Second,
-			MaxRetries:     2, // only for GET and HEAD requests, which are safe to repeat
-		}),
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &http.Client{Transport: guard}, nil
+client, err := goguard.NewClient(goguard.Policy{
+	RequestTimeout: 2 * time.Second,
+	MaxRetries:     2, // only for GET and HEAD requests, which are safe to repeat
+})
+if err != nil {
+	return err
 }
+defer client.Close()
 ```
+
+`client` is an `*http.Client` with a guarded transport. To protect only some hosts, or give a host its own settings, add endpoints: `goguard.NewClient(policy, goguard.WithEndpoint("payments", goguard.Host("payments.internal"), paymentsPolicy))`. For full control of the transport, use `goguard.New` and wrap it in an `http.Client` yourself.
 
 Use the client as you always do. When the circuit is open, the error matches `goguard.ErrCircuitOpen`:
 
@@ -98,24 +96,16 @@ Some HTTP calls don't need an answer right now: sending a webhook, a notificatio
 Choose where they wait when you build the store: `dlq.NewMemoryStore(...)` keeps them until the process exits, `dlq.OpenWAL(dir, ...)` keeps them on disk across restarts.
 
 ```go
-func newWebhookClient(store dlq.Store) (*goguard.ResilientTransport, *http.Client, error) {
-	guard, err := goguard.New(goguard.Config{},
-		goguard.WithEndpoint("partner", goguard.Host("hooks.partner.com"), goguard.Policy{
-			HealthPath: "/health",
-			Defer:      &goguard.Defer{Store: store}, // save what can't be sent right now
-		}),
-	)
-	if err != nil {
-		return nil, nil, err
-	}
-	return guard, &http.Client{Transport: guard}, nil
-}
+hooks, err := goguard.NewClient(goguard.Policy{
+	HealthPath: "/health",
+	Defer:      &goguard.Defer{Store: store}, // save what can't be sent right now
+})
 ```
 
 Send as usual. A request is only saved if it carries an idempotency key, so that sending it twice (once before the failure, once from the store) can't do the work twice:
 
 ```go
-func sendWebhook(client *http.Client, eventID string, payload []byte) error {
+func sendWebhook(client *goguard.Client, eventID string, payload []byte) error {
 	req, err := http.NewRequest(http.MethodPost, "https://hooks.partner.com/events", bytes.NewReader(payload))
 	if err != nil {
 		return err
@@ -134,22 +124,17 @@ func sendWebhook(client *http.Client, eventID string, payload []byte) error {
 }
 ```
 
-`goguard.ErrDeferred` means "not sent, but saved". Run a redriver to send the saved requests when the service is healthy. `BreakerSource` tells it which circuits to watch, so it leaves saved requests alone while their circuit is open:
+`goguard.ErrDeferred` means "not sent, but saved". If you run a Kafka service, hand the client to it (`kafka.ServiceConfig{HTTP: hooks}`, see Step 4) and the saved requests are sent for you. Without Kafka, run a redriver yourself. `BreakerSource` tells it which circuits to watch, so it leaves saved requests alone while their circuit is open:
 
 ```go
-func newWebhookRedriver(store dlq.Store, guard *goguard.ResilientTransport, client *http.Client) (*dlq.Redriver, error) {
-	replay, err := goguard.ReplayHandler(goguard.ReplayConfig{
-		Client: client,
-		Prepare: func(ctx context.Context, req *http.Request) error {
-			req.Header.Set("Authorization", "Bearer "+currentToken()) // credentials are never saved
-			return nil
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	return dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: replay, BreakerSource: guard.Breakers})
-}
+redriver, err := dlq.NewRedriver(dlq.RedriveConfig{
+	Store:         store,
+	Handler:       hooks.Replay(func(ctx context.Context, req *http.Request) error {
+		req.Header.Set("Authorization", "Bearer "+currentToken()) // credentials are never saved
+		return nil
+	}),
+	BreakerSource: hooks.Breakers,
+})
 ```
 
 Things to know:
@@ -186,54 +171,25 @@ A normal consumer has two bad choices when payments is down: fail the message or
 
 ```go
 func runOrders(ctx context.Context, brokers, dataDir string) error {
-	// Where orders wait, on disk, when something goes wrong.
-	store, err := dlq.OpenWAL(dataDir, dlq.WALOptions{})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = store.Close() }()
-
-	// What to do with each order.
-	orders, err := kafka.HandlerBinding(kafka.HandlerConfig{
-		Topic: "orders",
-		Handle: func(ctx context.Context, m kafka.HandledMessage) error {
-			return chargeOrder(ctx, m.Value) // return an error and the order is saved and retried later
-		},
+	svc, err := kafka.NewService(kafka.ServiceConfig{
+		NewClient: confluent.NewClientFunc(ck.ConfigMap{"bootstrap.servers": brokers, "group.id": "orders-service"}),
+		DataDir:   dataDir, // orders that fail wait here, on disk
+		Handlers: []kafka.HandlerConfig{{
+			Topic: "orders",
+			Handle: func(ctx context.Context, m kafka.HandledMessage) error {
+				return chargeOrder(ctx, m.Value) // return an error and the order is saved and retried later
+			},
+		}},
 	})
 	if err != nil {
 		return err
 	}
-
-	client, err := confluent.NewClient(ck.ConfigMap{
-		"bootstrap.servers": brokers,
-		"group.id":          "orders-service",
-	}, []string{"orders"})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = client.Close() }()
-
-	consumer, err := kafka.NewConsumer(kafka.Config{
-		Client:   client,
-		Store:    store,
-		Bindings: []kafka.Binding{orders},
-	})
-	if err != nil {
-		return err
-	}
-
-	// The redriver retries saved orders in the background.
-	redriver, err := dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: orders.Pipeline.Handler()})
-	if err != nil {
-		return err
-	}
-	ctx, stop := context.WithCancel(ctx)
-	defer stop()
-	go func() { _ = redriver.Run(ctx) }()
-
-	return consumer.Run(ctx)
+	defer svc.Close()
+	return svc.Run(ctx) // the consumer and the redriver, together
 }
 ```
+
+`NewService` opens the on-disk log and the Kafka client, connects the consumer and the redriver, and `Run` runs both until the context ends. `Close` releases what it opened.
 
 What that gives you:
 
@@ -257,24 +213,11 @@ func chargePayments(ctx context.Context, url string, m kafka.HandledMessage) err
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
-	switch {
-	case resp.StatusCode < 300:
-		return nil
-	case resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests:
-		return retry.Permanent(fmt.Errorf("payments answered %d", resp.StatusCode))
-	default:
-		return fmt.Errorf("payments answered %d", resp.StatusCode)
-	}
+	defer resp.Body.Close()
+	return retry.FromHTTP(resp, nil) // 2xx ok; 5xx and timeouts retry; a declined card is set aside
 }
 
 func runGuardedOrders(ctx context.Context, brokers, dataDir, paymentsURL string) error {
-	store, err := dlq.OpenWAL(dataDir, dlq.WALOptions{})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = store.Close() }()
-
 	// Ask payments' own health endpoint whether it is back, instead of guessing.
 	check, err := health.HTTP(paymentsURL + "/health")
 	if err != nil {
@@ -282,93 +225,70 @@ func runGuardedOrders(ctx context.Context, brokers, dataDir, paymentsURL string)
 	}
 	payments := breaker.New(breaker.Config{
 		Name:             "payments",
-		FailureThreshold: 0.5,                                                     // open when half of the recent calls fail...
-		MinSamples:       20,                                                      // ...but only after at least 20 calls
-		IsFailure:        func(err error) bool { return !retry.IsPermanent(err) }, // a declined card is not an outage
+		FailureThreshold: 0.5,            // open when half of the recent calls fail...
+		MinSamples:       20,             // ...but only after at least 20 calls
+		IsFailure:        retry.IsOutage, // a declined card is not an outage
 		Health:           &health.Config{Check: check},
 	})
 	defer payments.Close()
 
-	orders, err := kafka.HandlerBinding(kafka.HandlerConfig{
-		Topic:   "orders",
-		Breaker: payments, // while this circuit is open the topic pauses and messages wait in Kafka
-		Timeout: 5 * time.Second,
-		Handle: func(ctx context.Context, m kafka.HandledMessage) error {
-			return chargePayments(ctx, paymentsURL, m)
-		},
+	svc, err := kafka.NewService(kafka.ServiceConfig{
+		NewClient: confluent.NewClientFunc(ck.ConfigMap{"bootstrap.servers": brokers, "group.id": "orders-service"}),
+		DataDir:   dataDir,
+		Handlers: []kafka.HandlerConfig{{
+			Topic:   "orders",
+			Breaker: payments, // while this circuit is open the topic pauses and saved orders wait
+			Timeout: 5 * time.Second,
+			Handle: func(ctx context.Context, m kafka.HandledMessage) error {
+				return chargePayments(ctx, paymentsURL, m)
+			},
+		}},
+		Consumer: kafka.Config{Workers: 4}, // four orders at once; offsets are still committed in order
 	})
 	if err != nil {
 		return err
 	}
-
-	client, err := confluent.NewClient(ck.ConfigMap{
-		"bootstrap.servers": brokers,
-		"group.id":          "orders-service",
-	}, []string{"orders"})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = client.Close() }()
-
-	consumer, err := kafka.NewConsumer(kafka.Config{
-		Client:   client,
-		Store:    store,
-		Bindings: []kafka.Binding{orders},
-		Workers:  4, // messages handled at once; offsets are still committed in order
-	})
-	if err != nil {
-		return err
-	}
-
-	// The redriver retries saved orders. Given the breaker, it leaves them alone while the circuit
-	// is open, so a long outage does not use up their retries.
-	redriver, err := dlq.NewRedriver(dlq.RedriveConfig{
-		Store:    store,
-		Handler:  orders.Pipeline.Handler(),
-		Breakers: map[string]*breaker.Breaker{"payments": payments},
-	})
-	if err != nil {
-		return err
-	}
-
-	// Run both until the context ends or one of them stops with an error.
-	ctx, stop := context.WithCancel(ctx)
-	defer stop()
-	errs := make(chan error, 2)
-	go func() { errs <- redriver.Run(ctx) }()
-	go func() { errs <- consumer.Run(ctx) }()
-	err = <-errs
-	stop()
-	<-errs
-	return err
+	defer svc.Close()
+	return svc.Run(ctx)
 }
 ```
 
 What this adds to the simple version:
 
-- **A circuit breaker with a health check** on the call to payments. The topic pauses while it is open, and saved orders wait instead of failing.
-- **`retry.Permanent`** for an order that can never succeed (a declined card). It is set aside for a person, and it doesn't count as the service being down (`IsFailure`).
-- **`Breakers` on the redriver**, so it knows which circuits to watch.
-- **`Workers`** to handle several orders at once. Offsets are still committed in order.
-- **Both loops stop together** if either fails, with the error returned.
+- **A circuit breaker with a health check** on the call to payments. The topic pauses while it is open, and saved orders wait instead of failing. The service hands the breaker to the redriver for you.
+- **`retry.FromHTTP`** turns the answer into the right kind of error, so you don't write the status switch. A permanent one (a declined card) is set aside for a person, and `retry.IsOutage` keeps it from counting as the service being down.
+- **`Consumer: kafka.Config{...}`** is the full consumer configuration. `ServiceConfig` also takes `Redriver` (`dlq.RedriveConfig`), `WAL` (`dlq.WALOptions`) and `Secure` (encryption), so nothing is out of reach.
 
 Your `Handle` function can run twice for the same order (after a crash, say), so make it safe to repeat. `m.ID` is the same every time, so you can use it to spot a repeat.
 
 ### Reading several topics
 
-Give `kafka.Config` one binding per topic. The redriver needs to know which topic each saved order came from, so build it with `RedriveFor` instead of using one pipeline's handler:
+Add one handler per topic. A saved message is finished by the handler of its own topic, and every handler's breaker is watched:
 
 ```go
-func newRedriver(store dlq.Store, bindings []kafka.Binding) (*dlq.Redriver, error) {
-	rd, err := kafka.RedriveFor(bindings)
-	if err != nil {
-		return nil, err
-	}
-	return dlq.NewRedriver(dlq.RedriveConfig{Store: store, Handler: rd.Handler, Breakers: rd.Breakers})
-}
+svc, err := kafka.NewService(kafka.ServiceConfig{
+	NewClient: confluent.NewClientFunc(cfg),
+	DataDir:   dataDir,
+	Handlers: []kafka.HandlerConfig{
+		{Topic: "orders", Handle: chargeOrder},
+		{Topic: "refunds", Handle: refund},
+	},
+})
 ```
 
-Each saved order is finished by the pipeline of its own topic, and every breaker is watched. An order from a topic you no longer read is set aside for a person, not run through the wrong pipeline.
+A topic whose work has several steps goes in `Pipelines` instead (see Step 5). A message from a topic you no longer read is set aside for a person, never run through the wrong handler.
+
+### Saved HTTP requests in the same service
+
+Give the service the guarded client from Step 2 and it also finishes the requests that client saved:
+
+```go
+kafka.ServiceConfig{ /* as above */ HTTP: hooks }
+```
+
+### Wiring it yourself
+
+`NewService` is built from `kafka.NewConsumer`, `dlq.NewRedriver` and `kafka.RedriveFor`, which stay available if you want to own each part (a different store per topic, your own run loop). `kafka/example_readme_test.go` has the same service wired by hand.
 
 ## Step 5: a job with several steps
 

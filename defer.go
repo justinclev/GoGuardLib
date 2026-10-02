@@ -255,13 +255,6 @@ func ReplayHandler(c ReplayConfig) (dlq.RedriveHandler, error) {
 		}
 		defer func() { _ = resp.Body.Close() }()
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		switch code := resp.StatusCode; {
-		case code < 400:
-			return nil
-		case code == http.StatusRequestTimeout, code == http.StatusTooEarly, code == http.StatusTooManyRequests, code >= 500:
-			return fmt.Errorf("goguard: replay answered %d", code)
-		default:
-			return retry.Permanent(fmt.Errorf("goguard: replay answered %d", code))
-		}
+		return retry.FromHTTP(resp, nil)
 	}, nil
 }

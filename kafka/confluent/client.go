@@ -368,3 +368,16 @@ func (p *Producer) Close() {
 	p.p.Flush(5000)
 	p.p.Close()
 }
+
+// NewClientFunc returns a function that creates a Client for the topics it is given, for
+// kafka.ServiceConfig.NewClient. It is NewClient with the topics left to the service, which
+// already knows them from the handlers.
+func NewClientFunc(cfg ck.ConfigMap, opts ...Option) func(topics []string) (kafka.Client, error) {
+	return func(topics []string) (kafka.Client, error) {
+		c, err := NewClient(cfg, topics, opts...)
+		if err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+}

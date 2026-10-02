@@ -6,6 +6,21 @@ for v1.0" so it can be adopted early.
 
 ## Unreleased
 
+### Less code to write (additive; nothing was removed or made less configurable)
+- `kafka.NewService(kafka.ServiceConfig{...})` builds the store (`DataDir`, or your own
+  `Store`), the Kafka client (`NewClient`, or your own `Client`), the consumer, the redriver and
+  the per-topic routing, and `Service.Run` runs consumer and redriver together; `Close`
+  releases what the service opened. A Kafka service that took about 84 lines is now about 15.
+  `Consumer`, `Redriver`, `WAL` and `Secure` embed the existing config structs, so every
+  setting is still reachable.
+- `confluent.NewClientFunc(cfg, opts...)` is `NewClient` with the topics left to the service.
+- `goguard.NewClient(policy, opts...)` returns an `*http.Client` with a guarded transport in
+  one call (`Guard`, `Breakers`, `Replay`, `Close`); `NewClientWithConfig` takes a `Config`.
+  `ServiceConfig.HTTP` hands it to the service, which then also finishes the requests it saved.
+- `retry.FromHTTP(resp, err)` classifies an HTTP answer (2xx/3xx ok, 408/425/429/5xx temporary,
+  other 4xx permanent) and `retry.IsOutage` is the matching `breaker.Config.IsFailure`; this
+  replaces the status switch every handler wrote. `goguard.ReplayHandler` uses it.
+
 ### Reliability
 - **Fixed: a breaker without a health check could keep a consumer or redriver stalled for ever.**
   An open breaker only moves to half-open when a request reaches it, but the consumer pauses a

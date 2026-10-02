@@ -67,3 +67,17 @@ func TestOffsetResetDefaultsToEarliestButRespectsTheCaller(t *testing.T) {
 		t.Fatalf("an explicit choice was overwritten: %v", cm["auto.offset.reset"])
 	}
 }
+
+func TestNewClientFuncPassesTheOptionsAndBuildsAClient(t *testing.T) {
+	cfg := ck.ConfigMap{"bootstrap.servers": "localhost:9092", "group.id": "g"}
+	if _, err := NewClientFunc(cfg, WithRequireTLS())([]string{"t"}); !errors.Is(err, ErrInsecureTransport) {
+		t.Fatalf("options were not applied: %v", err)
+	}
+	c, err := NewClientFunc(cfg)([]string{"t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cl, ok := c.(interface{ Close() error }); ok {
+		_ = cl.Close()
+	}
+}
