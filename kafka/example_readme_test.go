@@ -3,6 +3,7 @@ package kafka_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -198,4 +199,40 @@ func proposalExample(ctx context.Context, newClient func([]string) (kafka.Client
 
 func Example_readmeProposal() {
 	_ = proposalExample
+}
+
+// runWithTunedLog is the README's "dead-letter log" example: the log's size, encryption and
+// retry limits, set through ServiceConfig.
+func runWithTunedLog(ctx context.Context, cfg kafka.ServiceConfig, dataDir string, key []byte) error {
+	cfg.DataDir = dataDir
+	cfg.EncryptionKey = key                                              // saved messages are encrypted on disk
+	cfg.WAL = dlq.WALOptions{MaxBytes: 2 << 30, MinFreeBytes: 512 << 20} // at most 2 GiB; keep 512 MiB free
+	cfg.Redriver = dlq.RedriveConfig{MaxAttempts: 10, Rate: 50, RampUp: 30 * time.Second}
+	return kafka.Run(ctx, cfg)
+}
+
+// printParked prints what needs a person: the parked messages, oldest first, and why.
+func printParked(ctx context.Context, svc *kafka.Service) error {
+	var after uint64
+	for {
+		page, err := svc.Store().Parked(ctx, dlq.ParkedQuery{After: after, Limit: 100})
+		if err != nil || len(page) == 0 {
+			return err
+		}
+		for _, rec := range page {
+			fmt.Println(rec.ID, rec.LastError) // the reason is already redacted
+			after = rec.Seq
+		}
+	}
+}
+
+// fixAndRequeue sends a parked message back to be retried once its cause is fixed.
+func fixAndRequeue(ctx context.Context, svc *kafka.Service, id string) error {
+	return svc.Store().Requeue(ctx, id)
+}
+
+func Example_readmeDeadLetterLog() {
+	_ = runWithTunedLog
+	_ = printParked
+	_ = fixAndRequeue
 }

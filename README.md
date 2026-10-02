@@ -413,6 +413,83 @@ When payments goes down in this setup:
 4. Payments recovers. Its health check passes, one real call succeeds, and the circuit closes.
 5. The redriver finishes the saved orders, starting at the charge step, at a gentle pace.
 
+## Setting up the dead-letter log
+
+The dead-letter log (DLQ) is where a message waits when it can't be finished right now. You don't create it or run anything for it: give the service a directory and it opens, writes, reads back and closes the log itself.
+
+```go
+kafka.Run(ctx, kafka.ServiceConfig{
+	NewClient: confluent.NewClientFunc(kafkaConfig),
+	DataDir:   "/var/lib/checkout", // this is the DLQ
+	// ...
+})
+```
+
+### What you must arrange
+
+- **A persistent local disk.** In Kubernetes an `emptyDir` is lost when the pod is rescheduled, and so is everything saved in it. Use a volume that survives, and give it room (see the size limit below).
+- **Not a network share.** The log relies on file locks and fsync, which NFS, SMB and similar mounts don't reliably give. The service refuses to open one unless you set `WAL: dlq.WALOptions{AllowNetworkFilesystem: true}`.
+- **One process per directory.** The log takes a lock, so a second process can't open it. Each instance of a service needs its own volume.
+- **Handlers that are safe to repeat.** After a crash a message can run twice. The `HTTP` steps send an `Idempotency-Key` for you; in your own code use `m.ID` or `x.IdempotencyKey()`.
+
+### Settings you may want
+
+```go
+cfg.EncryptionKey = key                                              // encrypt what is saved (32 bytes, from your secret store)
+cfg.WAL = dlq.WALOptions{MaxBytes: 2 << 30, MinFreeBytes: 512 << 20} // at most 2 GiB; keep 512 MiB free
+cfg.Redriver = dlq.RedriveConfig{MaxAttempts: 10, Rate: 50, RampUp: 30 * time.Second}
+```
+
+| Setting | What it does | Default |
+|---|---|---|
+| `WAL.MaxBytes` | Most live data the log holds. When it is full, new messages are refused and the topic backs up in Kafka instead of losing anything. | 512 MiB |
+| `WAL.MinFreeBytes` | Free space the disk must keep. Below it the log refuses new messages rather than fail a write. | 64 MiB |
+| `WAL.MaxRecordBytes` | Largest single message the log accepts. | 8 MiB |
+| `EncryptionKey` / `Secure` | Encrypts saved messages. `Secure` supports key rotation. | off |
+| `Redriver.MaxAttempts` | Retries before a message is set aside for a person. A call refused by an open circuit does not count. | 10 |
+| `Redriver.Rate`, `RampUp` | How fast saved messages are replayed, and how gently a recovered service is brought back to full speed. | no limit |
+
+Pass `Store` (a store you opened yourself) instead of `DataDir` when you need one store for several things, such as a guarded HTTP client that saves requests too. Pass one or the other, not both.
+
+### What is in it
+
+- **Waiting messages** failed for a temporary reason, usually a service being down. The redriver retries them from the step that failed once that service's circuit closes. You do nothing.
+- **Parked messages** failed for a reason retrying can't fix (a 4xx, unreadable data) or ran out of attempts. They stay until a person decides. Later messages with the same key wait behind a parked one, so a parked message holds up that customer.
+
+### Looking at it and acting on it
+
+From code, the service gives you the counts and the store:
+
+```go
+st, err := svc.Stats(ctx) // st.Store: waiting, leased and parked; st.Redriver; st.Consumer
+
+// What needs a person, oldest first, and why:
+page, err := svc.Store().Parked(ctx, dlq.ParkedQuery{Limit: 100})
+for _, rec := range page {
+	fmt.Println(rec.ID, rec.LastError) // the reason is already redacted
+}
+
+// After fixing the cause: retry it, or give up on it.
+err = svc.Store().Requeue(ctx, id)
+err = svc.Store().Discard(ctx, id) // deletes it for good; only parked messages can be discarded
+```
+
+From a terminal, `dlqctl` works on the log directory (JSON output, and it never prints message contents):
+
+```
+dlqctl verify  DIR        check every record, changing nothing (safe beside a running service)
+dlqctl inspect DIR        counts, blocked keys, the oldest parked, the parked records
+dlqctl backup  DIR DEST   copy the log (stop the service first, or use WALStore.Backup in code)
+dlqctl requeue DIR ID...  send parked records back to be retried (stop the service first)
+dlqctl discard DIR ID...  delete parked records (stop the service first)
+```
+
+### Keeping an eye on it
+
+Alert on two numbers from `svc.Stats`: how old the oldest waiting message is (the queue isn't draining), and whether anything is parked (a person has to act). [docs/OPERATIONS.md](docs/OPERATIONS.md) has the full list of signals, a runbook for each, and how to take backups and rotate keys.
+
+To also send a copy of every parked message to a Kafka topic for other tooling, set `Consumer.Mirror` (see `kafka.NewDLQPublisher`).
+
 ## Before you go to production
 
 - **Put the saved-orders directory on a persistent local disk**, not the container's temporary storage and not a network share.
