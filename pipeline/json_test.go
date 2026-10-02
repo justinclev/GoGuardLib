@@ -42,3 +42,16 @@ func TestJSONErrorsArePermanent(t *testing.T) {
 		t.Fatalf("data of the wrong shape: ok=%v err=%v, want a permanent error", ok, err)
 	}
 }
+
+func TestRequireJSONFailsPermanentlyWhenTheKeyIsMissing(t *testing.T) {
+	x := &Exec{}
+	if _, err := RequireJSON[account](x, "account"); !retry.IsPermanent(err) {
+		t.Fatalf("missing key: %v, want a permanent error", err)
+	}
+	if err := SetJSON(x, "account", account{ID: "a-9"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := RequireJSON[account](x, "account"); err != nil || got.ID != "a-9" {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+}

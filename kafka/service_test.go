@@ -5,8 +5,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -275,4 +277,122 @@ func TestServiceFinishesSavedHTTPRequestsThroughTheGuardedClient(t *testing.T) {
 	up.Store(true)
 	runService(t, svc)
 	eventually(t, "the saved requests to be sent", func() bool { return sent.Load() == 3 && r.storeStats().Total() == 0 })
+}
+
+// With BindLater the client needs no store of its own: the service binds the log it opened, so
+// DataDir and saved HTTP requests work together.
+func TestServiceBindsItsLogToTheHTTPClient(t *testing.T) {
+	r := newRig(t)
+	var up atomic.Bool
+	var sent atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if !up.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		sent.Add(1)
+	}))
+	defer srv.Close()
+	client, err := goguard.NewClient(goguard.Policy{
+		FailureThreshold: 0.5, MinSamples: 2, SleepWindow: 50 * time.Millisecond,
+		Defer: &goguard.Defer{BindLater: true},
+	})
+	must(t, err)
+	defer func() { _ = client.Close() }()
+
+	post := func(id string) error {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/hook", nil)
+		req.Header.Set("Idempotency-Key", id)
+		resp, err := client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		return err
+	}
+	if err := post("before"); errors.Is(err, goguard.ErrDeferred) {
+		t.Fatal("nothing may be saved before a store is bound")
+	}
+
+	svc, err := kafka.NewService(kafka.ServiceConfig{
+		Client: r.client, DataDir: t.TempDir(), HTTP: client,
+		Handlers: []kafka.HandlerConfig{{Topic: topic, Handle: func(context.Context, kafka.HandledMessage) error { return nil }}},
+		Consumer: kafka.Config{PollTimeout: 5 * time.Millisecond, CommitInterval: 10 * time.Millisecond},
+		Redriver: dlq.RedriveConfig{PollInterval: 10 * time.Millisecond, Backoff: retry.Constant(20 * time.Millisecond)},
+	})
+	must(t, err)
+	defer func() { _ = svc.Close() }()
+	r.assign(0)
+	for _, id := range []string{"a", "b", "c"} {
+		if err := post(id); !errors.Is(err, goguard.ErrDeferred) {
+			t.Fatalf("post %s = %v, want ErrDeferred", id, err)
+		}
+	}
+	st, err := svc.Stats(context.Background())
+	must(t, err)
+	if st.Store.Total() != 3 {
+		t.Fatalf("store holds %d, want 3", st.Store.Total())
+	}
+	up.Store(true)
+	runService(t, svc)
+	eventually(t, "the saved requests to be sent", func() bool { return sent.Load() == 3 })
+}
+
+// Close called while Run is active stops Run and waits for it, instead of closing the log under it.
+func TestServiceCloseStopsARunningService(t *testing.T) {
+	r := newRig(t)
+	svc, err := kafka.NewService(kafka.ServiceConfig{
+		Client: r.client, DataDir: t.TempDir(),
+		Handlers: []kafka.HandlerConfig{{Topic: topic, Handle: func(context.Context, kafka.HandledMessage) error { return nil }}},
+		Consumer: kafka.Config{PollTimeout: 5 * time.Millisecond},
+	})
+	must(t, err)
+	r.assign(0)
+	done := make(chan error, 1)
+	go func() { done <- svc.Run(context.Background()) }()
+	time.Sleep(50 * time.Millisecond)
+	must(t, svc.Close())
+	select {
+	case err := <-done:
+		must(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not stop Run")
+	}
+}
+
+func TestServiceStatsCombinesTheCounts(t *testing.T) {
+	r := newRig(t)
+	svc, err := kafka.NewService(kafka.ServiceConfig{
+		Client: r.client, Store: r.store,
+		Handlers: []kafka.HandlerConfig{{Topic: topic, Handle: func(context.Context, kafka.HandledMessage) error { return nil }}},
+		Consumer: kafka.Config{PollTimeout: 5 * time.Millisecond, CommitInterval: 10 * time.Millisecond},
+	})
+	must(t, err)
+	r.produceN(4, "m")
+	r.assign(0)
+	stop := runService(t, svc)
+	eventually(t, "four messages done", func() bool {
+		st, _ := svc.Stats(context.Background())
+		return st.Consumer.Done == 4
+	})
+	must(t, stop())
+}
+
+func TestServiceRunUntilSignalStopsOnSIGTERM(t *testing.T) {
+	r := newRig(t)
+	svc, err := kafka.NewService(kafka.ServiceConfig{
+		Client: r.client, Store: r.store,
+		Handlers: []kafka.HandlerConfig{{Topic: topic, Handle: func(context.Context, kafka.HandledMessage) error { return nil }}},
+		Consumer: kafka.Config{PollTimeout: 5 * time.Millisecond},
+	})
+	must(t, err)
+	done := make(chan error, 1)
+	go func() { done <- svc.RunUntilSignal(context.Background()) }()
+	time.Sleep(100 * time.Millisecond) // let it install the handler
+	must(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
+	select {
+	case err := <-done:
+		must(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunUntilSignal did not stop on SIGTERM")
+	}
 }

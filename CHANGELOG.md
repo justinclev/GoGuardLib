@@ -14,8 +14,17 @@ for v1.0" so it can be adopted early.
   `Consumer`, `Redriver`, `WAL` and `Secure` embed the existing config structs, so every
   setting is still reachable.
 - `confluent.NewClientFunc(cfg, opts...)` is `NewClient` with the topics left to the service.
-- `pipeline.SetJSON(x, key, v)` and `pipeline.GetJSON[T](x, key)` pass an object between steps without
-  marshalling by hand; JSON that cannot be written or read is a permanent error.
+- `pipeline.SetJSON(x, key, v)`, `GetJSON[T]` and `RequireJSON[T]` pass an object between steps
+  without marshalling by hand; JSON that cannot be written or read (and, for `RequireJSON`, a
+  missing key) is a permanent error.
+- `goguard.Defer.BindLater` and `Client.BindStore`: a guarded client can be built before the
+  store exists, and `kafka.NewService` binds the log it opened (so `DataDir` and saved HTTP
+  requests work together). Nothing is saved until a store is bound.
+- `Service.Stats(ctx)` returns the consumer, redriver and store numbers together;
+  `Service.RunUntilSignal` is `Run` that also stops on SIGINT/SIGTERM; `Service.Close` now stops
+  a running `Run` and waits for it instead of closing the log under it.
+- `health.MustURL(url)` builds a `health.Config` for `breaker.Config.Health` in one expression
+  (panics on a malformed URL, like `regexp.MustCompile`; `health.HTTP` still returns an error).
 - `goguard.NewClient(policy, opts...)` returns an `*http.Client` with a guarded transport in
   one call (`Guard`, `Breakers`, `Replay`, `Close`); `NewClientWithConfig` takes a `Config`.
   `ServiceConfig.HTTP` hands it to the service, which then also finishes the requests it saved.

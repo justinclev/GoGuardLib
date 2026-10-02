@@ -55,6 +55,10 @@ func (c *Client) Replay(prepare func(ctx context.Context, req *http.Request) err
 	return h
 }
 
+// BindStore gives store to every Defer that was configured with BindLater and has no store yet.
+// kafka.NewService calls it for ServiceConfig.HTTP. A Defer that already has a store keeps it.
+func (c *Client) BindStore(store dlq.Store) { c.guard.bindStore(store) }
+
 // Close stops the transport's background work and closes its idle connections.
 func (c *Client) Close() error {
 	c.guard.CloseIdleConnections()

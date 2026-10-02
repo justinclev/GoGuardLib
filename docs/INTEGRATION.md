@@ -114,6 +114,21 @@ binding, err := kafka.HandlerBinding(kafka.HandlerConfig{
 consumer, err := kafka.NewConsumer(kafka.Config{Client: client, Store: store /* durable */, Bindings: []kafka.Binding{binding}})
 ```
 
+For the whole service in one call (client, log, consumer, redriver and routing), use `kafka.NewService` instead of building each part:
+
+```go
+svc, err := kafka.NewService(kafka.ServiceConfig{
+    NewClient: confluent.NewClientFunc(kafkaConfig),
+    DataDir:   "/var/lib/correspondence", // a persistent volume
+    Handlers:  []kafka.HandlerConfig{{Topic: "correspondence-events", Breaker: rules, Handle: handle}},
+})
+if err != nil {
+    return err
+}
+defer svc.Close()
+return svc.RunUntilSignal(ctx)
+```
+
 You get contiguous offset commits, a durable store for messages that could not be handled, per-key ordering behind a deferred message, a paused topic while the breaker is open, and resume after a crash. `retry.Permanent(err)` parks a message for a person instead of retrying it.
 
 **Why there is no "simple consumer" that skips the store.** A loop that commits after each success and merely logs failures loses the failed message the moment a later one succeeds (its higher offset is committed), and one that drops a message when the circuit opens loses that too. Handling rebalances, contiguous commits and rewinding correctly is what `kafka.Consumer` exists for, so it is the only consumer offered. `Config.Store` is required with no default on purpose: an in-memory default would lose deferred messages on every restart. Use `dlq.OpenWAL` with `dlq.Secure`.

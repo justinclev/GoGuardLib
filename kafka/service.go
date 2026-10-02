@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 
 	goguard "github.com/justinclev/GoGuardLib"
 	"github.com/justinclev/GoGuardLib/breaker"
@@ -55,7 +58,8 @@ type ServiceConfig struct {
 	Replay map[string]dlq.RedriveHandler
 
 	// HTTP is a guarded client (goguard.NewClient) whose saved requests this service should finish.
-	// It registers the client's replay handler for "http" records and lets the redriver watch the
+	// Give its Defer a Store of your own, or set Defer.BindLater and the service binds the store it
+	// opened (so DataDir works). It registers the client's replay handler for "http" records and lets the redriver watch the
 	// client's circuits, unless Replay or Redriver.BreakerSource already say otherwise. Set
 	// Replay["http"] = HTTP.Replay(prepare) yourself to add credentials when replaying.
 	HTTP *goguard.Client
@@ -74,9 +78,11 @@ type Service struct {
 	ownsStore   bool
 	ownedCloser io.Closer // the client, when the service created it
 
-	mu      sync.Mutex
-	started bool
-	closed  bool
+	mu        sync.Mutex
+	started   bool
+	closed    bool
+	cancelRun context.CancelFunc
+	runDone   chan struct{} // closed when Run has returned
 }
 
 // NewService validates cfg and builds everything. It opens the log and the client if you asked it
@@ -166,6 +172,7 @@ func NewService(cfg ServiceConfig) (s *Service, err error) {
 	replay := cfg.Replay
 	rc := cfg.Redriver
 	if cfg.HTTP != nil {
+		cfg.HTTP.BindStore(s.store)
 		if _, set := replay["http"]; !set {
 			replay = make(map[string]dlq.RedriveHandler, len(cfg.Replay)+1)
 			for k, v := range cfg.Replay {
@@ -218,7 +225,8 @@ func mergeBreakers(rd Redrive, extra map[string]*breaker.Breaker) map[string]*br
 
 // Run runs the consumer and the redriver until ctx ends or either stops with an error. When one
 // stops the other is stopped too, and the errors are returned together. It returns nil when ctx
-// ended normally. Run may be called once.
+// ended normally. Run may be called once. Close, called from another goroutine, stops Run and waits
+// for it.
 func (s *Service) Run(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closed {
@@ -230,10 +238,13 @@ func (s *Service) Run(ctx context.Context) error {
 		return errors.New("kafka: Run was already called")
 	}
 	s.started = true
-	s.mu.Unlock()
-
 	ctx, stop := context.WithCancel(ctx)
+	s.cancelRun, s.runDone = stop, make(chan struct{})
+	done := s.runDone
+	s.mu.Unlock()
+	defer close(done)
 	defer stop()
+
 	errs := make(chan error, 2)
 	go func() { errs <- s.redriver.Run(ctx) }()
 	go func() { errs <- s.consumer.Run(ctx) }()
@@ -249,6 +260,30 @@ func (s *Service) Run(ctx context.Context) error {
 	return errors.Join(out...)
 }
 
+// RunUntilSignal is Run that also stops on SIGINT or SIGTERM, so main does not need its own signal
+// handling. It returns nil after a signal, like Run does after ctx ends.
+func (s *Service) RunUntilSignal(ctx context.Context) error {
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return s.Run(ctx)
+}
+
+// ServiceStats is a snapshot of everything the service counts.
+type ServiceStats struct {
+	Consumer Stats
+	Redriver dlq.RedriveStats
+	Store    dlq.StoreStats // messages waiting, leased and parked; zero if the store could not be read
+}
+
+// Stats returns the consumer's, the redriver's and the store's numbers together, for a health or
+// metrics endpoint. The error is the store's, if it could not be read; the other numbers are valid.
+func (s *Service) Stats(ctx context.Context) (ServiceStats, error) {
+	st := ServiceStats{Consumer: s.consumer.Stats(), Redriver: s.redriver.Stats()}
+	var err error
+	st.Store, err = s.store.Stats(ctx)
+	return st, err
+}
+
 // Consumer returns the consumer, for Stats and the like.
 func (s *Service) Consumer() *Consumer { return s.consumer }
 
@@ -258,9 +293,9 @@ func (s *Service) Redriver() *dlq.Redriver { return s.redriver }
 // Store returns the store the service uses, for listing parked messages and so on.
 func (s *Service) Store() dlq.Store { return s.store }
 
-// Close releases what the service opened itself: the client made by NewClient and the log opened
-// from DataDir. Call it after Run has returned. A client or a store you passed in is yours to
-// close. It is safe to call more than once.
+// Close stops Run if it is running and waits for it, then releases what the service opened itself:
+// the client made by NewClient and the log opened from DataDir. A client or a store you passed in
+// is yours to close. It is safe to call more than once.
 func (s *Service) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -268,7 +303,12 @@ func (s *Service) Close() error {
 		return nil
 	}
 	s.closed = true
+	cancel, done := s.cancelRun, s.runDone
 	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
 	var errs []error
 	if s.ownedCloser != nil {
 		errs = append(errs, s.ownedCloser.Close())

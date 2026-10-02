@@ -311,3 +311,15 @@ func TestDelayAndDefaults(t *testing.T) {
 		t.Fatal("MaxInterval must not be below Interval")
 	}
 }
+
+func TestMustURLBuildsAConfigAndPanicsOnABadURL(t *testing.T) {
+	if cfg := MustURL("http://payments.internal/health"); cfg == nil || cfg.Check == nil {
+		t.Fatal("MustURL must return a Config with a Check")
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("a relative URL must panic")
+		}
+	}()
+	MustURL("/health")
+}

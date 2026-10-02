@@ -33,3 +33,14 @@ func GetJSON[T any](x *Exec, key string) (v T, ok bool, err error) {
 	}
 	return v, true, nil
 }
+
+// RequireJSON is GetJSON for data a step cannot do without: a missing key is a permanent error
+// too (the checkpoint was written by code that did not save it), so the step can return the error
+// as it is.
+func RequireJSON[T any](x *Exec, key string) (T, error) {
+	v, ok, err := GetJSON[T](x, key)
+	if err == nil && !ok {
+		err = retry.Permanent(fmt.Errorf("pipeline: %q was not saved by an earlier step", key))
+	}
+	return v, err
+}

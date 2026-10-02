@@ -109,8 +109,8 @@ func (p *Policy) validate(name string) error {
 	if p.HealthPath != "" && !strings.HasPrefix(p.HealthPath, "/") {
 		return fmt.Errorf("goguard: endpoint %q HealthPath must start with \"/\"", name)
 	}
-	if p.Defer != nil && p.Defer.Store == nil {
-		return fmt.Errorf("goguard: endpoint %q sets Defer without a Store", name)
+	if p.Defer != nil && p.Defer.Store == nil && !p.Defer.BindLater {
+		return fmt.Errorf("goguard: endpoint %q sets Defer without a Store (or BindLater)", name)
 	}
 	return nil
 }

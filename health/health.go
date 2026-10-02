@@ -244,3 +244,15 @@ func HTTP(rawURL string, opts ...HTTPOption) (Check, error) {
 		return nil
 	}, nil
 }
+
+// MustURL is HTTP for the common case: a Config that probes rawURL, ready for breaker.Config.Health,
+// with every other setting at its default (change the fields of the result to tune them). It panics
+// if rawURL is not an absolute http or https URL, like regexp.MustCompile, so use it for a URL fixed
+// at start-up and use HTTP for one that comes from user input.
+func MustURL(rawURL string, opts ...HTTPOption) *Config {
+	check, err := HTTP(rawURL, opts...)
+	if err != nil {
+		panic(fmt.Sprintf("health.MustURL(%q): %v", rawURL, err))
+	}
+	return &Config{Check: check}
+}

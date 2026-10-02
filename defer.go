@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/justinclev/GoGuardLib/breaker"
@@ -65,6 +66,11 @@ type Defer struct {
 	// Store holds the saved requests. Required. dlq.NewMemoryStore keeps them until
 	// the process exits; dlq.OpenWAL keeps them across restarts.
 	Store dlq.Store
+	// BindLater lets Store stay empty when the store is not known yet: a kafka.Service given
+	// this client as ServiceConfig.HTTP calls Client.BindStore with the store it opened, so the
+	// saved requests land where its redriver looks. Until a store is bound nothing is saved and
+	// requests fail as they would without Defer.
+	BindLater bool
 	// IdempotencyHeader names the header a request must carry to be saved. Default
 	// "Idempotency-Key".
 	IdempotencyHeader string
@@ -80,13 +86,28 @@ type Defer struct {
 	// its circuits. Requests already saved are unaffected and are still replayed.
 	// It is called on the request path, so it must be fast.
 	Enabled func() bool
+
+	bound atomic.Pointer[boundStore]
 }
+
+type boundStore struct{ s dlq.Store }
 
 const (
 	deferMethodHeader = "x-goguard-http-method"
 	deferURLHeader    = "x-goguard-http-url"
 	defaultDeferBody  = 1 << 20
 )
+
+// store returns the store requests are saved to: Store, or the one bound later.
+func (d *Defer) store() dlq.Store {
+	if d.Store != nil {
+		return d.Store
+	}
+	if b := d.bound.Load(); b != nil {
+		return b.s
+	}
+	return nil
+}
 
 func (d *Defer) idemHeader() string {
 	if d.IdempotencyHeader != "" {
@@ -165,7 +186,11 @@ func (t *ResilientTransport) tryDefer(ent *entry, pol Policy, req *http.Request,
 		return nil
 	}
 	rec.BlockedOn = ent.name // the redriver leaves it alone while this circuit is open
-	err := d.Store.Append(context.WithoutCancel(req.Context()), rec)
+	store := d.store()
+	if store == nil {
+		return nil // BindLater, and no store bound yet
+	}
+	err := store.Append(context.WithoutCancel(req.Context()), rec)
 	obs.Emit(t.sink, obs.HTTPDeferred{Endpoint: ent.name, RecordID: rec.ID, Saved: err == nil, At: time.Now()})
 	if err != nil {
 		return nil
@@ -257,4 +282,20 @@ func ReplayHandler(c ReplayConfig) (dlq.RedriveHandler, error) {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return retry.FromHTTP(resp, nil)
 	}, nil
+}
+
+// bindStore gives store to the Defer of every endpoint (and of GuardAll) that has none and asked
+// for BindLater.
+func (t *ResilientTransport) bindStore(store dlq.Store) {
+	bind := func(d *Defer) {
+		if d != nil && d.Store == nil && d.BindLater {
+			d.bound.Store(&boundStore{s: store})
+		}
+	}
+	for _, ep := range t.config.Endpoints {
+		bind(ep.Policy.Defer)
+	}
+	if t.config.GuardAll != nil {
+		bind(t.config.GuardAll.Defer)
+	}
 }

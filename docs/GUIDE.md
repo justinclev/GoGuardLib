@@ -238,7 +238,7 @@ func runOrdersService(ctx context.Context, cfg serviceConfig) error {
 	}
 	defer payments.Close()
 
-	// The durable log where orders wait when a service is down.
+	// The durable, encrypted log where orders wait when a service is down.
 	store, err := openStore(cfg)
 	if err != nil {
 		return err
@@ -254,64 +254,32 @@ func runOrdersService(ctx context.Context, cfg serviceConfig) error {
 		return fmt.Errorf("building the pipeline: %w", err)
 	}
 
-	client, err := confluent.NewClient(ck.ConfigMap{
-		"bootstrap.servers": cfg.Brokers,
-		"group.id":          "orders-service",
-		"auto.offset.reset": "earliest",
-	}, []string{"orders"})
-	if err != nil {
-		return fmt.Errorf("creating the Kafka client: %w", err)
-	}
-	defer func() { _ = client.Close() }()
-
-	// The consumer reads orders and runs them through the pipeline.
-	consumer, err := kafka.NewConsumer(kafka.Config{
-		Client:   client,
-		Store:    store,
-		Bindings: []kafka.Binding{{Topic: "orders", Pipeline: orders}},
+	// The service reads orders, runs them through the pipeline, saves what fails, and finishes
+	// saved orders once the service they waited for is healthy.
+	svc, err := kafka.NewService(kafka.ServiceConfig{
+		NewClient: confluent.NewClientFunc(ck.ConfigMap{
+			"bootstrap.servers": cfg.Brokers,
+			"group.id":          "orders-service",
+			"auto.offset.reset": "earliest",
+		}),
+		Store:     store,
+		Pipelines: []kafka.Binding{{Topic: "orders", Pipeline: orders}},
+		Redriver: dlq.RedriveConfig{
+			Rate:   100, // orders per second, so a service that just came back is not flooded
+			RampUp: 30 * time.Second,
+		},
 	})
 	if err != nil {
-		return fmt.Errorf("creating the consumer: %w", err)
+		return err
 	}
-
-	// The redriver finishes stored orders once the service they waited for is healthy.
-	redriver, err := dlq.NewRedriver(dlq.RedriveConfig{
-		Store:    store,
-		Handler:  orders.Handler(),
-		Breakers: map[string]*breaker.Breaker{"inventory": inventory, "payments": payments},
-		Rate:     100, // orders per second, so a service that just came back is not flooded
-		RampUp:   30 * time.Second,
-	})
-	if err != nil {
-		return fmt.Errorf("creating the redriver: %w", err)
-	}
-
-	return runTogether(ctx, consumer.Run, redriver.Run)
+	defer func() { _ = svc.Close() }()
+	return svc.Run(ctx)
 }
 ```
 
-Call `runOrdersService` from `main` with a context that ends on shutdown (`signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)`). The consumer and the redriver run side by side, and `runTogether` stops one if the other stops.
+Call `runOrdersService` from `main` with a context that ends on shutdown (`signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)`), or use `svc.RunUntilSignal(ctx)` in its place. `Run` runs the consumer and the redriver side by side and stops one if the other stops. The service finds the pipeline's breakers by itself, so the redriver watches `inventory` and `payments` without being told.
 
-```go
-// runTogether runs the loops until ctx ends. If one stops, it stops the rest, and it
-// returns every error.
-func runTogether(ctx context.Context, loops ...func(context.Context) error) error {
-	ctx, stop := context.WithCancel(ctx)
-	defer stop()
-	results := make(chan error, len(loops))
-	for _, loop := range loops {
-		go func() {
-			results <- loop(ctx)
-			stop()
-		}()
-	}
-	var errs []error
-	for range loops {
-		errs = append(errs, <-results)
-	}
-	return errors.Join(errs...)
-}
-```
+Everything the service builds can still be configured: `Consumer` takes a `kafka.Config` (workers, backoff, the dead-letter mirror and so on), `Redriver` takes a `dlq.RedriveConfig`, and `WAL` and `Secure` take the log and encryption options if you give it a `DataDir` instead of a store. If you want to own each part, build them yourself with `kafka.NewConsumer`, `dlq.NewRedriver` and `kafka.RedriveFor`.
 
 ### What happens when payments goes down
 

@@ -218,17 +218,12 @@ func chargePayments(ctx context.Context, url string, m kafka.HandledMessage) err
 }
 
 func runGuardedOrders(ctx context.Context, brokers, dataDir, paymentsURL string) error {
-	// Ask payments' own health endpoint whether it is back, instead of guessing.
-	check, err := health.HTTP(paymentsURL + "/health")
-	if err != nil {
-		return err
-	}
 	payments := breaker.New(breaker.Config{
 		Name:             "payments",
-		FailureThreshold: 0.5,            // open when half of the recent calls fail...
-		MinSamples:       20,             // ...but only after at least 20 calls
-		IsFailure:        retry.IsOutage, // a declined card is not an outage
-		Health:           &health.Config{Check: check},
+		FailureThreshold: 0.5,                                      // open when half of the recent calls fail...
+		MinSamples:       20,                                       // ...but only after at least 20 calls
+		IsFailure:        retry.IsOutage,                           // a declined card is not an outage
+		Health:           health.MustURL(paymentsURL + "/health"), // ask payments whether it is back
 	})
 	defer payments.Close()
 
@@ -249,14 +244,15 @@ func runGuardedOrders(ctx context.Context, brokers, dataDir, paymentsURL string)
 		return err
 	}
 	defer svc.Close()
-	return svc.Run(ctx)
+	return svc.RunUntilSignal(ctx) // stops on Ctrl-C or SIGTERM
 }
 ```
 
 What this adds to the simple version:
 
-- **A circuit breaker with a health check** on the call to payments. The topic pauses while it is open, and saved orders wait instead of failing. The service hands the breaker to the redriver for you.
+- **A circuit breaker with a health check** on the call to payments (`health.MustURL` builds the check from a URL; it panics on a malformed one, so use `health.HTTP` for a URL from user input). The topic pauses while it is open, and saved orders wait instead of failing. The service hands the breaker to the redriver for you.
 - **`retry.FromHTTP`** turns the answer into the right kind of error, so you don't write the status switch. A permanent one (a declined card) is set aside for a person, and `retry.IsOutage` keeps it from counting as the service being down.
+- **`RunUntilSignal`** is `Run` that also stops on Ctrl-C or SIGTERM. `svc.Stats(ctx)` returns the consumer, redriver and store numbers together, for a health endpoint.
 - **`Consumer: kafka.Config{...}`** is the full consumer configuration. `ServiceConfig` also takes `Redriver` (`dlq.RedriveConfig`), `WAL` (`dlq.WALOptions`) and `Secure` (encryption), so nothing is out of reach.
 
 Your `Handle` function can run twice for the same order (after a crash, say), so make it safe to repeat. `m.ID` is the same every time, so you can use it to spot a repeat.
@@ -280,13 +276,14 @@ A topic whose work has several steps goes in `Pipelines` instead (see Step 5). A
 
 ### Saved HTTP requests in the same service
 
-Give the service the guarded client from Step 2 and it also finishes the requests that client saved. The client and the service must use the same store, so open it yourself and pass it to both:
+Give the service the guarded client from Step 2 and it also finishes the requests that client saved. Set `BindLater` so the client uses the log the service opened:
 
 ```go
-store, err := dlq.OpenWAL(dataDir, dlq.WALOptions{})
-hooks, err := goguard.NewClient(goguard.Policy{Defer: &goguard.Defer{Store: store}})
-svc, err := kafka.NewService(kafka.ServiceConfig{ /* as above, but */ Store: store, HTTP: hooks })
+hooks, err := goguard.NewClient(goguard.Policy{Defer: &goguard.Defer{BindLater: true}})
+svc, err := kafka.NewService(kafka.ServiceConfig{ /* as above */ HTTP: hooks })
 ```
+
+If you would rather open the store yourself, give the same `Store` to the client's `Defer` and to the service.
 
 ### Wiring it yourself
 
@@ -377,15 +374,15 @@ To pass an object, use the JSON helpers instead of marshalling yourself:
 	return pipeline.SetJSON(x, "account", account)
 }},
 {Name: "charge", Breaker: paymentsBr, Run: func(ctx context.Context, x *pipeline.Exec) error {
-	account, ok, err := pipeline.GetJSON[Account](x, "account")
-	if err != nil || !ok {
-		return err // data that cannot be read is a permanent error; a missing key is not saved
+	account, err := pipeline.RequireJSON[Account](x, "account")
+	if err != nil {
+		return err // missing or unreadable data is a permanent error
 	}
 	return charge(ctx, account)
 }},
 ```
 
-A value that cannot be marshalled, or saved data that no longer decodes into your type (a deploy changed the struct), comes back as a `retry.Permanent` error: it is set aside for a person instead of retried for ever. Adding a field is safe; for a breaking change, bump the pipeline version.
+`GetJSON` is the same without the missing-key error: it returns `ok=false` when nothing was saved. A value that cannot be marshalled, or saved data that no longer decodes into your type (a deploy changed the struct), comes back as a `retry.Permanent` error: it is set aside for a person instead of retried for ever. Adding a field is safe; for a breaking change, bump the pipeline version.
 
 Only what you `Set` is saved, so a variable in your closure is lost on a resume. Keep it small (IDs, not payloads): it counts against the record size limit. It is stored in clear unless you wrap the store in `dlq.Secure`.
 

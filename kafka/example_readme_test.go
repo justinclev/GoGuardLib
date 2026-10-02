@@ -134,17 +134,12 @@ func chargePayments(ctx context.Context, url string, m kafka.HandledMessage) err
 // runGuardedOrders is the README's "in a real service" example: the same service, with a circuit
 // breaker on the call to payments.
 func runGuardedOrders(ctx context.Context, brokers, dataDir, paymentsURL string) error {
-	// Ask payments' own health endpoint whether it is back, instead of guessing.
-	check, err := health.HTTP(paymentsURL + "/health")
-	if err != nil {
-		return err
-	}
 	payments := breaker.New(breaker.Config{
 		Name:             "payments",
-		FailureThreshold: 0.5,            // open when half of the recent calls fail...
-		MinSamples:       20,             // ...but only after at least 20 calls
-		IsFailure:        retry.IsOutage, // a declined card is not an outage
-		Health:           &health.Config{Check: check},
+		FailureThreshold: 0.5,                                     // open when half of the recent calls fail...
+		MinSamples:       20,                                      // ...but only after at least 20 calls
+		IsFailure:        retry.IsOutage,                          // a declined card is not an outage
+		Health:           health.MustURL(paymentsURL + "/health"), // ask payments whether it is back
 	})
 	defer payments.Close()
 
@@ -165,7 +160,7 @@ func runGuardedOrders(ctx context.Context, brokers, dataDir, paymentsURL string)
 		return err
 	}
 	defer func() { _ = svc.Close() }()
-	return svc.Run(ctx)
+	return svc.RunUntilSignal(ctx) // stops on Ctrl-C or SIGTERM
 }
 
 func Example_readmeGuarded() {
@@ -175,21 +170,15 @@ func Example_readmeGuarded() {
 // runWithWebhooks adds saved HTTP requests to the same service: one guarded client, and the service
 // sends what could not be sent once the partner is back.
 func runWithWebhooks(ctx context.Context, brokers, dataDir string) error {
-	// One store for both: the client saves into it and the service's redriver reads from it.
-	store, err := dlq.OpenWAL(dataDir, dlq.WALOptions{})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = store.Close() }()
-	hooks, err := goguard.NewClient(goguard.Policy{HealthPath: "/health", Defer: &goguard.Defer{Store: store}})
+	hooks, err := goguard.NewClient(goguard.Policy{HealthPath: "/health", Defer: &goguard.Defer{BindLater: true}})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = hooks.Close() }()
 	svc, err := kafka.NewService(kafka.ServiceConfig{
 		NewClient: confluent.NewClientFunc(ck.ConfigMap{"bootstrap.servers": brokers, "group.id": "orders-service"}),
-		Store:     store,
-		HTTP:      hooks,
+		DataDir:   dataDir,
+		HTTP:      hooks, // saved requests go into the service's log and are sent from it
 		Handlers: []kafka.HandlerConfig{{
 			Topic:  "orders",
 			Handle: func(ctx context.Context, m kafka.HandledMessage) error { return chargeOrder(ctx, m.Value) },
