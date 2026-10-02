@@ -33,6 +33,15 @@ type HandlerConfig struct {
 	// Breaker guards Handle. While it is open the handler is not called, the topic
 	// pauses, and messages wait in Kafka. Optional but recommended.
 	Breaker *breaker.Breaker
+	// HealthURL is the short way to get a Breaker when Breaker is nil: NewService (not
+	// HandlerBinding) builds one named Dependency that opens when half of the recent calls fail
+	// (after at least 20; a retry.Permanent error does not count), and asks HealthURL, an absolute
+	// http or https URL, whether the dependency is back before letting traffic through. The
+	// service closes it. Build the Breaker yourself for other thresholds.
+	HealthURL string
+	// Dependency names the breaker NewService builds from HealthURL, which is what the redriver
+	// waits on and what the events say. Default: Name, then Topic.
+	Dependency string
 	// Timeout bounds one call of Handle. Default 30s.
 	Timeout time.Duration
 	// Retry retries Handle in-process before the message is deferred. Optional. Keep
@@ -84,4 +93,12 @@ func HandlerBinding(c HandlerConfig) (Binding, error) {
 		return Binding{}, err
 	}
 	return Binding{Topic: c.Topic, Pipeline: p}, nil
+}
+
+// HandleValue adapts a function that only needs the message body, which is most existing
+// handlers, to HandlerConfig.Handle:
+//
+//	kafka.HandlerConfig{Topic: "orders", Handle: kafka.HandleValue(chargeOrder)}
+func HandleValue(f func(ctx context.Context, value []byte) error) func(context.Context, HandledMessage) error {
+	return func(ctx context.Context, m HandledMessage) error { return f(ctx, m.Value) }
 }

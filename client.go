@@ -25,7 +25,8 @@ type Client struct {
 
 // NewClient guards every request with p, one circuit per host (see GuardAll). Options are applied
 // after it, so WithEndpoint can give particular endpoints their own policy and WithEvents adds a
-// sink. Use New and http.Client directly for full control of the transport's Config.
+// sink. A Defer with no Store, such as &goguard.Defer{}, takes the store of the kafka.Service you give
+// the client to (ServiceConfig.HTTP) or of BindStore. Use New and http.Client directly for full control of the transport's Config.
 func NewClient(p Policy, opts ...Option) (*Client, error) {
 	all := append([]Option{GuardAll(p)}, opts...)
 	return NewClientWithConfig(Config{}, all...)
@@ -34,7 +35,23 @@ func NewClient(p Policy, opts ...Option) (*Client, error) {
 // NewClientWithConfig is NewClient with a transport Config, for settings such as MaxBreakers,
 // ResponseHeaderTimeout or a custom Transport.
 func NewClientWithConfig(cfg Config, opts ...Option) (*Client, error) {
-	t, err := New(cfg, opts...)
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	// A Defer without a Store is filled in later (BindStore, or ServiceConfig.HTTP), so a client
+	// can be built before the log exists. Nothing is saved until then.
+	bindLater := func(d *Defer) {
+		if d != nil && d.Store == nil {
+			d.BindLater = true
+		}
+	}
+	for _, ep := range cfg.Endpoints {
+		bindLater(ep.Policy.Defer)
+	}
+	if cfg.GuardAll != nil {
+		bindLater(cfg.GuardAll.Defer)
+	}
+	t, err := New(cfg)
 	if err != nil {
 		return nil, err
 	}

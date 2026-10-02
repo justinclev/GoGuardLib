@@ -396,3 +396,68 @@ func TestServiceRunUntilSignalStopsOnSIGTERM(t *testing.T) {
 		t.Fatal("RunUntilSignal did not stop on SIGTERM")
 	}
 }
+
+func TestHandleValuePassesTheBody(t *testing.T) {
+	var got string
+	h := kafka.HandleValue(func(_ context.Context, v []byte) error { got = string(v); return nil })
+	if err := h(context.Background(), kafka.HandledMessage{Value: []byte("body")}); err != nil || got != "body" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+// A handler with a HealthURL gets a breaker built for it; a bad URL is an error, not a panic.
+func TestServiceBuildsABreakerFromAHealthURL(t *testing.T) {
+	r := newRig(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer srv.Close()
+	var done atomic.Int32
+	svc, err := kafka.NewService(kafka.ServiceConfig{
+		Client: r.client, Store: r.store,
+		Handlers: []kafka.HandlerConfig{{
+			Topic: topic, HealthURL: srv.URL + "/health", Dependency: "payments",
+			Handle: kafka.HandleValue(func(context.Context, []byte) error { done.Add(1); return nil }),
+		}},
+		Consumer: kafka.Config{PollTimeout: 5 * time.Millisecond, CommitInterval: 10 * time.Millisecond},
+	})
+	must(t, err)
+	r.produceN(3, "m")
+	r.assign(0)
+	runService(t, svc)
+	eventually(t, "messages handled", func() bool { return done.Load() == 3 })
+	must(t, svc.Close())
+
+	_, err = kafka.NewService(kafka.ServiceConfig{
+		Client: r.client, Store: r.store,
+		Handlers: []kafka.HandlerConfig{{Topic: topic, HealthURL: "/health", Handle: kafka.HandleValue(func(context.Context, []byte) error { return nil })}},
+	})
+	if err == nil {
+		t.Fatal("a relative HealthURL must be rejected")
+	}
+}
+
+func TestRunBuildsRunsAndCloses(t *testing.T) {
+	r := newRig(t)
+	var done atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		errc <- kafka.Run(ctx, kafka.ServiceConfig{
+			Client: r.client, DataDir: t.TempDir(),
+			Handlers: []kafka.HandlerConfig{{Topic: topic, Handle: kafka.HandleValue(func(context.Context, []byte) error { done.Add(1); return nil })}},
+			Consumer: kafka.Config{PollTimeout: 5 * time.Millisecond, CommitInterval: 10 * time.Millisecond},
+		})
+	}()
+	r.produceN(2, "m")
+	r.assign(0)
+	eventually(t, "messages handled", func() bool { return done.Load() == 2 })
+	cancel()
+	select {
+	case err := <-errc:
+		must(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	if err := kafka.Run(context.Background(), kafka.ServiceConfig{}); err == nil {
+		t.Fatal("an empty config must be an error")
+	}
+}

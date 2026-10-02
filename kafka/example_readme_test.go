@@ -23,21 +23,13 @@ func chargeOrder(ctx context.Context, order []byte) error { return nil }
 // This is the README's simple Kafka example. It needs a broker to run, so it only
 // has to compile.
 func runOrders(ctx context.Context, brokers, dataDir string) error {
-	svc, err := kafka.NewService(kafka.ServiceConfig{
+	return kafka.Run(ctx, kafka.ServiceConfig{
 		NewClient: confluent.NewClientFunc(ck.ConfigMap{"bootstrap.servers": brokers, "group.id": "orders-service"}),
 		DataDir:   dataDir, // orders that fail wait here, on disk
-		Handlers: []kafka.HandlerConfig{{
-			Topic: "orders",
-			Handle: func(ctx context.Context, m kafka.HandledMessage) error {
-				return chargeOrder(ctx, m.Value) // return an error and the order is saved and retried later
-			},
-		}},
+		Handlers: []kafka.HandlerConfig{
+			{Topic: "orders", Handle: kafka.HandleValue(chargeOrder)}, // an error: saved, retried later
+		},
 	})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = svc.Close() }()
-	return svc.Run(ctx)
 }
 
 func Example_readmeSimple() {
@@ -100,14 +92,9 @@ func newRedriver(store dlq.Store, bindings []kafka.Binding) (*dlq.Redriver, erro
 
 // runTwoTopics is the README's "several topics" example: each topic has its own handler, and a
 // saved message is finished by the handler of its own topic.
-func runTwoTopics(ctx context.Context, cfg kafka.ServiceConfig, refund func(context.Context, kafka.HandledMessage) error) error {
-	cfg.Handlers = append(cfg.Handlers, kafka.HandlerConfig{Topic: "refunds", Handle: refund})
-	svc, err := kafka.NewService(cfg)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = svc.Close() }()
-	return svc.Run(ctx)
+func runTwoTopics(ctx context.Context, cfg kafka.ServiceConfig, refund func(context.Context, []byte) error) error {
+	cfg.Handlers = append(cfg.Handlers, kafka.HandlerConfig{Topic: "refunds", Handle: kafka.HandleValue(refund)})
+	return kafka.Run(ctx, cfg)
 }
 
 func Example_readmeSeveralTopics() {
@@ -132,85 +119,81 @@ func chargePayments(ctx context.Context, url string, m kafka.HandledMessage) err
 }
 
 // runGuardedOrders is the README's "in a real service" example: the same service, with a circuit
-// breaker on the call to payments.
+// breaker on the call to payments that asks payments' health endpoint when it is back.
 func runGuardedOrders(ctx context.Context, brokers, dataDir, paymentsURL string) error {
-	payments := breaker.New(breaker.Config{
-		Name:             "payments",
-		FailureThreshold: 0.5,                                     // open when half of the recent calls fail...
-		MinSamples:       20,                                      // ...but only after at least 20 calls
-		IsFailure:        retry.IsOutage,                          // a declined card is not an outage
-		Health:           health.MustURL(paymentsURL + "/health"), // ask payments whether it is back
-	})
-	defer payments.Close()
-
-	svc, err := kafka.NewService(kafka.ServiceConfig{
+	return kafka.Run(ctx, kafka.ServiceConfig{
 		NewClient: confluent.NewClientFunc(ck.ConfigMap{"bootstrap.servers": brokers, "group.id": "orders-service"}),
 		DataDir:   dataDir,
 		Handlers: []kafka.HandlerConfig{{
-			Topic:   "orders",
-			Breaker: payments, // while this circuit is open the topic pauses and saved orders wait
-			Timeout: 5 * time.Second,
+			Topic:      "orders",
+			HealthURL:  paymentsURL + "/health", // the topic pauses while payments is down
+			Dependency: "payments",
+			Timeout:    5 * time.Second,
 			Handle: func(ctx context.Context, m kafka.HandledMessage) error {
 				return chargePayments(ctx, paymentsURL, m)
 			},
 		}},
-		Consumer: kafka.Config{Workers: 4}, // handle four orders at once; offsets are still committed in order
+		Consumer: kafka.Config{Workers: 4}, // four orders at once; offsets are still committed in order
 	})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = svc.Close() }()
-	return svc.RunUntilSignal(ctx) // stops on Ctrl-C or SIGTERM
+}
+
+// runTunedOrders builds the breaker itself, for thresholds and health settings of your own.
+func runTunedOrders(ctx context.Context, brokers, dataDir, paymentsURL string) error {
+	payments := breaker.New(breaker.Config{
+		Name:             "payments",
+		FailureThreshold: 0.3,
+		MinSamples:       50,
+		IsFailure:        retry.IsOutage,
+		Health:           health.MustURL(paymentsURL + "/health"),
+	})
+	defer payments.Close()
+	return kafka.Run(ctx, kafka.ServiceConfig{
+		NewClient: confluent.NewClientFunc(ck.ConfigMap{"bootstrap.servers": brokers, "group.id": "orders-service"}),
+		DataDir:   dataDir,
+		Handlers: []kafka.HandlerConfig{{
+			Topic: "orders", Breaker: payments,
+			Handle: func(ctx context.Context, m kafka.HandledMessage) error { return chargePayments(ctx, paymentsURL, m) },
+		}},
+	})
 }
 
 func Example_readmeGuarded() {
 	_ = runGuardedOrders
+	_ = runTunedOrders
 }
 
 // runWithWebhooks adds saved HTTP requests to the same service: one guarded client, and the service
 // sends what could not be sent once the partner is back.
 func runWithWebhooks(ctx context.Context, brokers, dataDir string) error {
-	hooks, err := goguard.NewClient(goguard.Policy{HealthPath: "/health", Defer: &goguard.Defer{BindLater: true}})
+	hooks, err := goguard.NewClient(goguard.Policy{HealthPath: "/health", Defer: &goguard.Defer{}})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = hooks.Close() }()
-	svc, err := kafka.NewService(kafka.ServiceConfig{
+	return kafka.Run(ctx, kafka.ServiceConfig{
 		NewClient: confluent.NewClientFunc(ck.ConfigMap{"bootstrap.servers": brokers, "group.id": "orders-service"}),
 		DataDir:   dataDir,
 		HTTP:      hooks, // saved requests go into the service's log and are sent from it
-		Handlers: []kafka.HandlerConfig{{
-			Topic:  "orders",
-			Handle: func(ctx context.Context, m kafka.HandledMessage) error { return chargeOrder(ctx, m.Value) },
-		}},
+		Handlers:  []kafka.HandlerConfig{{Topic: "orders", Handle: kafka.HandleValue(chargeOrder)}},
 	})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = svc.Close() }()
-	return svc.Run(ctx)
 }
 
 func Example_readmeWebhooks() {
 	_ = runWithWebhooks
 }
 
-// proposalExample is the short version used in the proposal. Errors are dropped here only to keep
-// it short; runGuardedOrders is the complete version.
-func proposalExample(ctx context.Context, newClient func([]string) (kafka.Client, error), dataDir string, payments *breaker.Breaker) {
-	svc, _ := kafka.NewService(kafka.ServiceConfig{
+// proposalExample is the short version used in the proposal; runGuardedOrders is the same thing
+// with the supporting code.
+func proposalExample(ctx context.Context, newClient func([]string) (kafka.Client, error), dataDir, paymentsURL string) error {
+	return kafka.Run(ctx, kafka.ServiceConfig{
 		NewClient: newClient,
 		DataDir:   dataDir, // failed messages wait here, on disk
 		Handlers: []kafka.HandlerConfig{{
-			Topic:   "orders",
-			Breaker: payments, // the topic pauses while this circuit is open
-			Handle: func(ctx context.Context, m kafka.HandledMessage) error {
-				return chargeOrder(ctx, m.Value) // return an error: saved to disk, retried later
-			},
+			Topic:     "orders",
+			HealthURL: paymentsURL + "/health",        // the topic pauses while payments is down
+			Handle:    kafka.HandleValue(chargeOrder), // return an error: saved to disk, retried later
 		}},
 	})
-	defer func() { _ = svc.Close() }()
-	_ = svc.Run(ctx) // consumer and redriver together
 }
 
 func Example_readmeProposal() {

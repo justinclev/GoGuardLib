@@ -114,19 +114,16 @@ binding, err := kafka.HandlerBinding(kafka.HandlerConfig{
 consumer, err := kafka.NewConsumer(kafka.Config{Client: client, Store: store /* durable */, Bindings: []kafka.Binding{binding}})
 ```
 
-For the whole service in one call (client, log, consumer, redriver and routing), use `kafka.NewService` instead of building each part:
+For the whole service in one call (client, log, consumer, redriver and routing), use `kafka.Run` (or `kafka.NewService` when you need the service itself) instead of building each part:
 
 ```go
-svc, err := kafka.NewService(kafka.ServiceConfig{
+return kafka.Run(ctx, kafka.ServiceConfig{
     NewClient: confluent.NewClientFunc(kafkaConfig),
     DataDir:   "/var/lib/correspondence", // a persistent volume
-    Handlers:  []kafka.HandlerConfig{{Topic: "correspondence-events", Breaker: rules, Handle: handle}},
+    Handlers: []kafka.HandlerConfig{
+        {Topic: "correspondence-events", HealthURL: rulesURL + "/health", Handle: kafka.HandleValue(process)},
+    },
 })
-if err != nil {
-    return err
-}
-defer svc.Close()
-return svc.RunUntilSignal(ctx)
 ```
 
 You get contiguous offset commits, a durable store for messages that could not be handled, per-key ordering behind a deferred message, a paused topic while the breaker is open, and resume after a crash. `retry.Permanent(err)` parks a message for a person instead of retrying it.

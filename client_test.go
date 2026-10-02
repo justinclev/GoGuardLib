@@ -63,9 +63,11 @@ func TestClientSavesRequestsAndReplaysThemThroughItself(t *testing.T) {
 }
 
 func TestClientAppliesOptionsAfterTheDefaultPolicy(t *testing.T) {
-	if _, err := goguard.NewClient(goguard.Policy{Defer: &goguard.Defer{}}); err == nil {
-		t.Fatal("a Defer without a Store must be rejected")
+	c0, err := goguard.NewClient(goguard.Policy{Defer: &goguard.Defer{}})
+	if err != nil {
+		t.Fatal("a Defer with no Store must wait for BindStore:", err)
 	}
+	_ = c0.Close()
 	c, err := goguard.NewClient(goguard.Policy{}, goguard.WithEndpoint("pay", goguard.Host("pay.internal"), goguard.Policy{}))
 	if err != nil {
 		t.Fatal(err)

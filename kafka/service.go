@@ -13,7 +13,9 @@ import (
 	goguard "github.com/justinclev/GoGuardLib"
 	"github.com/justinclev/GoGuardLib/breaker"
 	"github.com/justinclev/GoGuardLib/dlq"
+	"github.com/justinclev/GoGuardLib/health"
 	"github.com/justinclev/GoGuardLib/obs"
+	"github.com/justinclev/GoGuardLib/retry"
 )
 
 // ServiceConfig describes a whole Kafka service in one place: where messages come from, where
@@ -75,8 +77,9 @@ type Service struct {
 	redriver *dlq.Redriver
 	store    dlq.Store
 
-	ownsStore   bool
-	ownedCloser io.Closer // the client, when the service created it
+	ownsStore     bool
+	ownedBreakers []*breaker.Breaker // built from HandlerConfig.HealthURL
+	ownedCloser   io.Closer          // the client, when the service created it
 
 	mu        sync.Mutex
 	started   bool
@@ -101,8 +104,24 @@ func NewService(cfg ServiceConfig) (s *Service, err error) {
 		return nil, errors.New("kafka: set the store on ServiceConfig, not on Redriver")
 	}
 
+	s = &Service{}
+	built := s // a return of (nil, err) clears s before this runs, so keep our own reference
+	defer func() {
+		if err != nil {
+			_ = built.Close()
+		}
+	}()
+
 	bindings := append([]Binding(nil), cfg.Pipelines...)
 	for _, h := range cfg.Handlers {
+		if h.Breaker == nil && h.HealthURL != "" {
+			br, berr := healthBreaker(h)
+			if berr != nil {
+				return nil, berr
+			}
+			s.ownedBreakers = append(s.ownedBreakers, br)
+			h.Breaker = br
+		}
 		b, herr := HandlerBinding(h)
 		if herr != nil {
 			return nil, herr
@@ -116,14 +135,6 @@ func NewService(cfg ServiceConfig) (s *Service, err error) {
 	if err != nil {
 		return nil, err
 	}
-
-	s = &Service{}
-	defer func() {
-		if err != nil {
-			_ = s.Close()
-			s = nil
-		}
-	}()
 
 	if cfg.Store != nil {
 		s.store = cfg.Store
@@ -196,6 +207,25 @@ func NewService(cfg ServiceConfig) (s *Service, err error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// healthBreaker builds the breaker for a handler that gave a HealthURL instead of a Breaker.
+func healthBreaker(h HandlerConfig) (*breaker.Breaker, error) {
+	check, err := health.HTTP(h.HealthURL)
+	if err != nil {
+		return nil, fmt.Errorf("kafka: handler for topic %q: HealthURL: %w", h.Topic, err)
+	}
+	name := h.Dependency
+	if name == "" {
+		name = h.Name
+	}
+	if name == "" {
+		name = h.Topic
+	}
+	return breaker.New(breaker.Config{
+		Name: name, FailureThreshold: 0.5, MinSamples: 20,
+		IsFailure: retry.IsOutage, Health: &health.Config{Check: check},
+	}), nil
 }
 
 // replayHandler sends a saved record to the handler for its kind of source: Kafka messages to the
@@ -310,6 +340,9 @@ func (s *Service) Close() error {
 		<-done
 	}
 	var errs []error
+	for _, b := range s.ownedBreakers {
+		b.Close()
+	}
 	if s.ownedCloser != nil {
 		errs = append(errs, s.ownedCloser.Close())
 	}
@@ -317,4 +350,16 @@ func (s *Service) Close() error {
 		errs = append(errs, s.store.Close())
 	}
 	return errors.Join(errs...)
+}
+
+// Run is NewService, Service.RunUntilSignal and Service.Close in one call, for a service that needs
+// nothing from the Service itself: it builds everything, runs until ctx ends or SIGINT/SIGTERM, and
+// releases what it opened. Use NewService when you want Stats or the consumer and redriver.
+func Run(ctx context.Context, cfg ServiceConfig) error {
+	svc, err := NewService(cfg)
+	if err != nil {
+		return err
+	}
+	runErr := svc.RunUntilSignal(ctx)
+	return errors.Join(runErr, svc.Close())
 }

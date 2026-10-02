@@ -171,25 +171,19 @@ A normal consumer has two bad choices when payments is down: fail the message or
 
 ```go
 func runOrders(ctx context.Context, brokers, dataDir string) error {
-	svc, err := kafka.NewService(kafka.ServiceConfig{
+	return kafka.Run(ctx, kafka.ServiceConfig{
 		NewClient: confluent.NewClientFunc(ck.ConfigMap{"bootstrap.servers": brokers, "group.id": "orders-service"}),
 		DataDir:   dataDir, // orders that fail wait here, on disk
-		Handlers: []kafka.HandlerConfig{{
-			Topic: "orders",
-			Handle: func(ctx context.Context, m kafka.HandledMessage) error {
-				return chargeOrder(ctx, m.Value) // return an error and the order is saved and retried later
-			},
-		}},
+		Handlers: []kafka.HandlerConfig{
+			{Topic: "orders", Handle: kafka.HandleValue(chargeOrder)}, // an error: saved, retried later
+		},
 	})
-	if err != nil {
-		return err
-	}
-	defer svc.Close()
-	return svc.Run(ctx) // the consumer and the redriver, together
 }
 ```
 
-`NewService` opens the on-disk log and the Kafka client, connects the consumer and the redriver, and `Run` runs both until the context ends. `Close` releases what it opened.
+`chargeOrder` is your function, `func(ctx context.Context, order []byte) error`. If you want the message ID, key or headers, write the handler as `func(ctx, m kafka.HandledMessage) error` and drop `HandleValue`.
+
+`kafka.Run` opens the on-disk log and the Kafka client, connects the consumer and the redriver, runs both until the context ends or Ctrl-C/SIGTERM, and releases what it opened. If you need the service itself, for `Stats` or to inspect the consumer, use `svc, err := kafka.NewService(cfg)`, then `defer svc.Close()` and `svc.RunUntilSignal(ctx)`; `kafka.Run` is exactly that.
 
 What that gives you:
 
@@ -218,41 +212,28 @@ func chargePayments(ctx context.Context, url string, m kafka.HandledMessage) err
 }
 
 func runGuardedOrders(ctx context.Context, brokers, dataDir, paymentsURL string) error {
-	payments := breaker.New(breaker.Config{
-		Name:             "payments",
-		FailureThreshold: 0.5,                                      // open when half of the recent calls fail...
-		MinSamples:       20,                                       // ...but only after at least 20 calls
-		IsFailure:        retry.IsOutage,                           // a declined card is not an outage
-		Health:           health.MustURL(paymentsURL + "/health"), // ask payments whether it is back
-	})
-	defer payments.Close()
-
-	svc, err := kafka.NewService(kafka.ServiceConfig{
+	return kafka.Run(ctx, kafka.ServiceConfig{
 		NewClient: confluent.NewClientFunc(ck.ConfigMap{"bootstrap.servers": brokers, "group.id": "orders-service"}),
 		DataDir:   dataDir,
 		Handlers: []kafka.HandlerConfig{{
-			Topic:   "orders",
-			Breaker: payments, // while this circuit is open the topic pauses and saved orders wait
-			Timeout: 5 * time.Second,
+			Topic:      "orders",
+			HealthURL:  paymentsURL + "/health", // the topic pauses while payments is down
+			Dependency: "payments",
+			Timeout:    5 * time.Second,
 			Handle: func(ctx context.Context, m kafka.HandledMessage) error {
 				return chargePayments(ctx, paymentsURL, m)
 			},
 		}},
 		Consumer: kafka.Config{Workers: 4}, // four orders at once; offsets are still committed in order
 	})
-	if err != nil {
-		return err
-	}
-	defer svc.Close()
-	return svc.RunUntilSignal(ctx) // stops on Ctrl-C or SIGTERM
 }
 ```
 
 What this adds to the simple version:
 
-- **A circuit breaker with a health check** on the call to payments (`health.MustURL` builds the check from a URL; it panics on a malformed one, so use `health.HTTP` for a URL from user input). The topic pauses while it is open, and saved orders wait instead of failing. The service hands the breaker to the redriver for you.
+- **A circuit breaker with a health check** on the call to payments: `HealthURL` is all it takes. The service builds a breaker that opens when half of the recent calls fail (after at least 20; a declined card does not count) and asks `HealthURL` when payments is back. For other thresholds, build the breaker yourself and pass it as `Breaker` (`health.MustURL` builds the health check from a URL in one expression). The topic pauses while it is open, and saved orders wait instead of failing. The service hands the breaker to the redriver for you.
 - **`retry.FromHTTP`** turns the answer into the right kind of error, so you don't write the status switch. A permanent one (a declined card) is set aside for a person, and `retry.IsOutage` keeps it from counting as the service being down.
-- **`RunUntilSignal`** is `Run` that also stops on Ctrl-C or SIGTERM. `svc.Stats(ctx)` returns the consumer, redriver and store numbers together, for a health endpoint.
+- **`svc.Stats(ctx)` returns the consumer, redriver and store numbers together, for a health endpoint.
 - **`Consumer: kafka.Config{...}`** is the full consumer configuration. `ServiceConfig` also takes `Redriver` (`dlq.RedriveConfig`), `WAL` (`dlq.WALOptions`) and `Secure` (encryption), so nothing is out of reach.
 
 Your `Handle` function can run twice for the same order (after a crash, say), so make it safe to repeat. `m.ID` is the same every time, so you can use it to spot a repeat.
@@ -262,12 +243,12 @@ Your `Handle` function can run twice for the same order (after a crash, say), so
 Add one handler per topic. A saved message is finished by the handler of its own topic, and every handler's breaker is watched:
 
 ```go
-svc, err := kafka.NewService(kafka.ServiceConfig{
+err := kafka.Run(ctx, kafka.ServiceConfig{
 	NewClient: confluent.NewClientFunc(cfg),
 	DataDir:   dataDir,
 	Handlers: []kafka.HandlerConfig{
-		{Topic: "orders", Handle: chargeOrder},
-		{Topic: "refunds", Handle: refund},
+		{Topic: "orders", Handle: kafka.HandleValue(chargeOrder)},
+		{Topic: "refunds", Handle: kafka.HandleValue(refund)},
 	},
 })
 ```
@@ -276,10 +257,10 @@ A topic whose work has several steps goes in `Pipelines` instead (see Step 5). A
 
 ### Saved HTTP requests in the same service
 
-Give the service the guarded client from Step 2 and it also finishes the requests that client saved. Set `BindLater` so the client uses the log the service opened:
+Give the service the guarded client from Step 2 and it also finishes the requests that client saved. A `Defer` with no `Store` uses the log the service opened:
 
 ```go
-hooks, err := goguard.NewClient(goguard.Policy{Defer: &goguard.Defer{BindLater: true}})
+hooks, err := goguard.NewClient(goguard.Policy{Defer: &goguard.Defer{}})
 svc, err := kafka.NewService(kafka.ServiceConfig{ /* as above */ HTTP: hooks })
 ```
 

@@ -13,6 +13,12 @@ for v1.0" so it can be adopted early.
   releases what the service opened. A Kafka service that took about 84 lines is now about 15.
   `Consumer`, `Redriver`, `WAL` and `Secure` embed the existing config structs, so every
   setting is still reachable.
+- `kafka.Run(ctx, cfg)` is `NewService`, `RunUntilSignal` and `Close` in one call. `kafka.HandleValue(f)`
+  adapts a `func(ctx, []byte) error` to `HandlerConfig.Handle`. `HandlerConfig.HealthURL` (with
+  `Dependency` for the name) builds the circuit breaker for a handler: it opens when half of the
+  recent calls fail, ignores permanent errors, and asks the URL when the service is back; pass
+  `Breaker` for other settings. `goguard.NewClient` accepts a `Defer` with no `Store` and waits
+  for `BindStore` or `ServiceConfig.HTTP` (the explicit `BindLater` flag is still there for `New`).
 - `confluent.NewClientFunc(cfg, opts...)` is `NewClient` with the topics left to the service.
 - `pipeline.SetJSON(x, key, v)`, `GetJSON[T]` and `RequireJSON[T]` pass an object between steps
   without marshalling by hand; JSON that cannot be written or read (and, for `RequireJSON`, a
