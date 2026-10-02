@@ -93,7 +93,7 @@ func send(ctx context.Context, method, url, idempotencyKey string, body []byte) 
 	return reply, retry.FromHTTP(resp, nil) // 5xx and timeouts: temporary. Other 4xx: permanent.
 }
 
-// newBreaker makes the circuit breaker for one service: it opens when half of the recent calls
+// serviceBreaker makes the circuit breaker for one service: it opens when half of the recent calls
 // fail, and asks the service's /health endpoint when it is back.
 func serviceBreaker(name, baseURL string) *breaker.Breaker {
 	return breaker.New(breaker.Config{
