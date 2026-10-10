@@ -14,6 +14,19 @@ const (
 	StateHalfOpen
 )
 
+func (s BreakerState) String() string {
+	switch s {
+	case StateClosed:
+		return "closed"
+	case StateOpen:
+		return "open"
+	case StateHalfOpen:
+		return "half-open"
+	default:
+		return "unknown"
+	}
+}
+
 type AtomicState struct {
 	current int32
 }
@@ -91,7 +104,26 @@ func (w *RollingWindow) rotate(now int64) {
 		w.buckets[w.head] = bucket{}
 	}
 
-	atomic.StoreInt64(&w.lastUpdate, now)
+	// Advance by whole buckets, keeping the remainder, so the window keeps its
+	// configured length instead of stretching by up to one bucket per rotation.
+	atomic.StoreInt64(&w.lastUpdate, w.lastUpdate+int64(diff)*int64(w.bucketDuration))
+}
+
+// Reset forgets everything recorded so far. A circuit that has just recovered
+// starts from a clean slate, so failures from before the outage cannot reopen it
+// on the first new error.
+func (w *RollingWindow) Reset() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i := range w.buckets {
+		w.buckets[i] = bucket{}
+	}
+	atomic.StoreInt64(&w.totalSuccess, 0)
+	atomic.StoreInt64(&w.totalFailure, 0)
+	atomic.StoreInt64(&w.totalLatency, 0)
+	atomic.StoreInt64(&w.totalRetries, 0)
+	w.head = 0
+	atomic.StoreInt64(&w.lastUpdate, time.Now().UnixNano())
 }
 
 func (w *RollingWindow) Success(now int64, latencyUs int64) {
@@ -133,13 +165,18 @@ func (w *RollingWindow) FailureRateBps(now int64) int64 {
 	return (failure * 10000) / total
 }
 
+// RetryRateBps returns retries as a share of all traffic (finished requests
+// plus retries) in basis points. Failures count as traffic: when every request
+// is failing, retries must still be limited.
 func (w *RollingWindow) RetryRateBps() int64 {
 	success := atomic.LoadInt64(&w.totalSuccess)
+	failure := atomic.LoadInt64(&w.totalFailure)
 	retries := atomic.LoadInt64(&w.totalRetries)
-	if success <= 0 {
+	total := success + failure + retries
+	if total <= 0 {
 		return 0
 	}
-	return (retries * 10000) / (success + retries)
+	return (retries * 10000) / total
 }
 
 func (w *RollingWindow) AvgLatencyUs() int64 {

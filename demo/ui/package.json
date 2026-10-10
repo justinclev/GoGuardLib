@@ -1,0 +1,25 @@
+{
+  "name": "goguard-demo-ui",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "ng": "ng",
+    "start": "ng serve --proxy-config proxy.conf.json",
+    "build": "ng build",
+    "check:paths": "node scripts/check-flow-paths.mjs"
+  },
+  "dependencies": {
+    "@angular/common": "~21.2.24",
+    "@angular/compiler": "~21.2.24",
+    "@angular/core": "~21.2.24",
+    "@angular/platform-browser": "~21.2.24",
+    "rxjs": "~7.8.0",
+    "tslib": "^2.6.0"
+  },
+  "devDependencies": {
+    "@angular/build": "~21.2.24",
+    "@angular/cli": "~21.2.24",
+    "@angular/compiler-cli": "~21.2.24",
+    "typescript": "~5.9.2"
+  }
+}

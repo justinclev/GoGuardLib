@@ -1,0 +1,66 @@
+<section class="controls">
+  <div class="group">
+    <button type="button" class="play" [class.on]="running()" (click)="toggleTraffic()">
+      <span class="ico">{{ running() ? '❚❚' : '▶' }}</span>
+      {{ running() ? 'Stop traffic' : 'Start traffic' }}
+    </button>
+
+    <label class="slider http">
+      <span class="lbl"><i></i>HTTP <b>{{ http() }}</b> req/s</span>
+      <input type="range" min="0" max="60" step="1" [value]="http()" (input)="onHttp($event)" aria-label="HTTP requests per second" />
+    </label>
+    <label class="slider kafka">
+      <span class="lbl"><i></i>Kafka <b>{{ kafka() }}</b> msg/s</span>
+      <input type="range" min="0" max="60" step="1" [value]="kafka()" (input)="onKafka($event)" aria-label="Kafka messages per second" />
+    </label>
+
+    <div class="presets">
+      <button type="button" (click)="preset(4, 4)">Gentle</button>
+      <button type="button" (click)="preset(15, 15)">Busy</button>
+      <button type="button" (click)="preset(40, 40)">Storm</button>
+    </div>
+
+    <label
+      class="switch"
+      [class.on]="deferOn()"
+      title="The HTTP flow's last call is a notification, which can wait. With this on, if Notifications cannot be reached the client saves the request in the dead-letter log, answers the caller, and sends it later. With it off, the request just fails."
+    >
+      <input type="checkbox" role="switch" [checked]="deferOn()" (change)="toggleDefer()" />
+      <span class="track"><i></i></span>
+      <span class="txt">Save HTTP notifications when they can't be sent <b>{{ deferOn() ? 'on' : 'off' }}</b></span>
+    </label>
+  </div>
+
+  <div class="group right">
+    <div class="seg" role="group" aria-label="Animation speed">
+      @for (s of speeds; track s) {
+        <button type="button" [class.on]="speed() === s" (click)="speed.set(s)">{{ s }}×</button>
+      }
+    </div>
+    <button type="button" class="ghost" [disabled]="!anyDown()" (click)="restoreAll()">Restore all</button>
+    <button type="button" class="ghost" (click)="badOrder()" title="Send one order the payments service will always refuse. It is set aside for a person: never retried, never deleted, and the other orders carry on.">
+      ☠ Bad order
+    </button>
+    <button type="button" class="crash" (click)="crash()" title="Kill the consumer process without warning. The dead-letter log is on disk, so nothing stored is lost.">
+      ⚡ Crash consumer
+    </button>
+    <button type="button" class="guided" [class.on]="scenario.running()" (click)="toggleScenario()">
+      {{ scenario.running() ? 'Stop guided demo' : '✦ Guided demo' }}
+    </button>
+  </div>
+</section>
+
+@if (scenario.running()) {
+  <section class="guide" aria-live="polite">
+    <div class="steps">
+      @for (n of [1, 2, 3, 4, 5]; track n) {
+        <i [class.done]="n < scenario.stage()" [class.now]="n === scenario.stage()"></i>
+      }
+    </div>
+    <div class="text">
+      <strong>{{ scenario.stage() }}/{{ scenario.stages() }} · {{ scenario.title() }}</strong>
+      <span>{{ scenario.caption() }}</span>
+    </div>
+    <div class="bar"><div class="fill" [style.width.%]="scenario.progress() * 100"></div></div>
+  </section>
+}

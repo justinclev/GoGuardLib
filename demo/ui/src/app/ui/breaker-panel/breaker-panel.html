@@ -1,0 +1,24 @@
+<section class="grid">
+  @for (c of cards(); track c.name) {
+    <article class="card" [class.open]="c.state === 'open'" [class.half]="c.state === 'half-open'">
+      <header>
+        <h3>{{ c.label }}</h3>
+        <span class="chip">{{ c.state === 'half-open' ? 'half-open' : c.state }}</span>
+      </header>
+
+      <div class="gauge" [attr.aria-label]="'Failure rate ' + c.rate + ' percent'">
+        <div class="fill" [style.width.%]="c.rate"></div>
+        <div class="threshold" title="Opens at 50%"></div>
+      </div>
+      <div class="gauge-l"><span>failure rate</span><b>{{ c.rate.toFixed(0) }}%</b></div>
+
+      <dl>
+        <div><dt>ok</dt><dd>{{ c.success }}</dd></div>
+        <div><dt>failed</dt><dd>{{ c.failure }}</dd></div>
+        <div><dt>rejected</dt><dd class="p">{{ c.rejected }}</dd></div>
+        <div><dt>opened</dt><dd>{{ c.opens }}×</dd></div>
+      </dl>
+      <p class="note">{{ c.note }}</p>
+    </article>
+  }
+</section>

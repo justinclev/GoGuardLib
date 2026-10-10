@@ -1,0 +1,5 @@
+# Security-sensitive code needs an owner's review.
+*                   @justinclev
+/secure/            @justinclev
+/dlq/               @justinclev
+/.github/           @justinclev

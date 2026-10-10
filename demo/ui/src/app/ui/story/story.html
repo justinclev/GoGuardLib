@@ -1,0 +1,26 @@
+<section class="panel">
+  <header>
+    <h2>What is happening</h2>
+    <span class="hint">live commentary</span>
+  </header>
+
+  <ol class="list" aria-live="polite">
+    @for (s of store.story(); track s.id) {
+      <li [class]="'item ' + s.tone">
+        <span class="ico" aria-hidden="true">{{ s.icon }}</span>
+        <div class="txt">
+          <div class="row">
+            <strong>{{ s.title }}</strong>
+            <time>{{ s.t | date: 'HH:mm:ss' }}</time>
+          </div>
+          <p>{{ s.body }}</p>
+        </div>
+      </li>
+    } @empty {
+      <li class="empty">
+        <strong>Nothing yet.</strong>
+        <p>Press <em>Start traffic</em>, then take a service down with the red button under it, or run the <em>Guided demo</em>.</p>
+      </li>
+    }
+  </ol>
+</section>

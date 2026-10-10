@@ -1,0 +1,6 @@
+.git
+**/node_modules
+demo/ui
+**/dist
+**/data
+**/.angular
