@@ -85,7 +85,7 @@ The first three HTTP steps call their services through `breaker.Do`. The notific
 
 ## Running without Docker
 
-You need Go 1.25+ and Node 22+.
+You need Go 1.26+ and Node 22+.
 
 ```bash
 # 1. the simulated services

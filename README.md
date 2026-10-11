@@ -6,7 +6,7 @@ When a service you depend on breaks, your code shouldn't keep calling it, hang w
 2. **Notices when the service is back.** It checks the service's health endpoint and lets calls through again, carefully.
 3. **Saves work you couldn't finish.** For Kafka, a message that can't be handled yet is written to disk and finished later, from the step where it stopped. Nothing is lost.
 
-Go 1.25 or newer. The core has no dependencies beyond the standard library.
+Go 1.25 or newer (CI and the demo build with 1.26). The core has no dependencies beyond the standard library.
 
 ```bash
 go get github.com/justinclev/GoGuardLib        # HTTP, any function, retries, saved work
