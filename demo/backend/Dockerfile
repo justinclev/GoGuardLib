@@ -3,7 +3,7 @@
 # Build context is the repository root (see demo/docker-compose.yml), because the
 # demo uses the library from the working tree rather than a published release.
 
-FROM golang:1.25-bookworm AS build
+FROM golang:1.26-bookworm AS build
 WORKDIR /src
 
 # A network that re-signs HTTPS with a company root certificate: put that certificate

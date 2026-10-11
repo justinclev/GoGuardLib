@@ -1,9 +1,11 @@
 module github.com/justinclev/GoGuardLib/demo/backend
 
-go 1.25.3
+go 1.26.0
+
+toolchain go1.26.9
 
 require (
-	github.com/confluentinc/confluent-kafka-go/v2 v2.11.1
+	github.com/confluentinc/confluent-kafka-go/v2 v2.16.0
 	github.com/justinclev/GoGuardLib v0.0.0
 	github.com/justinclev/GoGuardLib/kafka v0.0.0
 )
